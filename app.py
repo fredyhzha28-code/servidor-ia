@@ -43,7 +43,10 @@ def get_or_upload_files(catalogs):
                         tmp_path = tmp_file.name
                     
                     print(f"Subiendo {filename} a Gemini...")
-                    gemini_file = client.files.upload(file=tmp_path, display_name=title)
+                    gemini_file = client.files.upload(
+                        file=tmp_path, 
+                        config={'display_name': title}
+                    )
                     uploaded_files_cache[filename] = gemini_file
                     
                     os.remove(tmp_path)
