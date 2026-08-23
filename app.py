@@ -177,6 +177,10 @@ def search_products():
         return jsonify({"error": "No hay catálogos disponibles para buscar."}), 400
         
     try:
+        cat_hash = get_catalogs_hash(catalogs_data)
+        cached_text = None
+        files = None
+        
         # 1. Intentar leer de Memoria RAM primero (más rápido)
         global memory_knowledge_cache
         if cat_hash in memory_knowledge_cache:
