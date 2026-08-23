@@ -134,6 +134,24 @@ def local_search_in_json(query, products_json_str):
         print(f"Error parseando JSON local: {e}")
         return "¡Hola! Estoy actualizando mi base de datos de catálogos. Intenta tu búsqueda en un par de minutos."
 
+def generate_content_robust(contents):
+    models_to_try = [
+        'gemini-2.5-flash',
+        'gemini-2.0-flash',
+        'gemini-3.0-flash',
+        'gemini-3.5-flash'
+    ]
+    last_error = None
+    for m in models_to_try:
+        try:
+            return client.models.generate_content(model=m, contents=contents)
+        except Exception as e:
+            if '404' in str(e) or 'NOT_FOUND' in str(e):
+                last_error = e
+                continue
+            raise e
+    raise last_error
+
 def extract_knowledge_from_catalogs(files):
     """Pide a Gemini que extraiga todos los productos en formato JSON."""
     print("Extrayendo conocimiento de todos los catálogos (esto puede tardar)...")
@@ -155,10 +173,7 @@ def extract_knowledge_from_catalogs(files):
     Es crítico que extraigas la mayor cantidad posible de productos.
     """
     try:
-        response = client.models.generate_content(
-            model='gemini-3.5-flash',
-            contents=[*files, prompt_extract]
-        )
+        response = generate_content_robust(contents=[*files, prompt_extract])
         return response.text
     except Exception as e:
         print(f"Error en extracción: {e}")
@@ -240,10 +255,7 @@ def search_products():
             5. Da un formato bonito y ordenado a tu respuesta usando etiquetas HTML básicas.
             """
             print("Consultando a Gemini (Fallback)...")
-            response = client.models.generate_content(
-                model='gemini-3.5-flash',
-                contents=[*files, prompt]
-            )
+            response = generate_content_robust(contents=[*files, prompt])
             return jsonify({"response": response.text})
         
     except Exception as e:
