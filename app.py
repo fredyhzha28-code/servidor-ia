@@ -107,7 +107,7 @@ def extract_knowledge_from_catalogs(files):
     """
     try:
         response = client.models.generate_content(
-            model='gemini-3.5-flash',
+            model='gemini-1.5-flash',
             contents=[*files, prompt_extract]
         )
         return response.text
@@ -180,15 +180,19 @@ def search_products():
         
         print("Consultando a Gemini...")
         response = client.models.generate_content(
-            model='gemini-3.5-flash',
+            model='gemini-1.5-flash',
             contents=contents_to_send
         )
         
         return jsonify({"response": response.text})
         
     except Exception as e:
-        print(f"Error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        error_msg = str(e)
+        print(f"Error: {error_msg}")
+        if '429' in error_msg or 'RESOURCE_EXHAUSTED' in error_msg:
+            friendly_msg = "La Inteligencia Artificial está procesando muchas consultas y alcanzó su límite de seguridad gratuito. Por favor, espera 1 minuto y vuelve a intentarlo."
+            return jsonify({"error": friendly_msg}), 429
+        return jsonify({"error": error_msg}), 500
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
