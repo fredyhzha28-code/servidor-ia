@@ -90,20 +90,68 @@ def get_catalogs_hash(catalogs):
     combined_urls = "".join(urls)
     return hashlib.md5(combined_urls.encode()).hexdigest()
 
+def local_search_in_json(query, products_json_str):
+    """Busca en el texto JSON localmente y genera respuesta HTML sin usar Gemini."""
+    try:
+        start_idx = products_json_str.find('[')
+        end_idx = products_json_str.rfind(']') + 1
+        if start_idx != -1 and end_idx != 0:
+            clean_json = products_json_str[start_idx:end_idx]
+        else:
+            clean_json = products_json_str
+            
+        products = json.loads(clean_json)
+        
+        query_words = [w.lower() for w in query.split() if len(w) > 2]
+        if not query_words:
+            query_words = [query.lower()]
+            
+        results = []
+        for p in products:
+            text_to_search = f"{p.get('nombre', '')} {p.get('catalogo', '')}".lower()
+            score = sum(1 for w in query_words if w in text_to_search)
+            if score > 0:
+                results.append((score, p))
+                
+        if not results:
+            return "¡Hola! He buscado en todas nuestras revistas actuales pero no encontré exactamente eso. ¡Intenta buscar con otras palabras relacionadas!"
+            
+        results.sort(key=lambda x: x[0], reverse=True)
+        top_results = [r[1] for r in results[:10]]
+        
+        html = "¡Hola! He encontrado estas excelentes opciones para ti:<br><br><ul>"
+        for r in top_results:
+            nombre = r.get('nombre', 'Producto')
+            precio = r.get('precio', '')
+            cat = r.get('catalogo', '')
+            pag = r.get('pagina', '')
+            html += f"<li style='margin-bottom:8px'><b>{nombre}</b> - <b>{precio}</b><br><span style='color:#64748b; font-size:0.9em'>Catálogo {cat}, Pág {pag}</span></li>"
+        html += "</ul><br>¡Si te gusta alguno, anímate y dale al botón verde para pedirlo por WhatsApp!"
+        
+        return html
+    except Exception as e:
+        print(f"Error parseando JSON local: {e}")
+        return "¡Hola! Estoy actualizando mi base de datos de catálogos. Intenta tu búsqueda en un par de minutos."
+
 def extract_knowledge_from_catalogs(files):
-    """Pide a Gemini que extraiga todos los productos en un gran texto."""
+    """Pide a Gemini que extraiga todos los productos en formato JSON."""
     print("Extrayendo conocimiento de todos los catálogos (esto puede tardar)...")
     prompt_extract = """
     Lee detalladamente todos estos catálogos adjuntos.
     Tu tarea es extraer un listado masivo de TODOS los productos mencionados.
-    Para cada producto debes incluir:
-    - Nombre del producto
-    - Precio (si tiene precio de oferta, pon el de oferta)
-    - Nombre del catálogo al que pertenece (ej. Esika, Leonisa)
-    - Número de página donde se encuentra
     
-    Formatea el resultado como un texto estructurado, claro y conciso.
-    No omitas productos importantes, extrae la mayor cantidad posible.
+    DEBES responder ÚNICAMENTE con un array en formato JSON con la siguiente estructura exacta:
+    [
+      {
+        "nombre": "Nombre del producto",
+        "precio": "Precio del producto (con símbolo de moneda)",
+        "catalogo": "Nombre del catálogo (ej. Esika)",
+        "pagina": "Número de página"
+      }
+    ]
+    
+    No añadas ningún texto antes ni después del JSON (sin comillas invertidas ni la palabra json).
+    Es crítico que extraigas la mayor cantidad posible de productos.
     """
     try:
         response = client.models.generate_content(
@@ -155,36 +203,30 @@ def search_products():
                     doc_ref.set({"extracted_text": cached_text, "catalogs_hash": cat_hash})
                     print("Conocimiento guardado en Firebase caché!")
             
-        prompt = f"""
-        Eres un asistente de ventas experto y persuasivo para una tienda de belleza y moda que vende por catálogo.
-        El usuario ha escrito la siguiente búsqueda: "{query}"
-        
-        Tus reglas estrictas a seguir son:
-        1. Encontrar los productos que mejor respondan a lo que busca el cliente.
-        2. SIEMPRE debes incluir el PRECIO del producto (fíjate bien si tiene precio de oferta o precio regular).
-        3. Dile al cliente exactamente en qué catálogo (ej. Esika, Leonisa) y en qué número de PÁGINA está el producto para que pueda pedirlo.
-        4. Sé muy amable, entusiasta y servicial, invitando al cliente a realizar su pedido por WhatsApp.
-        5. Da un formato bonito y ordenado a tu respuesta usando etiquetas HTML básicas (usa <b> para resaltar el nombre del producto y el precio, <br> para saltos de línea, y <ul><li> para listas).
-        """
-        
         if cached_text:
-            context_prompt = f"""
-            A continuación se te proporciona la información extraída de nuestros catálogos actuales:
-            ---
-            {cached_text}
-            ---
-            """
-            contents_to_send = [prompt + "\n" + context_prompt]
+            # Búsqueda local instantánea y gratuita!
+            print("Realizando búsqueda local en caché JSON...")
+            html_response = local_search_in_json(query, cached_text)
+            return jsonify({"response": html_response})
         else:
-            contents_to_send = [*files, prompt]
-        
-        print("Consultando a Gemini...")
-        response = client.models.generate_content(
-            model='gemini-3.5-flash',
-            contents=contents_to_send
-        )
-        
-        return jsonify({"response": response.text})
+            # Fallback en caso de que todo el caché falle
+            prompt = f"""
+            Eres un asistente de ventas experto y persuasivo para una tienda de belleza y moda que vende por catálogo.
+            El usuario ha escrito la siguiente búsqueda: "{query}"
+            
+            Tus reglas estrictas a seguir son:
+            1. Encontrar los productos que mejor respondan a lo que busca el cliente.
+            2. SIEMPRE debes incluir el PRECIO del producto.
+            3. Dile al cliente exactamente en qué catálogo (ej. Esika, Leonisa) y en qué número de PÁGINA está el producto.
+            4. Sé muy amable, entusiasta y servicial, invitando al cliente a realizar su pedido por WhatsApp.
+            5. Da un formato bonito y ordenado a tu respuesta usando etiquetas HTML básicas.
+            """
+            print("Consultando a Gemini (Fallback)...")
+            response = client.models.generate_content(
+                model='gemini-3.5-flash',
+                contents=[*files, prompt]
+            )
+            return jsonify({"response": response.text})
         
     except Exception as e:
         error_msg = str(e)
