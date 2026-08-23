@@ -35,8 +35,9 @@ if firebase_creds_b64:
 else:
     print("No se encontró FIREBASE_CREDENTIALS_B64. Funcionando sin caché en Firebase.")
 
-# Caché para no descargar ni subir el mismo PDF de Cloudflare varias veces
+# Caché local (memoria RAM) para PDFs y base de conocimientos
 uploaded_files_cache = {}
+memory_knowledge_cache = {}
 
 def get_or_upload_files(catalogs):
     """
@@ -176,32 +177,45 @@ def search_products():
         return jsonify({"error": "No hay catálogos disponibles para buscar."}), 400
         
     try:
-        # Intentar leer de Firebase
-        cat_hash = get_catalogs_hash(catalogs_data)
-        cached_text = None
-        files = None
-        
-        if firebase_db:
+        # 1. Intentar leer de Memoria RAM primero (más rápido)
+        global memory_knowledge_cache
+        if cat_hash in memory_knowledge_cache:
+            cached_text = memory_knowledge_cache[cat_hash]
+            print("Conocimiento cargado desde caché en Memoria RAM!")
+            
+        # 2. Si no está en RAM, intentar Firebase
+        if not cached_text and firebase_db:
             doc_ref = firebase_db.collection("ai_knowledge_cache").document(cat_hash)
             doc = doc_ref.get()
             if doc.exists:
                 cached_text = doc.to_dict().get("extracted_text")
+                memory_knowledge_cache[cat_hash] = cached_text # Guardar en RAM para la próxima
                 print("Conocimiento cargado desde Firebase caché!")
         
+        # 3. Si no hay caché en ningún lado, extraer con IA
         if not cached_text:
-            print("Caché no encontrado o Firebase no configurado. Procesando PDFs...")
-            # Descargar de Cloudflare y subir a Gemini (solo los nuevos)
+            print("Caché no encontrado. Procesando PDFs con Gemini...")
             files = get_or_upload_files(catalogs_data)
             
             if not files:
                 return jsonify({"response": "No se pudieron cargar los catálogos desde el servidor."})
                 
-            if firebase_db:
-                cached_text = extract_knowledge_from_catalogs(files)
-                if cached_text:
-                    doc_ref = firebase_db.collection("ai_knowledge_cache").document(cat_hash)
-                    doc_ref.set({"extracted_text": cached_text, "catalogs_hash": cat_hash})
-                    print("Conocimiento guardado en Firebase caché!")
+            cached_text = extract_knowledge_from_catalogs(files)
+            
+            if cached_text:
+                # Guardar en memoria RAM siempre
+                memory_knowledge_cache[cat_hash] = cached_text
+                
+                # Guardar en Firebase si está configurado
+                if firebase_db:
+                    try:
+                        doc_ref = firebase_db.collection("ai_knowledge_cache").document(cat_hash)
+                        doc_ref.set({"extracted_text": cached_text, "catalogs_hash": cat_hash})
+                        print("Conocimiento guardado en Firebase caché!")
+                    except Exception as e:
+                        print(f"Error guardando en Firebase: {e}")
+                else:
+                    print("Firebase no configurado. Solo se usará caché en RAM (se perderá si el servidor se reinicia).")
             
         if cached_text:
             # Búsqueda local instantánea y gratuita!
