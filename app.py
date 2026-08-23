@@ -36,10 +36,12 @@ def get_or_upload_files(catalogs):
         if filename not in uploaded_files_cache:
             print(f"Descargando {title} desde Cloudflare ({url})...")
             try:
-                response = requests.get(url)
+                response = requests.get(url, stream=True)
                 if response.status_code == 200:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                        tmp_file.write(response.content)
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                tmp_file.write(chunk)
                         tmp_path = tmp_file.name
                     
                     print(f"Subiendo {filename} a Gemini...")
