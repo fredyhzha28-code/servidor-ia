@@ -138,19 +138,21 @@ def generate_content_robust(contents):
     models_to_try = [
         'gemini-2.5-flash',
         'gemini-2.0-flash',
+        'gemini-2.0-flash-exp',
+        'gemini-1.5-flash-latest',
         'gemini-3.0-flash',
-        'gemini-3.5-flash'
+        'gemini-3.5-flash',
+        'gemini-pro'
     ]
-    last_error = None
+    errors = []
     for m in models_to_try:
         try:
+            print(f"Probando {m}...")
             return client.models.generate_content(model=m, contents=contents)
         except Exception as e:
-            if '404' in str(e) or 'NOT_FOUND' in str(e):
-                last_error = e
-                continue
-            raise e
-    raise last_error
+            errors.append(f"[{m} falló: {str(e)}]")
+            
+    raise Exception("Todos los modelos fallaron: " + " | ".join(errors))
 
 def extract_knowledge_from_catalogs(files):
     """Pide a Gemini que extraiga todos los productos en formato JSON."""
@@ -191,6 +193,13 @@ def search_products():
     if not catalogs_data:
         return jsonify({"error": "No hay catálogos disponibles para buscar."}), 400
         
+    if query == "DEBUG_MODELS":
+        try:
+            available_models = [m.name for m in client.models.list()]
+            return jsonify({"response": f"Modelos activos en tu API Key:<br>{'<br>'.join(available_models)}"})
+        except Exception as e:
+            return jsonify({"response": f"Error obteniendo modelos: {str(e)}"})
+            
     try:
         cat_hash = get_catalogs_hash(catalogs_data)
         cached_text = None
@@ -260,10 +269,7 @@ def search_products():
         
     except Exception as e:
         error_msg = str(e)
-        print(f"Error: {error_msg}")
-        if '429' in error_msg or 'RESOURCE_EXHAUSTED' in error_msg:
-            friendly_msg = "La Inteligencia Artificial está procesando muchas consultas y alcanzó su límite de seguridad gratuito. Por favor, espera 1 minuto y vuelve a intentarlo."
-            return jsonify({"error": friendly_msg}), 429
+        print(f"Error crítico: {error_msg}")
         return jsonify({"error": error_msg}), 500
 
 if __name__ == '__main__':
