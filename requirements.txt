@@ -3,3 +3,4 @@ flask-cors
 google-genai
 python-dotenv
 gunicorn
+firebase-admin
