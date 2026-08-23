@@ -135,24 +135,11 @@ def local_search_in_json(query, products_json_str):
         return "¡Hola! Estoy actualizando mi base de datos de catálogos. Intenta tu búsqueda en un par de minutos."
 
 def generate_content_robust(contents):
-    models_to_try = [
-        'gemini-2.5-flash',
-        'gemini-2.0-flash',
-        'gemini-2.0-flash-exp',
-        'gemini-1.5-flash-latest',
-        'gemini-3.0-flash',
-        'gemini-3.5-flash',
-        'gemini-pro'
-    ]
-    errors = []
-    for m in models_to_try:
-        try:
-            print(f"Probando {m}...")
-            return client.models.generate_content(model=m, contents=contents)
-        except Exception as e:
-            errors.append(f"[{m} falló: {str(e)}]")
-            
-    raise Exception("Todos los modelos fallaron: " + " | ".join(errors))
+    # Usar explícitamente el modelo de producción con 1,500 peticiones al día gratis.
+    try:
+        return client.models.generate_content(model='gemini-2.5-flash', contents=contents)
+    except Exception as e:
+        raise Exception(f"Gemini 2.5 Flash falló: {str(e)}")
 
 def extract_knowledge_from_catalogs(files):
     """Pide a Gemini que extraiga todos los productos en formato JSON."""
