@@ -107,7 +107,7 @@ def extract_knowledge_from_catalogs(files):
     """
     try:
         response = client.models.generate_content(
-            model='gemini-1.5-flash',
+            model='gemini-3.5-flash',
             contents=[*files, prompt_extract]
         )
         return response.text
@@ -180,7 +180,7 @@ def search_products():
         
         print("Consultando a Gemini...")
         response = client.models.generate_content(
-            model='gemini-1.5-flash',
+            model='gemini-3.5-flash',
             contents=contents_to_send
         )
         
