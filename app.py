@@ -102,15 +102,21 @@ def get_catalogs_hash(catalogs):
 def local_search_in_json(query, products_json_str):
     """Busca en el texto JSON localmente y genera respuesta HTML sin usar Gemini."""
     try:
-        start_idx = products_json_str.find('[')
-        end_idx = products_json_str.rfind(']') + 1
-        if start_idx != -1 and end_idx != 0:
-            clean_json = products_json_str[start_idx:end_idx]
-        else:
-            clean_json = products_json_str
-            
-        products = json.loads(clean_json)
+        import re
+        import json
         
+        products = []
+        # Expresión regular para encontrar todos los objetos {...} completos.
+        # Esto soluciona el problema de si la IA trunca el texto por ser demasiados catálogos.
+        pattern = re.compile(r'\{[^{}]*\}')
+        for match in pattern.finditer(products_json_str):
+            try:
+                obj = json.loads(match.group(0))
+                if isinstance(obj, dict) and 'nombre' in obj:
+                    products.append(obj)
+            except Exception:
+                continue
+                
         query_words = [w.lower() for w in query.split() if len(w) > 2]
         if not query_words:
             query_words = [query.lower()]
