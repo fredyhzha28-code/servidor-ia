@@ -86,8 +86,16 @@ def get_or_upload_files(catalogs):
     return ready_files
 
 def get_catalogs_hash(catalogs):
-    """Genera un hash único basado en las URLs de los catálogos."""
-    urls = sorted([cat.get('url', '') for cat in catalogs if cat.get('url')])
+    """Genera un hash único basado en las URLs limpias (sin parámetros) de los catálogos."""
+    urls = []
+    for cat in catalogs:
+        url = cat.get('url', '')
+        if url:
+            # Eliminar parámetros query (como tokens de Cloudflare R2) para que el hash sea consistente
+            clean_url = url.split('?')[0]
+            urls.append(clean_url)
+            
+    urls = sorted(urls)
     combined_urls = "".join(urls)
     return hashlib.md5(combined_urls.encode()).hexdigest()
 
