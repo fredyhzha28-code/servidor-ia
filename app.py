@@ -153,7 +153,7 @@ def local_search_in_json(query, products_json_str):
             precio = r.get('precio', '')
             cat = r.get('catalogo', '')
             pag = r.get('pagina', '')
-            html += f"<li style='margin-bottom:8px'><b>{nombre}</b> - <b>{precio}</b><br><span style='color:#64748b; font-size:0.9em'>Catálogo {cat}, Pág {pag}</span></li>"
+            html += f"<li style='margin-bottom:12px'><b>{nombre}</b> - <b class='text-pink-600'>{precio}</b><br><span style='color:#64748b; font-size:0.95em'>Catálogo {cat}, Pág {pag}</span> <a href='#' onclick=\"window.openCatalogByTitle('{cat}', '{pag}'); return false;\" class='ml-2 inline-flex items-center gap-1 bg-pink-50 text-pink-600 px-3 py-1 rounded-full text-xs font-bold hover:bg-pink-100 transition-colors shadow-sm'><i class='fas fa-book-open'></i> VER</a></li>"
         html += "</ul><br>¡Si te gusta alguno, anímate y dale al botón verde para pedirlo por WhatsApp!"
         
         return html
@@ -280,8 +280,9 @@ def search_products():
             1. Actúa como humano, amable y persuasivo. Analiza la intención (ej. regalos para mamá, productos baratos para hombre).
             2. Selecciona las mejores opciones del JSON.
             3. Menciona SIEMPRE el nombre, PRECIO, CATÁLOGO y PÁGINA.
-            4. Usa HTML básico (<b>, <ul>, <li>, <br>) para formatear bonito.
-            5. Invita al cliente a hacer su pedido por WhatsApp.
+            4. Añade SIEMPRE un botón [VER] usando HTML así: <a href="#" onclick="window.openCatalogByTitle('NOMBRE_DEL_CATALOGO', 'NUMERO_PAGINA'); return false;" class="inline-flex items-center gap-1 bg-pink-50 text-pink-600 px-3 py-1 rounded-full text-xs font-bold hover:bg-pink-100 transition-colors shadow-sm ml-2"><i class="fas fa-book-open"></i> VER</a>. Reemplaza NOMBRE_DEL_CATALOGO y NUMERO_PAGINA con los datos exactos del JSON.
+            5. Usa HTML básico (<b>, <ul>, <li style="margin-bottom:12px">, <br>, <a>) para formatear bonito.
+            6. Invita al cliente a hacer su pedido por WhatsApp.
             """
             
             try:
