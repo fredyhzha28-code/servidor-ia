@@ -176,6 +176,24 @@ def extract_knowledge_from_catalogs(files):
         print(f"Error en extracción: {e}")
         return None
 
+import threading
+
+def background_extract_and_save(catalogs_data, cat_hash):
+    print("Iniciando extracción en segundo plano...")
+    try:
+        files = get_or_upload_files(catalogs_data)
+        if not files: return
+        cached_text = extract_knowledge_from_catalogs(files)
+        if cached_text:
+            global memory_knowledge_cache
+            memory_knowledge_cache[cat_hash] = cached_text
+            if firebase_db:
+                doc_ref = firebase_db.collection("ai_knowledge_cache").document(cat_hash)
+                doc_ref.set({"extracted_text": cached_text, "catalogs_hash": cat_hash})
+                print("Conocimiento guardado en Firebase caché (desde segundo plano)!")
+    except Exception as e:
+        print(f"Error en hilo de fondo: {e}")
+
 @app.route('/api/search', methods=['POST'])
 def search_products():
     data = request.json
@@ -198,9 +216,8 @@ def search_products():
     try:
         cat_hash = get_catalogs_hash(catalogs_data)
         cached_text = None
-        files = None
         
-        # 1. Intentar leer de Memoria RAM primero (más rápido)
+        # 1. Intentar leer de Memoria RAM primero
         global memory_knowledge_cache
         if cat_hash in memory_knowledge_cache:
             cached_text = memory_knowledge_cache[cat_hash]
@@ -212,33 +229,24 @@ def search_products():
             doc = doc_ref.get()
             if doc.exists:
                 cached_text = doc.to_dict().get("extracted_text")
-                memory_knowledge_cache[cat_hash] = cached_text # Guardar en RAM para la próxima
+                memory_knowledge_cache[cat_hash] = cached_text
                 print("Conocimiento cargado desde Firebase caché!")
         
-        # 3. Si no hay caché en ningún lado, extraer con IA
+        # 3. Si no hay caché en ningún lado, extraer con IA EN SEGUNDO PLANO
         if not cached_text:
-            print("Caché no encontrado. Procesando PDFs con Gemini...")
-            files = get_or_upload_files(catalogs_data)
+            print("Caché no encontrado. Iniciando hilo en segundo plano...")
+            # Iniciamos el proceso largo en segundo plano para no bloquear (y evitar error de CORS/Timeout de Render)
+            thread = threading.Thread(target=background_extract_and_save, args=(catalogs_data, cat_hash))
+            thread.start()
             
-            if not files:
-                return jsonify({"response": "No se pudieron cargar los catálogos desde el servidor."})
-                
-            cached_text = extract_knowledge_from_catalogs(files)
-            
-            if cached_text:
-                # Guardar en memoria RAM siempre
-                memory_knowledge_cache[cat_hash] = cached_text
-                
-                # Guardar en Firebase si está configurado
-                if firebase_db:
-                    try:
-                        doc_ref = firebase_db.collection("ai_knowledge_cache").document(cat_hash)
-                        doc_ref.set({"extracted_text": cached_text, "catalogs_hash": cat_hash})
-                        print("Conocimiento guardado en Firebase caché!")
-                    except Exception as e:
-                        print(f"Error guardando en Firebase: {e}")
-                else:
-                    print("Firebase no configurado. Solo se usará caché en RAM (se perderá si el servidor se reinicia).")
+            # Devolvemos un mensaje amigable indicando que estamos procesando
+            friendly_msg = (
+                "¡Hola! He detectado que hay revistas nuevas. 🚀<br><br>"
+                "Estoy leyendo y memorizando todos los productos en la nube ahora mismo. "
+                "Esto tomará alrededor de 1 a 2 minutos.<br><br>"
+                "Por favor, <b>intenta tu búsqueda de nuevo en un par de minutos</b> y será instantánea."
+            )
+            return jsonify({"response": friendly_msg})
             
         if cached_text:
             # Búsqueda local instantánea y gratuita!
