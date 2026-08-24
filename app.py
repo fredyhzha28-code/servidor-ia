@@ -104,6 +104,16 @@ def local_search_in_json(query, products_json_str):
     try:
         import re
         import json
+        import unicodedata
+        
+        def normalize_text(text):
+            if not text: return ""
+            text = text.lower()
+            # Quitar tildes y acentos
+            text = ''.join(c for c in unicodedata.normalize('NFD', text) if unicodedata.category(c) != 'Mn')
+            # Quitar signos de puntuación, comillas, apóstrofes
+            text = re.sub(r'[^a-z0-9\s]', '', text)
+            return text
         
         products = []
         # Expresión regular para encontrar todos los objetos {...} completos.
@@ -117,13 +127,16 @@ def local_search_in_json(query, products_json_str):
             except Exception:
                 continue
                 
-        query_words = [w.lower() for w in query.split() if len(w) > 2]
+        # Normalizar la búsqueda del usuario (ej. "d'orsay" -> "dorsay", "Ésika" -> "esika")
+        normalized_query = normalize_text(query)
+        query_words = [w for w in normalized_query.split() if len(w) > 2]
         if not query_words:
-            query_words = [query.lower()]
+            query_words = [normalized_query]
             
         results = []
         for p in products:
-            text_to_search = f"{p.get('nombre', '')} {p.get('catalogo', '')}".lower()
+            # Normalizar el texto del producto para poder compararlo
+            text_to_search = normalize_text(f"{p.get('nombre', '')} {p.get('catalogo', '')}")
             score = sum(1 for w in query_words if w in text_to_search)
             if score > 0:
                 results.append((score, p))
@@ -255,26 +268,32 @@ def search_products():
             return jsonify({"response": friendly_msg})
             
         if cached_text:
-            # Búsqueda local instantánea y gratuita!
-            print("Realizando búsqueda local en caché JSON...")
-            html_response = local_search_in_json(query, cached_text)
-            return jsonify({"response": html_response})
-        else:
-            # Fallback en caso de que todo el caché falle
+            print("Consultando a Gemini usando el caché JSON rápido para una respuesta inteligente...")
             prompt = f"""
-            Eres un asistente de ventas experto y persuasivo para una tienda de belleza y moda que vende por catálogo.
-            El usuario ha escrito la siguiente búsqueda: "{query}"
+            Eres un asistente de ventas experto para la Tienda de Erika.
+            Aquí tienes nuestra base de datos actual de productos en formato JSON:
+            {cached_text}
             
-            Tus reglas estrictas a seguir son:
-            1. Encontrar los productos que mejor respondan a lo que busca el cliente.
-            2. SIEMPRE debes incluir el PRECIO del producto.
-            3. Dile al cliente exactamente en qué catálogo (ej. Esika, Leonisa) y en qué número de PÁGINA está el producto.
-            4. Sé muy amable, entusiasta y servicial, invitando al cliente a realizar su pedido por WhatsApp.
-            5. Da un formato bonito y ordenado a tu respuesta usando etiquetas HTML básicas.
+            El cliente busca: "{query}"
+            
+            Reglas:
+            1. Actúa como humano, amable y persuasivo. Analiza la intención (ej. regalos para mamá, productos baratos para hombre).
+            2. Selecciona las mejores opciones del JSON.
+            3. Menciona SIEMPRE el nombre, PRECIO, CATÁLOGO y PÁGINA.
+            4. Usa HTML básico (<b>, <ul>, <li>, <br>) para formatear bonito.
+            5. Invita al cliente a hacer su pedido por WhatsApp.
             """
-            print("Consultando a Gemini (Fallback)...")
-            response = generate_content_robust(contents=[*files, prompt])
-            return jsonify({"response": response.text})
+            
+            try:
+                # Intento de búsqueda IA rápida e inteligente
+                ai_response = generate_content_robust(contents=[prompt])
+                return jsonify({"response": ai_response.text})
+            except Exception as e:
+                print(f"La búsqueda inteligente falló (posible límite de cuota). Usando búsqueda local de respaldo... Error: {e}")
+                # Respaldo a búsqueda local si Gemini falla
+                html_response = local_search_in_json(query, cached_text)
+                return jsonify({"response": html_response})
+
         
     except Exception as e:
         error_msg = str(e)
