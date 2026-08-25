@@ -170,7 +170,7 @@ def generate_content_robust(contents, max_retries=3):
     # Usar explícitamente el modelo que tiene cuota asignada en su proyecto
     for attempt in range(max_retries):
         try:
-            return client.models.generate_content(model='gemini-1.5-flash', contents=contents)
+            return client.models.generate_content(model='gemini-flash-latest', contents=contents)
         except Exception as e:
             error_str = str(e)
             print(f"Intento {attempt + 1} falló: {error_str}")
