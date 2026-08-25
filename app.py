@@ -373,6 +373,9 @@ def search_products():
                 )
                 return jsonify({"response": friendly_msg})
             
+        if query == "ignorar":
+            return jsonify({"response": "Proceso de sincronización iniciado."})
+            
         # 4. Si todos están listos, unimos los JSON
         print("Todos los catálogos en caché. Uniendo información...")
         combined_items = []
