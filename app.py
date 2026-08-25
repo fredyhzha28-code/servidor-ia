@@ -190,7 +190,7 @@ def local_search_in_json(query, products_json_str):
 
 import time
 
-def generate_content_robust(contents, max_retries=3, progress_callback=None):
+def generate_content_robust(contents, max_retries=10, progress_callback=None):
     # Volvemos a tu modelo favorito gemini-3.6-flash
     last_error = None
     for attempt in range(max_retries):
@@ -229,7 +229,7 @@ def generate_content_robust(contents, max_retries=3, progress_callback=None):
             print("Todas las API keys fallaron o están sin cuota. " + msg)
             if progress_callback:
                 progress_callback(msg, 60 + attempt)
-            time.sleep(15)
+            time.sleep(35)
         else:
             raise Exception(f"Gemini falló tras probar todas las llaves {max_retries} veces. Último error: {last_error}")
 
