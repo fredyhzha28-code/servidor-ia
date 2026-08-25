@@ -188,7 +188,7 @@ def local_search_in_json(query, products_json_str):
 
 import time
 
-def generate_content_robust(contents, max_retries=3):
+def generate_content_robust(contents, max_retries=3, progress_callback=None):
     # Volvemos a tu modelo favorito gemini-3.6-flash
     last_error = None
     for attempt in range(max_retries):
@@ -223,12 +223,15 @@ def generate_content_robust(contents, max_retries=3):
         
         # Si agotó todas las llaves en este intento
         if attempt < max_retries - 1:
-            print("Todas las API keys fallaron o están sin cuota. Esperando 15 segundos antes de reintentar...")
+            msg = f"Reintentando por saturación (Intento {attempt+2}/{max_retries})..."
+            print("Todas las API keys fallaron o están sin cuota. " + msg)
+            if progress_callback:
+                progress_callback(msg, 60 + attempt)
             time.sleep(15)
         else:
             raise Exception(f"Gemini falló tras probar todas las llaves {max_retries} veces. Último error: {last_error}")
 
-def extract_knowledge_from_catalog(files_list, title):
+def extract_knowledge_from_catalog(files_list, title, progress_callback=None):
     """Pide a Gemini que extraiga todos los productos de UN catálogo en formato JSON."""
     print(f"Extrayendo conocimiento de {title} (esto puede tardar)...")
     prompt_extract = f"""
@@ -250,7 +253,7 @@ def extract_knowledge_from_catalog(files_list, title):
     Es crítico que extraigas la mayor cantidad posible de productos de este catálogo.
     """
     try:
-        response = generate_content_robust(contents=[files_list, prompt_extract])
+        response = generate_content_robust(contents=[files_list, prompt_extract], progress_callback=progress_callback)
         if not response or not response.text:
             raise Exception("Respuesta vacía de Gemini")
         return response.text
@@ -293,7 +296,17 @@ def background_extract_and_save(missing_catalogs):
                     "updatedAt": firestore.SERVER_TIMESTAMP
                 })
                 
-            cached_text = extract_knowledge_from_catalog(files_list, title)
+            def extraction_progress(msg, pct):
+                if status_collection:
+                    try:
+                        status_collection.document(cat_hash).update({
+                            "message": msg,
+                            "progress": pct,
+                            "updatedAt": firestore.SERVER_TIMESTAMP
+                        })
+                    except: pass
+                
+            cached_text = extract_knowledge_from_catalog(files_list, title, progress_callback=extraction_progress)
             if cached_text:
                 global memory_knowledge_cache
                 memory_knowledge_cache[cat_hash] = cached_text
