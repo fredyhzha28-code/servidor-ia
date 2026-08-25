@@ -280,6 +280,85 @@ def extract_knowledge_from_catalog(files_list, title, progress_callback=None, cl
         raise e
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
+
+def process_single_catalog(idx, cat):
+    try:
+        url = cat.get('url', '')
+        title = cat.get('title', 'Revista')
+        if not url: return
+        
+        cat_hash = get_single_catalog_hash(url)
+        
+        # Asignar una llave dedicada basada en su posición en la fila
+        client_idx = idx % len(clients) if clients else None
+        
+        appId = cat.get('appId', 'tienda-catalogos-app')
+        status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status") if firebase_db else None
+        
+        # Avisar al frontend (admin) que empezó
+        if status_collection:
+            status_collection.document(cat_hash).set({
+                "status": "processing",
+                "title": title,
+                "message": f"Iniciando lectura (Asignada a Llave {client_idx+1})...",
+                "progress": 5,
+                "updatedAt": firestore.SERVER_TIMESTAMP
+            })
+            
+        files_list = get_or_upload_file(cat, cat_hash, client_idx)
+        if not files_list: return
+        
+        if status_collection:
+            status_collection.document(cat_hash).update({
+                "message": "La IA está analizando los productos (esto demora un poco)...",
+                "progress": 60,
+                "updatedAt": firestore.SERVER_TIMESTAMP
+            })
+            
+        def extraction_progress(msg, pct):
+            if status_collection:
+                try:
+                    status_collection.document(cat_hash).update({
+                        "message": msg,
+                        "progress": pct,
+                        "updatedAt": firestore.SERVER_TIMESTAMP
+                    })
+                except: pass
+            
+        cached_text = extract_knowledge_from_catalog(files_list, title, progress_callback=extraction_progress, client_idx=client_idx)
+        if cached_text:
+            global memory_knowledge_cache
+            memory_knowledge_cache[cat_hash] = cached_text
+            if status_collection:
+                # Guardar el JSON (este va en caché interno del backend, no necesita appId)
+                doc_ref = firebase_db.collection("ai_knowledge_cache_single").document(cat_hash)
+                doc_ref.set({"extracted_text": cached_text, "url": url.split('?')[0]})
+                
+                # Avisar al frontend que terminó
+                status_collection.document(cat_hash).set({
+                    "status": "completed",
+                    "title": title,
+                    "message": "¡Revista memorizada con éxito!",
+                    "progress": 100,
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                })
+                print(f"Conocimiento guardado en Firebase caché para: {title}!")
+    except Exception as e:
+        print(f"Error procesando catálogo {cat.get('title')}: {e}")
+        try:
+            appId = cat.get('appId', 'tienda-catalogos-app')
+            status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status") if firebase_db else None
+            if status_collection:
+                cat_hash = get_single_catalog_hash(cat.get('url', ''))
+                status_collection.document(cat_hash).set({
+                    "status": "error",
+                    "title": cat.get('title'),
+                    "message": f"Error de Gemini (revisa la cuota). El sistema lo intentará de nuevo.",
+                    "progress": 0,
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                })
+        except: pass
 
 def background_extract_and_save(missing_catalogs):
     print(f"Iniciando extracción en segundo plano para {len(missing_catalogs)} revistas nuevas...")
@@ -302,80 +381,10 @@ def background_extract_and_save(missing_catalogs):
                 })
         except: pass
 
-    # 2. Empezar a procesar secuencialmente con llave dedicada
-    for idx, cat in enumerate(missing_catalogs):
-        try:
-            url = cat.get('url', '')
-            title = cat.get('title', 'Revista')
-            if not url: continue
-            
-            cat_hash = get_single_catalog_hash(url)
-            
-            # Asignar una llave dedicada basada en su posición en la fila
-            client_idx = idx % len(clients) if clients else None
-            
-            appId = cat.get('appId', 'tienda-catalogos-app')
-            status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status") if firebase_db else None
-            
-            # Avisar al frontend (admin) que empezó
-            if status_collection:
-                status_collection.document(cat_hash).set({
-                    "status": "processing",
-                    "title": title,
-                    "message": f"Iniciando lectura (Asignada a Llave {client_idx+1})...",
-                    "progress": 5,
-                    "updatedAt": firestore.SERVER_TIMESTAMP
-                })
-                
-            files_list = get_or_upload_file(cat, cat_hash, client_idx)
-            if not files_list: continue
-            
-            if status_collection:
-                status_collection.document(cat_hash).update({
-                    "message": "La IA está analizando los productos (esto demora un poco)...",
-                    "progress": 60,
-                    "updatedAt": firestore.SERVER_TIMESTAMP
-                })
-                
-            def extraction_progress(msg, pct):
-                if status_collection:
-                    try:
-                        status_collection.document(cat_hash).update({
-                            "message": msg,
-                            "progress": pct,
-                            "updatedAt": firestore.SERVER_TIMESTAMP
-                        })
-                    except: pass
-                
-            cached_text = extract_knowledge_from_catalog(files_list, title, progress_callback=extraction_progress, client_idx=client_idx)
-            if cached_text:
-                global memory_knowledge_cache
-                memory_knowledge_cache[cat_hash] = cached_text
-                if status_collection:
-                    # Guardar el JSON (este va en caché interno del backend, no necesita appId)
-                    doc_ref = firebase_db.collection("ai_knowledge_cache_single").document(cat_hash)
-                    doc_ref.set({"extracted_text": cached_text, "url": url.split('?')[0]})
-                    
-                    # Avisar al frontend que terminó
-                    status_collection.document(cat_hash).set({
-                        "status": "completed",
-                        "title": title,
-                        "message": "¡Revista memorizada con éxito!",
-                        "progress": 100,
-                        "updatedAt": firestore.SERVER_TIMESTAMP
-                    })
-                    print(f"Conocimiento guardado en Firebase caché para: {title}!")
-        except Exception as e:
-            print(f"Error procesando catálogo {cat.get('title')}: {e}")
-            if 'status_collection' in locals() and status_collection:
-                status_collection.document(cat_hash).set({
-                    "status": "error",
-                    "title": cat.get('title'),
-                    "message": f"Error de Gemini (revisa la cuota). El sistema lo intentará de nuevo.",
-                    "progress": 0,
-                    "error": str(e),
-                    "updatedAt": firestore.SERVER_TIMESTAMP
-                })
+    # 2. Empezar a procesar en paralelo con 3 hilos máximo (para no ahogar la RAM de Render)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        for idx, cat in enumerate(missing_catalogs):
+            executor.submit(process_single_catalog, idx, cat)
 
 @app.route('/api/search', methods=['POST'])
 def search_products():
