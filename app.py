@@ -389,6 +389,18 @@ def search_products():
             
             if cat_json:
                 cached_jsons.append(cat_json)
+                # ¡NUEVO! Actualizar la interfaz para que el usuario sepa que esta ya estaba lista
+                if query == "ignorar" and firebase_db:
+                    try:
+                        status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status")
+                        status_collection.document(cat_hash).set({
+                            "status": "completed",
+                            "title": title,
+                            "message": "¡Ya estaba en la nube! (Omitida inteligentemente)",
+                            "progress": 100,
+                            "updatedAt": firestore.SERVER_TIMESTAMP
+                        })
+                    except: pass
             else:
                 missing_catalogs.append(cat)
         
