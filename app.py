@@ -92,18 +92,30 @@ def get_or_upload_file(cat, cat_hash=None):
                 print(f"Subiendo {filename} a Gemini...")
                 update_progress("Enviando a la IA...", 30)
                 # Subir para cada API key para que todas tengan permiso de acceder al archivo
-                gemini_files_for_clients = []
-                for idx, c in enumerate(clients):
+                gemini_files_for_clients = [None] * len(clients)
+                if client_idx is not None and client_idx < len(clients):
+                    # Subir SOLO a la llave dedicada
                     try:
-                        update_progress(f"Subiendo a la nube (Llave {idx+1} de {len(clients)})...", 30 + (idx * 5))
-                        gf = c.files.upload(
+                        update_progress(f"Subiendo a la nube (Llave dedicada {client_idx+1})...", 30)
+                        gf = clients[client_idx].files.upload(
                             file=tmp_path, 
                             config={'display_name': title}
                         )
-                        gemini_files_for_clients.append(gf)
+                        gemini_files_for_clients[client_idx] = gf
                     except Exception as e:
-                        print(f"Error subiendo archivo a una llave: {e}")
-                        gemini_files_for_clients.append(None)
+                        print(f"Error subiendo archivo a la llave dedicada {client_idx+1}: {e}")
+                else:
+                    # Fallback por si acaso: Subir a todas
+                    for idx, c in enumerate(clients):
+                        try:
+                            update_progress(f"Subiendo a la nube (Llave {idx+1} de {len(clients)})...", 30 + (idx * 5))
+                            gf = c.files.upload(
+                                file=tmp_path, 
+                                config={'display_name': title}
+                            )
+                            gemini_files_for_clients[idx] = gf
+                        except Exception as e:
+                            print(f"Error subiendo archivo a una llave: {e}")
                 
                 uploaded_files_cache[filename] = gemini_files_for_clients
                 update_progress("¡Archivo subido! Iniciando lectura profunda...", 55)
@@ -190,11 +202,15 @@ def local_search_in_json(query, products_json_str):
 
 import time
 
-def generate_content_robust(contents, max_retries=10, progress_callback=None):
+def generate_content_robust(contents, client_idx=None, max_retries=10, progress_callback=None):
     # Volvemos a tu modelo favorito gemini-3.6-flash
     last_error = None
+    
+    # Determinar qué clientes intentar
+    clients_to_try = [(client_idx, clients[client_idx])] if client_idx is not None and client_idx < len(clients) else list(enumerate(clients))
+    
     for attempt in range(max_retries):
-        for idx, current_client in enumerate(clients):
+        for idx, current_client in clients_to_try:
             try:
                 # Construir el contents específico para esta llave
                 current_contents = []
@@ -223,7 +239,7 @@ def generate_content_robust(contents, max_retries=10, progress_callback=None):
                 else:
                     raise Exception(f"Gemini error fatal: {error_str}")
         
-        # Si agotó todas las llaves en este intento
+        # Si agotó todas las llaves permitidas en este intento
         if attempt < max_retries - 1:
             msg = f"Reintentando por saturación (Intento {attempt+2}/{max_retries})..."
             print("Todas las API keys fallaron o están sin cuota. " + msg)
@@ -233,7 +249,7 @@ def generate_content_robust(contents, max_retries=10, progress_callback=None):
         else:
             raise Exception(f"Gemini falló tras probar todas las llaves {max_retries} veces. Último error: {last_error}")
 
-def extract_knowledge_from_catalog(files_list, title, progress_callback=None):
+def extract_knowledge_from_catalog(files_list, title, progress_callback=None, client_idx=None):
     """Pide a Gemini que extraiga todos los productos de UN catálogo en formato JSON."""
     print(f"Extrayendo conocimiento de {title} (esto puede tardar)...")
     prompt_extract = f"""
@@ -255,7 +271,7 @@ def extract_knowledge_from_catalog(files_list, title, progress_callback=None):
     Es crítico que extraigas la mayor cantidad posible de productos de este catálogo.
     """
     try:
-        response = generate_content_robust(contents=[files_list, prompt_extract], progress_callback=progress_callback)
+        response = generate_content_robust(contents=[files_list, prompt_extract], client_idx=client_idx, progress_callback=progress_callback)
         if not response or not response.text:
             raise Exception("Respuesta vacía de Gemini")
         return response.text
@@ -286,14 +302,17 @@ def background_extract_and_save(missing_catalogs):
                 })
         except: pass
 
-    # 2. Empezar a procesar secuencialmente
-    for cat in missing_catalogs:
+    # 2. Empezar a procesar secuencialmente con llave dedicada
+    for idx, cat in enumerate(missing_catalogs):
         try:
             url = cat.get('url', '')
             title = cat.get('title', 'Revista')
             if not url: continue
             
             cat_hash = get_single_catalog_hash(url)
+            
+            # Asignar una llave dedicada basada en su posición en la fila
+            client_idx = idx % len(clients) if clients else None
             
             appId = cat.get('appId', 'tienda-catalogos-app')
             status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status") if firebase_db else None
@@ -303,12 +322,12 @@ def background_extract_and_save(missing_catalogs):
                 status_collection.document(cat_hash).set({
                     "status": "processing",
                     "title": title,
-                    "message": "Iniciando lectura...",
+                    "message": f"Iniciando lectura (Asignada a Llave {client_idx+1})...",
                     "progress": 5,
                     "updatedAt": firestore.SERVER_TIMESTAMP
                 })
                 
-            files_list = get_or_upload_file(cat, cat_hash)
+            files_list = get_or_upload_file(cat, cat_hash, client_idx)
             if not files_list: continue
             
             if status_collection:
@@ -328,7 +347,7 @@ def background_extract_and_save(missing_catalogs):
                         })
                     except: pass
                 
-            cached_text = extract_knowledge_from_catalog(files_list, title, progress_callback=extraction_progress)
+            cached_text = extract_knowledge_from_catalog(files_list, title, progress_callback=extraction_progress, client_idx=client_idx)
             if cached_text:
                 global memory_knowledge_cache
                 memory_knowledge_cache[cat_hash] = cached_text
