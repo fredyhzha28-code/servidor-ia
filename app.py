@@ -39,65 +39,52 @@ else:
 uploaded_files_cache = {}
 memory_knowledge_cache = {}
 
-def get_or_upload_files(catalogs):
+def get_or_upload_file(cat):
     """
-    catalogs = [{'title': '...', 'url': '...'}, ...]
+    Sube UN solo catálogo a Gemini y retorna el objeto de archivo.
+    cat = {'title': '...', 'url': '...'}
     """
     global uploaded_files_cache
-    ready_files = []
-    
-    for cat in catalogs:
-        url = cat.get('url')
-        title = cat.get('title', 'Catálogo')
-        if not url:
-            continue
-            
-        filename = url.split("/")[-1]
-        if '?' in filename:
-            filename = filename.split('?')[0] # Limpiar query params si hay
-            
-        if filename not in uploaded_files_cache:
-            print(f"Descargando {title} desde Cloudflare ({url})...")
-            try:
-                response = requests.get(url, stream=True)
-                if response.status_code == 200:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:
-                                tmp_file.write(chunk)
-                        tmp_path = tmp_file.name
-                    
-                    print(f"Subiendo {filename} a Gemini...")
-                    gemini_file = client.files.upload(
-                        file=tmp_path, 
-                        config={'display_name': title}
-                    )
-                    uploaded_files_cache[filename] = gemini_file
-                    
-                    os.remove(tmp_path)
-                else:
-                    print(f"Error {response.status_code} al descargar {url}")
-            except Exception as e:
-                print(f"Error de conexión con {url}: {str(e)}")
+    url = cat.get('url')
+    title = cat.get('title', 'Catálogo')
+    if not url:
+        return None
         
-        if filename in uploaded_files_cache:
-            ready_files.append(uploaded_files_cache[filename])
+    filename = url.split("/")[-1]
+    if '?' in filename:
+        filename = filename.split('?')[0] # Limpiar query params si hay
+        
+    if filename not in uploaded_files_cache:
+        print(f"Descargando {title} desde Cloudflare ({url})...")
+        try:
+            response = requests.get(url, stream=True)
+            if response.status_code == 200:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            tmp_file.write(chunk)
+                    tmp_path = tmp_file.name
                 
-    return ready_files
+                print(f"Subiendo {filename} a Gemini...")
+                gemini_file = client.files.upload(
+                    file=tmp_path, 
+                    config={'display_name': title}
+                )
+                uploaded_files_cache[filename] = gemini_file
+                
+                os.remove(tmp_path)
+            else:
+                print(f"Error {response.status_code} al descargar {url}")
+        except Exception as e:
+            print(f"Error de conexión con {url}: {str(e)}")
+    
+    return uploaded_files_cache.get(filename)
 
-def get_catalogs_hash(catalogs):
-    """Genera un hash único basado en las URLs limpias (sin parámetros) de los catálogos."""
-    urls = []
-    for cat in catalogs:
-        url = cat.get('url', '')
-        if url:
-            # Eliminar parámetros query (como tokens de Cloudflare R2) para que el hash sea consistente
-            clean_url = url.split('?')[0]
-            urls.append(clean_url)
-            
-    urls = sorted(urls)
-    combined_urls = "".join(urls)
-    return hashlib.md5(combined_urls.encode()).hexdigest()
+def get_single_catalog_hash(url):
+    """Genera un hash único basado en la URL de un solo catálogo."""
+    if not url: return ""
+    clean_url = url.split('?')[0]
+    return hashlib.md5(clean_url.encode()).hexdigest()
 
 def local_search_in_json(query, products_json_str):
     """Busca en el texto JSON localmente y genera respuesta HTML sin usar Gemini."""
@@ -168,12 +155,12 @@ def generate_content_robust(contents):
     except Exception as e:
         raise Exception(f"Gemini 3.6 Flash falló: {str(e)}")
 
-def extract_knowledge_from_catalogs(files):
-    """Pide a Gemini que extraiga todos los productos en formato JSON."""
-    print("Extrayendo conocimiento de todos los catálogos (esto puede tardar)...")
+def extract_knowledge_from_catalog(file):
+    """Pide a Gemini que extraiga todos los productos de UN catálogo en formato JSON."""
+    print("Extrayendo conocimiento del catálogo (esto puede tardar)...")
     prompt_extract = """
-    Lee detalladamente todos estos catálogos adjuntos.
-    Tu tarea es extraer un listado masivo de TODOS los productos mencionados.
+    Lee detalladamente el catálogo adjunto.
+    Tu tarea es extraer un listado masivo de TODOS los productos mencionados en este catálogo.
     
     DEBES responder ÚNICAMENTE con un array en formato JSON con la siguiente estructura exacta:
     [
@@ -186,10 +173,10 @@ def extract_knowledge_from_catalogs(files):
     ]
     
     No añadas ningún texto antes ni después del JSON (sin comillas invertidas ni la palabra json).
-    Es crítico que extraigas la mayor cantidad posible de productos.
+    Es crítico que extraigas la mayor cantidad posible de productos de este catálogo.
     """
     try:
-        response = generate_content_robust(contents=[*files, prompt_extract])
+        response = generate_content_robust(contents=[file, prompt_extract])
         return response.text
     except Exception as e:
         print(f"Error en extracción: {e}")
@@ -197,21 +184,28 @@ def extract_knowledge_from_catalogs(files):
 
 import threading
 
-def background_extract_and_save(catalogs_data, cat_hash):
-    print("Iniciando extracción en segundo plano...")
-    try:
-        files = get_or_upload_files(catalogs_data)
-        if not files: return
-        cached_text = extract_knowledge_from_catalogs(files)
-        if cached_text:
-            global memory_knowledge_cache
-            memory_knowledge_cache[cat_hash] = cached_text
-            if firebase_db:
-                doc_ref = firebase_db.collection("ai_knowledge_cache").document(cat_hash)
-                doc_ref.set({"extracted_text": cached_text, "catalogs_hash": cat_hash})
-                print("Conocimiento guardado en Firebase caché (desde segundo plano)!")
-    except Exception as e:
-        print(f"Error en hilo de fondo: {e}")
+def background_extract_and_save(missing_catalogs):
+    print(f"Iniciando extracción en segundo plano para {len(missing_catalogs)} revistas nuevas...")
+    for cat in missing_catalogs:
+        try:
+            url = cat.get('url', '')
+            if not url: continue
+            
+            cat_hash = get_single_catalog_hash(url)
+            file_obj = get_or_upload_file(cat)
+            
+            if not file_obj: continue
+            
+            cached_text = extract_knowledge_from_catalog(file_obj)
+            if cached_text:
+                global memory_knowledge_cache
+                memory_knowledge_cache[cat_hash] = cached_text
+                if firebase_db:
+                    doc_ref = firebase_db.collection("ai_knowledge_cache_single").document(cat_hash)
+                    doc_ref.set({"extracted_text": cached_text, "url": url.split('?')[0]})
+                    print(f"Conocimiento guardado en Firebase caché para: {cat.get('title')}!")
+        except Exception as e:
+            print(f"Error procesando catálogo {cat.get('title')}: {e}")
 
 @app.route('/api/search', methods=['POST'])
 def search_products():
@@ -233,46 +227,89 @@ def search_products():
             return jsonify({"response": f"Error obteniendo modelos: {str(e)}"})
             
     try:
-        cat_hash = get_catalogs_hash(catalogs_data)
-        cached_text = None
-        
-        # 1. Intentar leer de Memoria RAM primero
         global memory_knowledge_cache
-        if cat_hash in memory_knowledge_cache:
-            cached_text = memory_knowledge_cache[cat_hash]
-            print("Conocimiento cargado desde caché en Memoria RAM!")
-            
-        # 2. Si no está en RAM, intentar Firebase
-        if not cached_text and firebase_db:
-            doc_ref = firebase_db.collection("ai_knowledge_cache").document(cat_hash)
-            doc = doc_ref.get()
-            if doc.exists:
-                cached_text = doc.to_dict().get("extracted_text")
-                memory_knowledge_cache[cat_hash] = cached_text
-                print("Conocimiento cargado desde Firebase caché!")
+        cached_jsons = []
+        missing_catalogs = []
         
-        # 3. Si no hay caché en ningún lado, extraer con IA EN SEGUNDO PLANO
-        if not cached_text:
-            print("Caché no encontrado. Iniciando hilo en segundo plano...")
-            # Iniciamos el proceso largo en segundo plano para no bloquear (y evitar error de CORS/Timeout de Render)
-            thread = threading.Thread(target=background_extract_and_save, args=(catalogs_data, cat_hash))
+        for cat in catalogs_data:
+            url = cat.get('url', '')
+            if not url: continue
+            
+            cat_hash = get_single_catalog_hash(url)
+            cat_json = None
+            
+            # 1. Intentar leer de Memoria RAM
+            if cat_hash in memory_knowledge_cache:
+                cat_json = memory_knowledge_cache[cat_hash]
+                
+            # 2. Si no está en RAM, intentar Firebase
+            if not cat_json and firebase_db:
+                doc_ref = firebase_db.collection("ai_knowledge_cache_single").document(cat_hash)
+                doc = doc_ref.get()
+                if doc.exists:
+                    cat_json = doc.to_dict().get("extracted_text")
+                    if cat_json:
+                        memory_knowledge_cache[cat_hash] = cat_json
+            
+            if cat_json:
+                cached_jsons.append(cat_json)
+            else:
+                missing_catalogs.append(cat)
+        
+        # 3. Si hay catálogos sin caché, extraer EN SEGUNDO PLANO
+        if missing_catalogs:
+            print(f"Faltan {len(missing_catalogs)} catálogos en caché. Iniciando hilo en segundo plano...")
+            # Iniciamos el proceso largo en segundo plano para procesar SOLO los faltantes
+            thread = threading.Thread(target=background_extract_and_save, args=(missing_catalogs,))
             thread.start()
             
-            # Devolvemos un mensaje amigable indicando que estamos procesando
-            friendly_msg = (
-                "¡Hola! He detectado que hay revistas nuevas. 🚀<br><br>"
-                "Estoy leyendo y memorizando todos los productos en la nube ahora mismo. "
-                "Esto tomará alrededor de 1 a 2 minutos.<br><br>"
-                "Por favor, <b>intenta tu búsqueda de nuevo en un par de minutos</b> y será instantánea."
-            )
-            return jsonify({"response": friendly_msg})
+            # Si es la primera vez y no hay NADA en caché, pedimos esperar.
+            # De lo contrario, omitimos el mensaje y respondemos con los catálogos que SÍ están listos.
+            if not cached_jsons:
+                friendly_msg = (
+                    "¡Hola! Estoy memorizando nuestras revistas por primera vez en la nube. 🚀<br><br>"
+                    "Esto tomará un minuto.<br><br>"
+                    "Por favor, <b>intenta tu búsqueda de nuevo en breve</b>."
+                )
+                return jsonify({"response": friendly_msg})
             
-        if cached_text:
-            print("Consultando a Gemini usando el caché JSON rápido para una respuesta inteligente...")
+        # 4. Si todos están listos, unimos los JSON
+        print("Todos los catálogos en caché. Uniendo información...")
+        combined_items = []
+        for cj in cached_jsons:
+            cj = cj.strip()
+            # Limpiar posible formato markdown que envía Gemini
+            if cj.startswith('```json'):
+                cj = cj.replace('```json', '', 1)
+            if cj.endswith('```'):
+                cj = cj[:-3]
+            cj = cj.strip()
+            
+            try:
+                import json
+                items = json.loads(cj)
+                if isinstance(items, list):
+                    combined_items.extend(items)
+            except Exception:
+                # Si falla JSON.loads, extraer objetos con regex
+                import re
+                pattern = re.compile(r'\{[^{}]*\}')
+                for match in pattern.finditer(cj):
+                    try:
+                        obj = json.loads(match.group(0))
+                        combined_items.append(obj)
+                    except:
+                        pass
+                        
+        import json
+        combined_json_str = json.dumps(combined_items, ensure_ascii=False)
+            
+        if combined_json_str and combined_json_str != "[]":
+            print("Consultando a Gemini usando el caché JSON rápido unido para una respuesta inteligente...")
             prompt = f"""
             Eres un asistente de ventas experto para la Tienda de Erika.
             Aquí tienes nuestra base de datos actual de productos en formato JSON:
-            {cached_text}
+            {combined_json_str}
             
             El cliente busca: "{query}"
             
@@ -292,7 +329,7 @@ def search_products():
             except Exception as e:
                 print(f"La búsqueda inteligente falló (posible límite de cuota). Usando búsqueda local de respaldo... Error: {e}")
                 # Respaldo a búsqueda local si Gemini falla
-                html_response = local_search_in_json(query, cached_text)
+                html_response = local_search_in_json(query, combined_json_str)
                 return jsonify({"response": html_response})
 
         
