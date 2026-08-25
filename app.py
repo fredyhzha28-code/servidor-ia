@@ -19,10 +19,12 @@ CORS(app)
 api_keys = []
 if os.environ.get("GEMINI_API_KEY"):
     api_keys.append(os.environ.get("GEMINI_API_KEY"))
-if os.environ.get("GEMINI_API_KEY_2"):
-    api_keys.append(os.environ.get("GEMINI_API_KEY_2"))
-if os.environ.get("GEMINI_API_KEY_3"):
-    api_keys.append(os.environ.get("GEMINI_API_KEY_3"))
+
+# Soportar automáticamente GEMINI_API_KEY_2, GEMINI_API_KEY_3... hasta la 20
+for i in range(2, 21):
+    key = os.environ.get(f"GEMINI_API_KEY_{i}")
+    if key:
+        api_keys.append(key)
     
 if not api_keys:
     api_keys.append("")
