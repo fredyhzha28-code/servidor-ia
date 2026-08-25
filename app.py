@@ -16,7 +16,18 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+api_keys = []
+if os.environ.get("GEMINI_API_KEY"):
+    api_keys.append(os.environ.get("GEMINI_API_KEY"))
+if os.environ.get("GEMINI_API_KEY_2"):
+    api_keys.append(os.environ.get("GEMINI_API_KEY_2"))
+if os.environ.get("GEMINI_API_KEY_3"):
+    api_keys.append(os.environ.get("GEMINI_API_KEY_3"))
+    
+if not api_keys:
+    api_keys.append("")
+
+clients = [genai.Client(api_key=key) for key in api_keys]
 
 # Inicializar Firebase
 firebase_db = None
@@ -167,21 +178,33 @@ def local_search_in_json(query, products_json_str):
 import time
 
 def generate_content_robust(contents, max_retries=3):
-    # Usar explícitamente el modelo que tiene cuota asignada en su proyecto
+    # Volvemos a tu modelo favorito gemini-3.6-flash
+    last_error = None
     for attempt in range(max_retries):
-        try:
-            return client.models.generate_content(model='gemini-flash-latest', contents=contents)
-        except Exception as e:
-            error_str = str(e)
-            print(f"Intento {attempt + 1} falló: {error_str}")
-            if "429" in error_str or "503" in error_str:
-                if attempt < max_retries - 1:
-                    print("Esperando 25 segundos antes de reintentar...")
-                    time.sleep(25) # Esperar a que pase el rate limit
+        for idx, current_client in enumerate(clients):
+            try:
+                return current_client.models.generate_content(model='gemini-3.6-flash', contents=contents)
+            except Exception as e:
+                error_str = str(e)
+                print(f"API Key {idx + 1} falló: {error_str}")
+                
+                # Si es error de cuota o servicio no disponible, probar con la siguiente llave
+                if "429" in error_str or "503" in error_str:
+                    last_error = error_str
+                    continue
+                # Si la llave es inválida (ej. 401, 403, 400), la ignoramos y probamos la siguiente
+                elif "401" in error_str or "403" in error_str or "400" in error_str:
+                    last_error = error_str
+                    continue
                 else:
-                    raise Exception(f"Gemini falló tras {max_retries} intentos: {error_str}")
-            else:
-                raise Exception(f"Gemini error fatal: {error_str}")
+                    raise Exception(f"Gemini error fatal: {error_str}")
+        
+        # Si agotó todas las llaves en este intento
+        if attempt < max_retries - 1:
+            print("Todas las API keys fallaron o están sin cuota. Esperando 15 segundos antes de reintentar...")
+            time.sleep(15)
+        else:
+            raise Exception(f"Gemini falló tras probar todas las llaves {max_retries} veces. Último error: {last_error}")
 
 def extract_knowledge_from_catalog(file):
     """Pide a Gemini que extraiga todos los productos de UN catálogo en formato JSON."""
@@ -298,8 +321,8 @@ def search_products():
         
     if query == "DEBUG_MODELS":
         try:
-            available_models = [m.name for m in client.models.list()]
-            return jsonify({"response": f"Modelos activos en tu API Key:<br>{'<br>'.join(available_models)}"})
+            available_models = [m.name for m in clients[0].models.list()]
+            return jsonify({"response": f"Modelos activos en tu primera API Key:<br>{'<br>'.join(available_models)}"})
         except Exception as e:
             return jsonify({"response": f"Error obteniendo modelos: {str(e)}"})
             
