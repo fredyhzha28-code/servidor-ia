@@ -55,9 +55,9 @@ def get_or_upload_file(cat, cat_hash=None):
         filename = filename.split('?')[0] # Limpiar query params si hay
         
     def update_progress(msg, pct):
-        if firebase_db and cat_hash:
+        if firebase_db and cat_hash and cat.get('appId'):
             try:
-                firebase_db.collection("ai_extraction_status").document(cat_hash).update({
+                firebase_db.collection("artifacts").document(cat.get('appId')).collection("public").document("data").collection("ai_extraction_status").document(cat_hash).update({
                     "message": msg,
                     "progress": pct,
                     "updatedAt": firestore.SERVER_TIMESTAMP
@@ -222,9 +222,12 @@ def background_extract_and_save(missing_catalogs):
             
             cat_hash = get_single_catalog_hash(url)
             
+            appId = cat.get('appId', 'tienda-catalogos-app')
+            status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status") if firebase_db else None
+            
             # Avisar al frontend (admin) que empezó
-            if firebase_db:
-                firebase_db.collection("ai_extraction_status").document(cat_hash).set({
+            if status_collection:
+                status_collection.document(cat_hash).set({
                     "status": "processing",
                     "title": title,
                     "message": "Iniciando lectura...",
@@ -235,8 +238,8 @@ def background_extract_and_save(missing_catalogs):
             file_obj = get_or_upload_file(cat, cat_hash)
             if not file_obj: continue
             
-            if firebase_db:
-                firebase_db.collection("ai_extraction_status").document(cat_hash).update({
+            if status_collection:
+                status_collection.document(cat_hash).update({
                     "message": "La IA está analizando los productos (esto demora un poco)...",
                     "progress": 60,
                     "updatedAt": firestore.SERVER_TIMESTAMP
@@ -246,13 +249,13 @@ def background_extract_and_save(missing_catalogs):
             if cached_text:
                 global memory_knowledge_cache
                 memory_knowledge_cache[cat_hash] = cached_text
-                if firebase_db:
-                    # Guardar el JSON
+                if status_collection:
+                    # Guardar el JSON (este va en caché interno del backend, no necesita appId)
                     doc_ref = firebase_db.collection("ai_knowledge_cache_single").document(cat_hash)
                     doc_ref.set({"extracted_text": cached_text, "url": url.split('?')[0]})
                     
                     # Avisar al frontend que terminó
-                    firebase_db.collection("ai_extraction_status").document(cat_hash).set({
+                    status_collection.document(cat_hash).set({
                         "status": "completed",
                         "title": title,
                         "message": "¡Revista memorizada con éxito!",
@@ -262,11 +265,11 @@ def background_extract_and_save(missing_catalogs):
                     print(f"Conocimiento guardado en Firebase caché para: {title}!")
         except Exception as e:
             print(f"Error procesando catálogo {cat.get('title')}: {e}")
-            if firebase_db:
-                firebase_db.collection("ai_extraction_status").document(cat_hash).set({
+            if 'status_collection' in locals() and status_collection:
+                status_collection.document(cat_hash).set({
                     "status": "error",
                     "title": cat.get('title'),
-                    "message": f"Error: {str(e)[:50]}",
+                    "message": f"Error de Gemini (revisa la cuota). El sistema lo intentará de nuevo.",
                     "progress": 0,
                     "error": str(e),
                     "updatedAt": firestore.SERVER_TIMESTAMP
@@ -276,12 +279,19 @@ def background_extract_and_save(missing_catalogs):
 def search_products():
     data = request.json
     query = data.get('query', '')
-    catalogs_data = data.get('catalogs', [])
+    catalogs = data.get('catalogs', [])
+    appId = data.get('appId', 'tienda-catalogos-app')
+    
+    # Inyectar appId a cada catálogo para el background worker
+    for cat in catalogs:
+        cat['appId'] = appId
+        
+    print(f"Recibida búsqueda: '{query}'. Catálogos activos: {len(catalogs)}")
     
     if not query:
         return jsonify({"error": "No se proporcionó búsqueda"}), 400
         
-    if not catalogs_data:
+    if not catalogs:
         return jsonify({"error": "No hay catálogos disponibles para buscar."}), 400
         
     if query == "DEBUG_MODELS":
@@ -296,7 +306,7 @@ def search_products():
         cached_jsons = []
         missing_catalogs = []
         
-        for cat in catalogs_data:
+        for cat in catalogs:
             url = cat.get('url', '')
             if not url: continue
             
