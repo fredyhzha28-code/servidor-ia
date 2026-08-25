@@ -267,6 +267,26 @@ import threading
 
 def background_extract_and_save(missing_catalogs):
     print(f"Iniciando extracción en segundo plano para {len(missing_catalogs)} revistas nuevas...")
+    
+    # 1. Avisar inmediatamente a la interfaz gráfica de TODAS las revistas en cola
+    for cat in missing_catalogs:
+        try:
+            url = cat.get('url', '')
+            if not url: continue
+            cat_hash = get_single_catalog_hash(url)
+            appId = cat.get('appId', 'tienda-catalogos-app')
+            status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status") if firebase_db else None
+            if status_collection:
+                status_collection.document(cat_hash).set({
+                    "status": "processing",
+                    "title": cat.get('title', 'Revista'),
+                    "message": "En cola de espera...",
+                    "progress": 1,
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                })
+        except: pass
+
+    # 2. Empezar a procesar secuencialmente
     for cat in missing_catalogs:
         try:
             url = cat.get('url', '')
