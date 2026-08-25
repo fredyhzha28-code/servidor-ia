@@ -52,7 +52,7 @@ else:
 uploaded_files_cache = {}
 memory_knowledge_cache = {}
 
-def get_or_upload_file(cat, cat_hash=None):
+def get_or_upload_file(cat, cat_hash=None, client_idx=None):
     """
     Sube UN solo catálogo a Gemini y retorna el objeto de archivo.
     cat = {'title': '...', 'url': '...'}
