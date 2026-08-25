@@ -39,7 +39,7 @@ else:
 uploaded_files_cache = {}
 memory_knowledge_cache = {}
 
-def get_or_upload_file(cat):
+def get_or_upload_file(cat, cat_hash=None):
     """
     Sube UN solo catálogo a Gemini y retorna el objeto de archivo.
     cat = {'title': '...', 'url': '...'}
@@ -54,8 +54,19 @@ def get_or_upload_file(cat):
     if '?' in filename:
         filename = filename.split('?')[0] # Limpiar query params si hay
         
+    def update_progress(msg, pct):
+        if firebase_db and cat_hash:
+            try:
+                firebase_db.collection("ai_extraction_status").document(cat_hash).update({
+                    "message": msg,
+                    "progress": pct,
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                })
+            except: pass
+
     if filename not in uploaded_files_cache:
         print(f"Descargando {title} desde Cloudflare ({url})...")
+        update_progress("Descargando PDF...", 10)
         try:
             response = requests.get(url, stream=True)
             if response.status_code == 200:
@@ -66,6 +77,7 @@ def get_or_upload_file(cat):
                     tmp_path = tmp_file.name
                 
                 print(f"Subiendo {filename} a Gemini...")
+                update_progress("Enviando a la IA...", 30)
                 gemini_file = client.files.upload(
                     file=tmp_path, 
                     config={'display_name': title}
@@ -75,8 +87,12 @@ def get_or_upload_file(cat):
                 os.remove(tmp_path)
             else:
                 print(f"Error {response.status_code} al descargar {url}")
+                update_progress(f"Error al descargar: {response.status_code}", 0)
         except Exception as e:
             print(f"Error de conexión con {url}: {str(e)}")
+            update_progress(f"Error de conexión", 0)
+    else:
+        update_progress("Archivo en caché de Gemini...", 30)
     
     return uploaded_files_cache.get(filename)
 
@@ -148,12 +164,24 @@ def local_search_in_json(query, products_json_str):
         print(f"Error parseando JSON local: {e}")
         return "¡Hola! Estoy actualizando mi base de datos de catálogos. Intenta tu búsqueda en un par de minutos."
 
-def generate_content_robust(contents):
-    # Usar explícitamente el modelo gemini-3.6-flash sugerido por Google
-    try:
-        return client.models.generate_content(model='gemini-3.6-flash', contents=contents)
-    except Exception as e:
-        raise Exception(f"Gemini 3.6 Flash falló: {str(e)}")
+import time
+
+def generate_content_robust(contents, max_retries=3):
+    # Usar explícitamente el modelo que tiene cuota asignada en su proyecto
+    for attempt in range(max_retries):
+        try:
+            return client.models.generate_content(model='gemini-3.6-flash', contents=contents)
+        except Exception as e:
+            error_str = str(e)
+            print(f"Intento {attempt + 1} falló: {error_str}")
+            if "429" in error_str or "503" in error_str:
+                if attempt < max_retries - 1:
+                    print("Esperando 25 segundos antes de reintentar...")
+                    time.sleep(25) # Esperar a que pase el rate limit
+                else:
+                    raise Exception(f"Gemini falló tras {max_retries} intentos: {error_str}")
+            else:
+                raise Exception(f"Gemini error fatal: {error_str}")
 
 def extract_knowledge_from_catalog(file):
     """Pide a Gemini que extraiga todos los productos de UN catálogo en formato JSON."""
@@ -189,23 +217,60 @@ def background_extract_and_save(missing_catalogs):
     for cat in missing_catalogs:
         try:
             url = cat.get('url', '')
+            title = cat.get('title', 'Revista')
             if not url: continue
             
             cat_hash = get_single_catalog_hash(url)
-            file_obj = get_or_upload_file(cat)
             
+            # Avisar al frontend (admin) que empezó
+            if firebase_db:
+                firebase_db.collection("ai_extraction_status").document(cat_hash).set({
+                    "status": "processing",
+                    "title": title,
+                    "message": "Iniciando lectura...",
+                    "progress": 5,
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                })
+                
+            file_obj = get_or_upload_file(cat, cat_hash)
             if not file_obj: continue
             
+            if firebase_db:
+                firebase_db.collection("ai_extraction_status").document(cat_hash).update({
+                    "message": "La IA está analizando los productos (esto demora un poco)...",
+                    "progress": 60,
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                })
+                
             cached_text = extract_knowledge_from_catalog(file_obj)
             if cached_text:
                 global memory_knowledge_cache
                 memory_knowledge_cache[cat_hash] = cached_text
                 if firebase_db:
+                    # Guardar el JSON
                     doc_ref = firebase_db.collection("ai_knowledge_cache_single").document(cat_hash)
                     doc_ref.set({"extracted_text": cached_text, "url": url.split('?')[0]})
-                    print(f"Conocimiento guardado en Firebase caché para: {cat.get('title')}!")
+                    
+                    # Avisar al frontend que terminó
+                    firebase_db.collection("ai_extraction_status").document(cat_hash).set({
+                        "status": "completed",
+                        "title": title,
+                        "message": "¡Revista memorizada con éxito!",
+                        "progress": 100,
+                        "updatedAt": firestore.SERVER_TIMESTAMP
+                    })
+                    print(f"Conocimiento guardado en Firebase caché para: {title}!")
         except Exception as e:
             print(f"Error procesando catálogo {cat.get('title')}: {e}")
+            if firebase_db:
+                firebase_db.collection("ai_extraction_status").document(cat_hash).set({
+                    "status": "error",
+                    "title": cat.get('title'),
+                    "message": f"Error: {str(e)[:50]}",
+                    "progress": 0,
+                    "error": str(e),
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                })
 
 @app.route('/api/search', methods=['POST'])
 def search_products():
