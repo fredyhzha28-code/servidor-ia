@@ -228,23 +228,24 @@ def generate_content_robust(contents, max_retries=3):
         else:
             raise Exception(f"Gemini falló tras probar todas las llaves {max_retries} veces. Último error: {last_error}")
 
-def extract_knowledge_from_catalog(files_list):
+def extract_knowledge_from_catalog(files_list, title):
     """Pide a Gemini que extraiga todos los productos de UN catálogo en formato JSON."""
-    print("Extrayendo conocimiento del catálogo (esto puede tardar)...")
-    prompt_extract = """
-    Lee detalladamente el catálogo adjunto.
+    print(f"Extrayendo conocimiento de {title} (esto puede tardar)...")
+    prompt_extract = f"""
+    Lee detalladamente el catálogo adjunto llamado "{title}".
     Tu tarea es extraer un listado masivo de TODOS los productos mencionados en este catálogo.
     
     DEBES responder ÚNICAMENTE con un array en formato JSON con la siguiente estructura exacta:
     [
-      {
+      {{
         "nombre": "Nombre del producto",
         "precio": "Precio del producto (con símbolo de moneda)",
-        "catalogo": "Nombre del catálogo (ej. Esika)",
+        "catalogo": "{title}",
         "pagina": "Número de página"
-      }
+      }}
     ]
     
+    Es OBLIGATORIO que el campo "catalogo" sea exactamente "{title}" para todos los productos.
     No añadas ningún texto antes ni después del JSON (sin comillas invertidas ni la palabra json).
     Es crítico que extraigas la mayor cantidad posible de productos de este catálogo.
     """
@@ -292,7 +293,7 @@ def background_extract_and_save(missing_catalogs):
                     "updatedAt": firestore.SERVER_TIMESTAMP
                 })
                 
-            cached_text = extract_knowledge_from_catalog(files_list)
+            cached_text = extract_knowledge_from_catalog(files_list, title)
             if cached_text:
                 global memory_knowledge_cache
                 memory_knowledge_cache[cat_hash] = cached_text
