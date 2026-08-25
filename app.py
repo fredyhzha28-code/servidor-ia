@@ -93,8 +93,9 @@ def get_or_upload_file(cat, cat_hash=None):
                 update_progress("Enviando a la IA...", 30)
                 # Subir para cada API key para que todas tengan permiso de acceder al archivo
                 gemini_files_for_clients = []
-                for c in clients:
+                for idx, c in enumerate(clients):
                     try:
+                        update_progress(f"Subiendo a la nube (Llave {idx+1} de {len(clients)})...", 30 + (idx * 5))
                         gf = c.files.upload(
                             file=tmp_path, 
                             config={'display_name': title}
@@ -105,6 +106,7 @@ def get_or_upload_file(cat, cat_hash=None):
                         gemini_files_for_clients.append(None)
                 
                 uploaded_files_cache[filename] = gemini_files_for_clients
+                update_progress("¡Archivo subido! Iniciando lectura profunda...", 55)
                 
                 os.remove(tmp_path)
             else:
