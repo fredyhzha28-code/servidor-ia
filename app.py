@@ -89,11 +89,20 @@ def get_or_upload_file(cat, cat_hash=None):
                 
                 print(f"Subiendo {filename} a Gemini...")
                 update_progress("Enviando a la IA...", 30)
-                gemini_file = clients[0].files.upload(
-                    file=tmp_path, 
-                    config={'display_name': title}
-                )
-                uploaded_files_cache[filename] = gemini_file
+                # Subir para cada API key para que todas tengan permiso de acceder al archivo
+                gemini_files_for_clients = []
+                for c in clients:
+                    try:
+                        gf = c.files.upload(
+                            file=tmp_path, 
+                            config={'display_name': title}
+                        )
+                        gemini_files_for_clients.append(gf)
+                    except Exception as e:
+                        print(f"Error subiendo archivo a una llave: {e}")
+                        gemini_files_for_clients.append(None)
+                
+                uploaded_files_cache[filename] = gemini_files_for_clients
                 
                 os.remove(tmp_path)
             else:
@@ -183,7 +192,18 @@ def generate_content_robust(contents, max_retries=3):
     for attempt in range(max_retries):
         for idx, current_client in enumerate(clients):
             try:
-                return current_client.models.generate_content(model='gemini-3.6-flash', contents=contents)
+                # Construir el contents específico para esta llave
+                current_contents = []
+                for item in contents:
+                    if isinstance(item, list):
+                        # Si es una lista de archivos (uno por cada API Key)
+                        if idx >= len(item) or item[idx] is None:
+                            raise Exception("El archivo PDF no se pudo subir correctamente para esta API Key")
+                        current_contents.append(item[idx])
+                    else:
+                        current_contents.append(item)
+                        
+                return current_client.models.generate_content(model='gemini-3.6-flash', contents=current_contents)
             except Exception as e:
                 error_str = str(e)
                 print(f"API Key {idx + 1} falló: {error_str}")
@@ -206,7 +226,7 @@ def generate_content_robust(contents, max_retries=3):
         else:
             raise Exception(f"Gemini falló tras probar todas las llaves {max_retries} veces. Último error: {last_error}")
 
-def extract_knowledge_from_catalog(file):
+def extract_knowledge_from_catalog(files_list):
     """Pide a Gemini que extraiga todos los productos de UN catálogo en formato JSON."""
     print("Extrayendo conocimiento del catálogo (esto puede tardar)...")
     prompt_extract = """
@@ -227,7 +247,7 @@ def extract_knowledge_from_catalog(file):
     Es crítico que extraigas la mayor cantidad posible de productos de este catálogo.
     """
     try:
-        response = generate_content_robust(contents=[file, prompt_extract])
+        response = generate_content_robust(contents=[files_list, prompt_extract])
         if not response or not response.text:
             raise Exception("Respuesta vacía de Gemini")
         return response.text
@@ -260,8 +280,8 @@ def background_extract_and_save(missing_catalogs):
                     "updatedAt": firestore.SERVER_TIMESTAMP
                 })
                 
-            file_obj = get_or_upload_file(cat, cat_hash)
-            if not file_obj: continue
+            files_list = get_or_upload_file(cat, cat_hash)
+            if not files_list: continue
             
             if status_collection:
                 status_collection.document(cat_hash).update({
@@ -270,7 +290,7 @@ def background_extract_and_save(missing_catalogs):
                     "updatedAt": firestore.SERVER_TIMESTAMP
                 })
                 
-            cached_text = extract_knowledge_from_catalog(file_obj)
+            cached_text = extract_knowledge_from_catalog(files_list)
             if cached_text:
                 global memory_knowledge_cache
                 memory_knowledge_cache[cat_hash] = cached_text
