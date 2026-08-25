@@ -89,7 +89,7 @@ def get_or_upload_file(cat, cat_hash=None):
                 
                 print(f"Subiendo {filename} a Gemini...")
                 update_progress("Enviando a la IA...", 30)
-                gemini_file = client.files.upload(
+                gemini_file = clients[0].files.upload(
                     file=tmp_path, 
                     config={'display_name': title}
                 )
