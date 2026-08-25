@@ -170,7 +170,7 @@ def generate_content_robust(contents, max_retries=3):
     # Usar explícitamente el modelo que tiene cuota asignada en su proyecto
     for attempt in range(max_retries):
         try:
-            return client.models.generate_content(model='gemini-3.6-flash', contents=contents)
+            return client.models.generate_content(model='gemini-1.5-flash', contents=contents)
         except Exception as e:
             error_str = str(e)
             print(f"Intento {attempt + 1} falló: {error_str}")
@@ -205,10 +205,12 @@ def extract_knowledge_from_catalog(file):
     """
     try:
         response = generate_content_robust(contents=[file, prompt_extract])
+        if not response or not response.text:
+            raise Exception("Respuesta vacía de Gemini")
         return response.text
     except Exception as e:
         print(f"Error en extracción: {e}")
-        return None
+        raise e
 
 import threading
 
