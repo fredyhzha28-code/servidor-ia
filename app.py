@@ -534,7 +534,13 @@ def search_products():
             try:
                 # Intento de búsqueda IA rápida e inteligente
                 ai_response = generate_content_robust(contents=[prompt])
-                return jsonify({"response": ai_response.text})
+                
+                # Convertir los asteriscos de Markdown a etiquetas HTML (ej. **texto** a <b>texto</b>)
+                import re
+                final_text = ai_response.text
+                final_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', final_text)
+                
+                return jsonify({"response": final_text})
             except Exception as e:
                 print(f"La búsqueda inteligente falló (posible límite de cuota). Usando búsqueda local de respaldo... Error: {e}")
                 # Respaldo a búsqueda local si Gemini falla
