@@ -132,11 +132,12 @@ def get_or_upload_file(cat, cat_hash=None, client_idx=None):
     
     return uploaded_files_cache.get(filename)
 
-def get_single_catalog_hash(url):
-    """Genera un hash único basado en la URL de un solo catálogo."""
+def get_single_catalog_hash(url, title=""):
+    """Genera un hash único basado en la URL y el TÍTULO de un solo catálogo."""
     if not url: return ""
     clean_url = url.split('?')[0]
-    return hashlib.md5(clean_url.encode()).hexdigest()
+    string_to_hash = f"{clean_url}_{title}"
+    return hashlib.md5(string_to_hash.encode()).hexdigest()
 
 def local_search_in_json(query, products_json_str):
     """Busca en el texto JSON localmente y genera respuesta HTML sin usar Gemini."""
@@ -288,7 +289,7 @@ def process_single_catalog(idx, cat):
         title = cat.get('title', 'Revista')
         if not url: return
         
-        cat_hash = get_single_catalog_hash(url)
+        cat_hash = get_single_catalog_hash(url, title)
         
         # Asignar una llave dedicada basada en su posición en la fila
         client_idx = idx % len(clients) if clients else None
@@ -350,7 +351,7 @@ def process_single_catalog(idx, cat):
             appId = cat.get('appId', 'tienda-catalogos-app')
             status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status") if firebase_db else None
             if status_collection:
-                cat_hash = get_single_catalog_hash(cat.get('url', ''))
+                cat_hash = get_single_catalog_hash(cat.get('url', ''), cat.get('title', 'Revista'))
                 status_collection.document(cat_hash).set({
                     "status": "error",
                     "title": cat.get('title'),
@@ -368,7 +369,7 @@ def background_extract_and_save(missing_catalogs):
         try:
             url = cat.get('url', '')
             if not url: continue
-            cat_hash = get_single_catalog_hash(url)
+            cat_hash = get_single_catalog_hash(url, cat.get('title', 'Revista'))
             appId = cat.get('appId', 'tienda-catalogos-app')
             status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status") if firebase_db else None
             if status_collection:
@@ -421,7 +422,8 @@ def search_products():
             url = cat.get('url', '')
             if not url: continue
             
-            cat_hash = get_single_catalog_hash(url)
+            title = cat.get('title', 'Revista')
+            cat_hash = get_single_catalog_hash(url, title)
             cat_json = None
             
             # 1. Intentar leer de Memoria RAM
@@ -507,8 +509,14 @@ def search_products():
             
         if combined_json_str and combined_json_str != "[]":
             print("Consultando a Gemini usando el caché JSON rápido unido para una respuesta inteligente...")
+            active_catalogs_titles = [cat.get('title', 'Revista') for cat in catalogs]
+            active_catalogs_str = ", ".join(active_catalogs_titles)
+            
             prompt = f"""
             Eres un asistente de ventas experto para la Tienda de Erika.
+            Las únicas revistas (catálogos) disponibles y activas actualmente son: {active_catalogs_str}. 
+            Por favor, NO inventes ni menciones otras revistas que no estén estrictamente en esta lista.
+            
             Aquí tienes nuestra base de datos actual de productos en formato JSON:
             {combined_json_str}
             
