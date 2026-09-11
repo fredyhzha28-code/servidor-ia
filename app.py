@@ -318,7 +318,8 @@ def extract_knowledge_from_catalog(files_list, title, progress_callback=None, cl
         "precio": "Precio del producto (con símbolo de moneda)",
         "descripcion_corta": "Descripción atractiva o características breves",
         "categoria": "Categoría principal (OBLIGATORIO elegir una: Dama, Caballero, Niños, Niñas, Hogar)",
-        "subcategoria": "Subcategoría específica (ej. Ropa Deportiva, Ropa Interior, Maquillaje, Lociones, Zapatos, etc.)",
+        "seccion": "Sección general (OBLIGATORIO elegir una: Ropa, Zapatos, Belleza y Perfumería, Cuidado Personal, Accesorios, Varios)",
+        "subcategoria": "Subcategoría específica (ej. Pantalones, Ropa Interior, Lociones, Cremas, Maquillaje, Anillos, etc.)",
         "catalogo": "{title}",
         "pagina": "Número de página exacto (solo el número)"
       }}
