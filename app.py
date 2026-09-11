@@ -10,8 +10,52 @@ from google import genai
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore
+import fitz
+import boto3
 
 load_dotenv()
+
+# R2 Config
+R2_ACCOUNT_ID = '57a66ef13f9fdfb1fd8bebb50b00190f'
+R2_ACCESS_KEY_ID = '8e7ef783e5dc05d04187dcb9ae809cda'
+R2_SECRET_ACCESS_KEY = 'e84d5734b3ce43304be2f476f85b6510e8436b61f24af1075a0249e6ffbffe23'
+R2_BUCKET_NAME = 'fredy'
+R2_PUBLIC_URL = 'https://pub-3f4d0f0e19944bcf94093fff790c9671.r2.dev'
+
+s3_client = boto3.client(
+    's3',
+    endpoint_url=f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com',
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    region_name='auto'
+)
+
+def generate_and_upload_thumbnails(pdf_path, cat_hash, update_progress):
+    try:
+        doc = fitz.open(pdf_path)
+        folder_path = f"thumbnails/{cat_hash}"
+        total_pages = len(doc)
+        
+        for page_num in range(total_pages):
+            if page_num % 10 == 0:
+                update_progress(f"Generando imágenes... ({page_num}/{total_pages})", 35 + int((page_num/total_pages)*15))
+                
+            page = doc.load_page(page_num)
+            pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5))
+            img_bytes = pix.tobytes("jpeg")
+            
+            object_name = f"{folder_path}/page_{page_num + 1}.jpg"
+            s3_client.put_object(
+                Bucket=R2_BUCKET_NAME,
+                Key=object_name,
+                Body=img_bytes,
+                ContentType='image/jpeg'
+            )
+        doc.close()
+        return f"{R2_PUBLIC_URL}/{folder_path}"
+    except Exception as e:
+        print(f"Error generando miniaturas: {e}")
+        return None
 
 app = Flask(__name__)
 CORS(app)
@@ -117,8 +161,16 @@ def get_or_upload_file(cat, cat_hash=None, client_idx=None):
                         except Exception as e:
                             print(f"Error subiendo archivo a una llave: {e}")
                 
-                uploaded_files_cache[filename] = gemini_files_for_clients
-                update_progress("¡Archivo subido! Iniciando lectura profunda...", 55)
+                update_progress("¡Archivo subido! Generando miniaturas...", 35)
+                thumb_base_url = generate_and_upload_thumbnails(tmp_path, cat_hash, update_progress)
+                if thumb_base_url:
+                    # Guardamos la URL de las miniaturas en caché de Firebase temporalmente
+                    if firebase_db:
+                        try:
+                            firebase_db.collection("ai_knowledge_cache_single").document(cat_hash).set({"thumb_base_url": thumb_base_url}, merge=True)
+                        except: pass
+                        
+                update_progress("¡Imágenes listas! Iniciando lectura profunda...", 55)
                 
                 os.remove(tmp_path)
             else:
@@ -260,10 +312,13 @@ def extract_knowledge_from_catalog(files_list, title, progress_callback=None, cl
     DEBES responder ÚNICAMENTE con un array en formato JSON con la siguiente estructura exacta:
     [
       {{
+        "id": "crea_un_id_unico_corto",
         "nombre": "Nombre del producto",
         "precio": "Precio del producto (con símbolo de moneda)",
+        "descripcion_corta": "Descripción atractiva o características breves",
+        "categoria": "Categoría general (ej. Maquillaje, Perfumes, Cuidado Personal)",
         "catalogo": "{title}",
-        "pagina": "Número de página"
+        "pagina": "Número de página exacto (solo el número)"
       }}
     ]
     
@@ -331,10 +386,62 @@ def process_single_catalog(idx, cat):
         if cached_text:
             global memory_knowledge_cache
             memory_knowledge_cache[cat_hash] = cached_text
+            
+            # EXTRAER PRODUCTOS INDIVIDUALES A FIREBASE
+            try:
+                import json
+                import re
+                
+                clean_text = cached_text.strip()
+                if clean_text.startswith('```json'):
+                    clean_text = clean_text.replace('```json', '', 1)
+                if clean_text.endswith('```'):
+                    clean_text = clean_text[:-3]
+                clean_text = clean_text.strip()
+                
+                products = []
+                try:
+                    products = json.loads(clean_text)
+                except Exception:
+                    pattern = re.compile(r'\{[^{}]*\}')
+                    for match in pattern.finditer(clean_text):
+                        try:
+                            obj = json.loads(match.group(0))
+                            products.append(obj)
+                        except: pass
+                
+                if firebase_db and products:
+                    products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+                    thumb_base_url = f"{R2_PUBLIC_URL}/thumbnails/{cat_hash}"
+                    
+                    batch = firebase_db.batch()
+                    count = 0
+                    for p in products:
+                        if isinstance(p, dict) and 'nombre' in p:
+                            p_id = p.get('id', get_single_catalog_hash(f"{cat_hash}_{p.get('nombre')}_{p.get('pagina')}"))
+                            pag_num = p.get('pagina', '1')
+                            p['imagen'] = f"{thumb_base_url}/page_{pag_num}.jpg"
+                            p['catalogo_url'] = url.split('?')[0]
+                            p['catalogo_hash'] = cat_hash
+                            
+                            doc_ref = products_col.document(p_id)
+                            batch.set(doc_ref, p)
+                            count += 1
+                            
+                            if count >= 400:
+                                batch.commit()
+                                batch = firebase_db.batch()
+                                count = 0
+                    if count > 0:
+                        batch.commit()
+                    print(f"Guardados {len(products)} productos individuales en Firebase.")
+            except Exception as e:
+                print(f"Error guardando productos a Firebase: {e}")
+
             if status_collection:
                 # Guardar el JSON (este va en caché interno del backend, no necesita appId)
                 doc_ref = firebase_db.collection("ai_knowledge_cache_single").document(cat_hash)
-                doc_ref.set({"extracted_text": cached_text, "url": url.split('?')[0]})
+                doc_ref.set({"extracted_text": cached_text, "url": url.split('?')[0]}, merge=True)
                 
                 # Avisar al frontend que terminó
                 status_collection.document(cat_hash).set({
