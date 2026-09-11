@@ -170,6 +170,7 @@ def get_or_upload_file(cat, cat_hash=None, client_idx=None):
                             firebase_db.collection("ai_knowledge_cache_single").document(cat_hash).set({"thumb_base_url": thumb_base_url}, merge=True)
                         except: pass
                         
+                uploaded_files_cache[filename] = gemini_files_for_clients
                 update_progress("¡Imágenes listas! Iniciando lectura profunda...", 55)
                 
                 os.remove(tmp_path)
