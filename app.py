@@ -355,17 +355,18 @@ def process_single_page(doc, page_num, cat_info):
         for p in unique_products:
             p_id = p.get('id', get_single_catalog_hash(f"{cat_hash}_{p.get('nombre')}_{p.get('precio', '')}_{page_num}"))
             p['imagen'] = img_url
-                p['catalogo_url'] = url.split('?')[0]
-                p['catalogo_hash'] = cat_hash
-                p['pagina'] = str(page_num)
+            p['catalogo_url'] = url.split('?')[0]
+            p['catalogo_hash'] = cat_hash
+            p['pagina'] = str(page_num)
+            
+            doc_ref = products_col.document(p_id)
+            batch.set(doc_ref, p)
+            count += 1
+            if count >= 400:
+                batch.commit()
+                batch = firebase_db.batch()
+                count = 0
                 
-                doc_ref = products_col.document(p_id)
-                batch.set(doc_ref, p)
-                count += 1
-                if count >= 400:
-                    batch.commit()
-                    batch = firebase_db.batch()
-                    count = 0
         if count > 0:
             batch.commit()
             
