@@ -43,7 +43,7 @@ def generate_and_upload_thumbnails(pdf_path, cat_hash, update_progress):
                 gc.collect() # Forzar limpieza de RAM para evitar caídas en Render
                 
             page = doc.load_page(page_num)
-            pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5))
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
             img_bytes = pix.tobytes("jpeg")
             
             object_name = f"{folder_path}/page_{page_num + 1}.jpg"
@@ -259,9 +259,6 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
     clients_to_try = []
     if client_idx is not None and client_idx < len(clients):
         clients_to_try.append((client_idx, clients[client_idx]))
-        for i, c in enumerate(clients):
-            if i != client_idx:
-                clients_to_try.append((i, c))
     else:
         clients_to_try = list(enumerate(clients))
     
@@ -285,8 +282,7 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
                     'gemini-pro-latest',
                     'gemini-3.8-flash',
                     'gemini-3.7-flash',
-                    'gemini-3.6-flash',
-                    'gemini-2.5-flash'
+                    'gemini-3.6-flash'
                 ]
                 last_error_msg = 'Desconocido'
                 for model_name in models_to_try:
