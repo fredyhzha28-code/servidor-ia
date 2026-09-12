@@ -406,7 +406,34 @@ def process_single_catalog(idx, cat):
     cat['hash'] = cat_hash
     
     status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status") if firebase_db else None
+    catalogs_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("catalogs") if firebase_db else None
     
+    # 0. Verificación ABSOLUTA de que el catálogo existe en la base de datos
+    if catalogs_collection:
+        # Buscamos si existe algún documento en 'catalogs' que tenga exactamente esta url
+        # Separamos el '?' por si tiene parámetros temporales
+        clean_url = url.split('?')[0]
+        # Query
+        query_docs = catalogs_collection.where("pdfUrl", ">=", clean_url).where("pdfUrl", "<=", clean_url + "\uf8ff").limit(1).get()
+        
+        # Como Firebase en el cliente guarda el pdfUrl exacto, comprobamos con get() simple o filtrando en python
+        all_cats = catalogs_collection.get()
+        exists_in_db = False
+        for c in all_cats:
+            c_data = c.to_dict()
+            db_url = c_data.get('pdfUrl', '').split('?')[0]
+            if db_url == clean_url:
+                exists_in_db = True
+                break
+                
+        if not exists_in_db:
+            print(f"[{title}] CATÁLOGO FANTASMA DETECTADO (No existe en Firebase 'catalogs'). Abortando.")
+            if status_collection:
+                # Si de casualidad hay un status, lo matamos
+                try: status_collection.document(cat_hash).delete()
+                except: pass
+            return
+            
     # 1. Recuperar estado de procesamiento
     last_successful_page = 0
     if status_collection:
