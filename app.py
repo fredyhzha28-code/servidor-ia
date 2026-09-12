@@ -319,18 +319,6 @@ def process_single_page(doc, page_num, cat_info):
     # 4. Enviar a Gemini
     products = extract_products_from_page(page_text, tmp_img_path, title, page_num)
     
-    # 5. Auditoría (Segunda Revisión) si es sospechosa
-    # Lógica simple: contar símbolos de dolar en el OCR vs productos devueltos
-    dolar_count = page_text.count('$')
-    if dolar_count > len(products) * 2 and len(products) < 5:
-        print(f"[Audit] Página {page_num} sospechosa ({dolar_count} precios detectados, {len(products)} productos). Haciendo segunda revisión...")
-        audit_products = extract_products_from_page(page_text, tmp_img_path, title, page_num, is_audit=True)
-        # Combinar deduplicando por nombre
-        existing_names = set([normalize_text(p.get('nombre', '')) for p in products])
-        for ap in audit_products:
-            if normalize_text(ap.get('nombre', '')) not in existing_names:
-                products.append(ap)
-                
     print(f"[Gemini] Productos finales en Pág {page_num}: {len(products)}")
     
     # 6. Guardar productos en Firebase inmediatamente
