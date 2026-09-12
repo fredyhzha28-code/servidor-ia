@@ -137,29 +137,16 @@ def get_or_upload_file(cat, cat_hash=None, client_idx=None):
                 update_progress("Enviando a la IA...", 30)
                 # Subir para cada API key para que todas tengan permiso de acceder al archivo
                 gemini_files_for_clients = [None] * len(clients)
-                if client_idx is not None and client_idx < len(clients):
-                    # Subir SOLO a la llave dedicada
+                for idx, c in enumerate(clients):
                     try:
-                        update_progress(f"Subiendo a la nube (Llave dedicada {client_idx+1})...", 30)
-                        gf = clients[client_idx].files.upload(
+                        update_progress(f"Subiendo a la nube (Llave {idx+1} de {len(clients)})...", 30 + (idx * 5))
+                        gf = c.files.upload(
                             file=tmp_path, 
                             config={'display_name': title}
                         )
-                        gemini_files_for_clients[client_idx] = gf
+                        gemini_files_for_clients[idx] = gf
                     except Exception as e:
-                        print(f"Error subiendo archivo a la llave dedicada {client_idx+1}: {e}")
-                else:
-                    # Fallback por si acaso: Subir a todas
-                    for idx, c in enumerate(clients):
-                        try:
-                            update_progress(f"Subiendo a la nube (Llave {idx+1} de {len(clients)})...", 30 + (idx * 5))
-                            gf = c.files.upload(
-                                file=tmp_path, 
-                                config={'display_name': title}
-                            )
-                            gemini_files_for_clients[idx] = gf
-                        except Exception as e:
-                            print(f"Error subiendo archivo a una llave: {e}")
+                        print(f"Error subiendo archivo a una llave: {e}")
                 
                 update_progress("¡Archivo subido! Generando miniaturas...", 35)
                 thumb_base_url = generate_and_upload_thumbnails(tmp_path, cat_hash, update_progress)
