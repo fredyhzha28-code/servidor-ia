@@ -260,8 +260,15 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
     # Volvemos a tu modelo favorito gemini-3.6-flash
     last_error = None
     
-    # Determinar qué clientes intentar
-    clients_to_try = [(client_idx, clients[client_idx])] if client_idx is not None and client_idx < len(clients) else list(enumerate(clients))
+    # Determinar en qué orden intentar las llaves (priorizar la asignada, pero intentar todas como respaldo)
+    clients_to_try = []
+    if client_idx is not None and client_idx < len(clients):
+        clients_to_try.append((client_idx, clients[client_idx]))
+        for i, c in enumerate(clients):
+            if i != client_idx:
+                clients_to_try.append((i, c))
+    else:
+        clients_to_try = list(enumerate(clients))
     
     for attempt in range(max_retries):
         for idx, current_client in clients_to_try:
@@ -276,8 +283,16 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
                         current_contents.append(item[idx])
                     else:
                         current_contents.append(item)
-                # Try multiple models in case one is not available
-                models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash-latest', 'gemini-1.5-flash', 'gemini-1.5-pro-latest']
+                # Try multiple models (prioritize PRO for best reading quality, fallback to FLASH)
+                models_to_try = [
+                    'gemini-1.5-pro',
+                    'gemini-1.5-pro-latest',
+                    'gemini-2.5-pro',
+                    'gemini-2.5-flash', 
+                    'gemini-2.0-flash', 
+                    'gemini-1.5-flash-latest', 
+                    'gemini-1.5-flash'
+                ]
                 for model_name in models_to_try:
                     try:
                         return current_client.models.generate_content(model=model_name, contents=current_contents)
