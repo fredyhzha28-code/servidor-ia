@@ -277,7 +277,7 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
                     else:
                         current_contents.append(item)
                         
-                return current_client.models.generate_content(model='gemini-3.6-flash', contents=current_contents)
+                return current_client.models.generate_content(model='gemini-1.5-pro', contents=current_contents)
             except Exception as e:
                 error_str = str(e)
                 print(f"API Key {idx + 1} falló: {error_str}")
@@ -308,7 +308,8 @@ def extract_knowledge_from_catalog(files_list, title, progress_callback=None, cl
     print(f"Extrayendo conocimiento de {title} (esto puede tardar)...")
     prompt_extract = f"""
     Lee detalladamente el catálogo adjunto llamado "{title}".
-    Tu tarea es extraer un listado masivo de TODOS los productos mencionados en este catálogo.
+    Tu tarea es extraer un listado exhaustivo y masivo de TODOS los productos mencionados en este catálogo.
+    IMPORTANTE: Muchas páginas tienen 2, 3 o más productos diferentes en la misma página. DEBES extraer CADA UNO de ellos como un elemento separado en el JSON, con su respectivo precio y nombre individual. No agrupes productos, no omitas ninguno. Si una página tiene 3 productos, deben haber 3 objetos JSON para esa página.
     
     DEBES responder ÚNICAMENTE con un array en formato JSON con la siguiente estructura exacta:
     [
@@ -327,7 +328,7 @@ def extract_knowledge_from_catalog(files_list, title, progress_callback=None, cl
     
     Es OBLIGATORIO que el campo "catalogo" sea exactamente "{title}" para todos los productos.
     No añadas ningún texto antes ni después del JSON (sin comillas invertidas ni la palabra json).
-    Es crítico que extraigas la mayor cantidad posible de productos de este catálogo.
+    Es CRÍTICO que extraigas ABSOLUTAMENTE TODOS los productos, revisando cada página minuciosamente para no dejar ninguno por fuera.
     """
     try:
         response = generate_content_robust(contents=[files_list, prompt_extract], client_idx=client_idx, progress_callback=progress_callback)
