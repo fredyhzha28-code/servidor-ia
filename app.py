@@ -485,7 +485,7 @@ def process_single_catalog(idx, cat):
             try: os.remove(chunk['path'])
             except: pass
 
-        with ThreadPoolExecutor(max_workers=min(4, len(clients) if clients else 2)) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor:
             futures = [executor.submit(process_chunk, i, chunk) for i, chunk in enumerate(chunks)]
             for i, future in enumerate(futures):
                 try:
@@ -563,8 +563,8 @@ def background_extract_and_save(missing_catalogs):
                 })
         except: pass
 
-    # 2. Empezar a procesar en paralelo con 3 hilos máximo (para no ahogar la RAM de Render)
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    # 2. Empezar a procesar en paralelo con 1 hilo máximo (para no ahogar la RAM de Render)
+    with ThreadPoolExecutor(max_workers=1) as executor:
         for idx, cat in enumerate(missing_catalogs):
             executor.submit(process_single_catalog, idx, cat)
 
