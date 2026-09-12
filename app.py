@@ -280,9 +280,9 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
                         current_contents.append(item)
                 # Try multiple models (prioritize the most advanced PRO models from your 2026 API keys)
                 models_to_try = [
+                    'gemini-2.5-pro',
                     'gemini-3.1-pro-preview',
                     'gemini-pro-latest',
-                    'gemini-2.5-pro',
                     'gemini-3.8-flash',
                     'gemini-3.7-flash',
                     'gemini-3.6-flash',
@@ -327,8 +327,11 @@ def extract_knowledge_from_catalog(files_list, title, progress_callback=None, cl
     print(f"Extrayendo conocimiento de {title} (esto puede tardar)...")
     prompt_extract = f"""
     Lee detalladamente el catálogo adjunto llamado "{title}".
-    Tu tarea es extraer un listado exhaustivo y masivo de TODOS los productos mencionados en este catálogo.
-    IMPORTANTE: Muchas páginas tienen 2, 3 o más productos diferentes en la misma página. DEBES extraer CADA UNO de ellos como un elemento separado en el JSON, con su respectivo precio y nombre individual. No agrupes productos, no omitas ninguno. Si una página tiene 3 productos, deben haber 3 objetos JSON para esa página.
+    Tu tarea es extraer un listado exhaustivo, masivo y MILIMÉTRICO de TODOS los productos mencionados en este catálogo.
+    ATENCIÓN: Este es un catálogo largo (más de 200 páginas) y tienes la tendencia a cansarte y omitir productos de las últimas páginas o saltarte páginas enteras. ¡ESTO ESTÁ ESTRICTAMENTE PROHIBIDO! 
+    DEBES extraer ABSOLUTAMENTE TODOS los productos, desde la página 1 hasta la última página.
+    IMPORTANTE: Muchas páginas tienen 2, 3 o más productos diferentes. DEBES extraer CADA UNO de ellos como un elemento separado en el JSON, con su respectivo precio y nombre. No agrupes productos, no omitas ninguno. Si una página tiene 3 productos, deben haber 3 objetos JSON para esa página.
+    Espero un JSON con CIENTOS de productos. Revisa cada maldita página.
     
     DEBES responder ÚNICAMENTE con un array en formato JSON con la siguiente estructura exacta:
     [
@@ -347,7 +350,7 @@ def extract_knowledge_from_catalog(files_list, title, progress_callback=None, cl
     
     Es OBLIGATORIO que el campo "catalogo" sea exactamente "{title}" para todos los productos.
     No añadas ningún texto antes ni después del JSON (sin comillas invertidas ni la palabra json).
-    Es CRÍTICO que extraigas ABSOLUTAMENTE TODOS los productos, revisando cada página minuciosamente para no dejar ninguno por fuera.
+    PENALIZACIÓN: Si omites productos de las secciones de Caballeros, Niños o Hogar, o si tu JSON tiene menos de 100 productos, el sistema fallará. Extrae TODO, revisando cada página minuciosamente para no dejar ninguno por fuera.
     """
     try:
         response = generate_content_robust(contents=[files_list, prompt_extract], client_idx=client_idx, progress_callback=progress_callback)
