@@ -38,12 +38,12 @@ def generate_and_upload_thumbnails(pdf_path, cat_hash, update_progress):
         
         import gc
         for page_num in range(total_pages):
-            if page_num % 10 == 0:
+            if page_num % 5 == 0:
                 update_progress(f"Generando imágenes... ({page_num}/{total_pages})", 35 + int((page_num/total_pages)*15))
                 gc.collect() # Forzar limpieza de RAM para evitar caídas en Render
                 
             page = doc.load_page(page_num)
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
             img_bytes = pix.tobytes("jpeg")
             
             object_name = f"{folder_path}/page_{page_num + 1}.jpg"
