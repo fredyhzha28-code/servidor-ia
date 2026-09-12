@@ -43,7 +43,7 @@ def generate_and_upload_thumbnails(pdf_path, cat_hash, update_progress):
                 update_progress(f"Generando imágenes... ({page_num}/{total_pages})", 35 + int((page_num/total_pages)*15))
                 
             page = doc.load_page(page_num)
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
+            pix = page.get_pixmap(matrix=fitz.Matrix(0.7, 0.7))
             img_bytes = pix.tobytes("jpeg")
             
             object_name = f"{folder_path}/page_{page_num + 1}.jpg"
