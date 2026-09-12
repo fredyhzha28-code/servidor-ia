@@ -36,9 +36,11 @@ def generate_and_upload_thumbnails(pdf_path, cat_hash, update_progress):
         folder_path = f"thumbnails/{cat_hash}"
         total_pages = len(doc)
         
+        import gc
         for page_num in range(total_pages):
             if page_num % 10 == 0:
                 update_progress(f"Generando imágenes... ({page_num}/{total_pages})", 35 + int((page_num/total_pages)*15))
+                gc.collect() # Forzar limpieza de RAM para evitar caídas en Render
                 
             page = doc.load_page(page_num)
             pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5))
@@ -51,6 +53,12 @@ def generate_and_upload_thumbnails(pdf_path, cat_hash, update_progress):
                 Body=img_bytes,
                 ContentType='image/jpeg'
             )
+            
+            # Liberar RAM explícitamente por cada página
+            del pix
+            del page
+            del img_bytes
+
         doc.close()
         return f"{R2_PUBLIC_URL}/{folder_path}"
     except Exception as e:
