@@ -288,15 +288,17 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
                     'gemini-3.6-flash',
                     'gemini-2.5-flash'
                 ]
+                last_error_msg = 'Desconocido'
                 for model_name in models_to_try:
                     try:
                         return current_client.models.generate_content(model=model_name, contents=current_contents)
                     except Exception as me:
                         error_msg = str(me)
+                        last_error_msg = error_msg
                         if "404" in error_msg or "429" in error_msg or "503" in error_msg:
                             continue # Try next model (e.g. fallback from Pro to Flash)
                         raise me # If it's a real error (like auth), let it bubble up
-                raise Exception(f"Ninguno de los modelos intentados está disponible. Último error: {str(me) if 'me' in locals() else 'Desconocido'}")
+                raise Exception(f"Ninguno de los modelos intentados está disponible. Último error: {last_error_msg}")
             except Exception as e:
                 error_str = str(e)
                 print(f"API Key {idx + 1} falló: {error_str}")
@@ -444,44 +446,54 @@ def process_single_catalog(idx, cat):
         import json, re
         
         def process_chunk(chunk_idx, chunk):
-            # Asignar una llave específica
-            c_idx = chunk_idx % len(clients) if clients else None
-            c = clients[c_idx] if clients else None
+            c_idx_start = chunk_idx % len(clients) if clients else 0
             
-            if c:
-                # Subir archivo
-                gf = c.files.upload(file=chunk['path'], config={'display_name': f"{title} (pags {chunk['start_page']}-{chunk['end_page']})"})
-                files_list = [None] * len(clients)
-                files_list[c_idx] = gf # Fake files list just for this client
+            # Try up to 3 different keys for this chunk if one fails
+            for attempt in range(min(3, len(clients))):
+                c_idx = (c_idx_start + attempt) % len(clients)
+                c = clients[c_idx]
                 
-                # Extraer
-                text = extract_knowledge_from_catalog(files_list, title, progress_callback=None, client_idx=c_idx, chunk_start=chunk['start_page'], chunk_end=chunk['end_page'])
-                
-                # Limpiar
-                try: os.remove(chunk['path'])
-                except: pass
-                
-                if text:
-                    clean_text = text.strip()
-                    if clean_text.startswith('```json'): clean_text = clean_text.replace('```json', '', 1)
-                    if clean_text.endswith('```'): clean_text = clean_text[:-3]
+                try:
+                    gf = c.files.upload(file=chunk['path'], config={'display_name': f"{title} (pags {chunk['start_page']}-{chunk['end_page']})"})
+                    files_list = [None] * len(clients)
+                    files_list[c_idx] = gf
                     
-                    try:
-                        prods = json.loads(clean_text)
-                        all_products.extend(prods)
-                    except Exception:
-                        pattern = re.compile(r'\{[^{}]*\}')
-                        for match in pattern.finditer(clean_text):
-                            try:
-                                obj = json.loads(match.group(0))
-                                all_products.append(obj)
-                            except: pass
+                    text = extract_knowledge_from_catalog(files_list, title, progress_callback=None, client_idx=c_idx, chunk_start=chunk['start_page'], chunk_end=chunk['end_page'])
+                    
+                    if text:
+                        clean_text = text.strip()
+                        if clean_text.startswith('```json'): clean_text = clean_text.replace('```json', '', 1)
+                        if clean_text.endswith('```'): clean_text = clean_text[:-3]
+                        
+                        try:
+                            prods = json.loads(clean_text)
+                            all_products.extend(prods)
+                        except Exception:
+                            pattern = re.compile(r'\{[^{}]*\}')
+                            for match in pattern.finditer(clean_text):
+                                try:
+                                    obj = json.loads(match.group(0))
+                                    all_products.append(obj)
+                                except: pass
+                    
+                    # Si tuvo éxito, no reintentamos
+                    break 
+                except Exception as e:
+                    print(f"Error procesando bloque {chunk_idx+1} con llave {c_idx+1}: {e}")
+                    # Try next client
+                    continue
+            
+            # Limpiar archivo temporal al terminar los intentos
+            try: os.remove(chunk['path'])
+            except: pass
 
-        # Procesar en paralelo
-        with ThreadPoolExecutor(max_workers=len(clients) if clients else 2) as executor:
+        with ThreadPoolExecutor(max_workers=min(4, len(clients) if clients else 2)) as executor:
             futures = [executor.submit(process_chunk, i, chunk) for i, chunk in enumerate(chunks)]
             for i, future in enumerate(futures):
-                future.result() # Wait for completion
+                try:
+                    future.result() # Wait for completion
+                except Exception as e:
+                    print(f"Bloque {i+1} falló permanentemente: {e}")
                 update_status(f"Procesado bloque {i+1} de {len(chunks)}...", 30 + (60 * (i+1) // len(chunks)))
 
         if all_products and firebase_db:
