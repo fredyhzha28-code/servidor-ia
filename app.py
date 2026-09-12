@@ -276,8 +276,16 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
                         current_contents.append(item[idx])
                     else:
                         current_contents.append(item)
-                        
-                return current_client.models.generate_content(model='gemini-1.5-flash', contents=current_contents)
+                # Try multiple models in case one is not available
+                models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash-latest', 'gemini-1.5-flash', 'gemini-1.5-pro-latest']
+                for model_name in models_to_try:
+                    try:
+                        return current_client.models.generate_content(model=model_name, contents=current_contents)
+                    except Exception as me:
+                        if "404" in str(me):
+                            continue # Try next model
+                        raise me # If it's a real error (like quota or auth), let it bubble up to the key retry logic
+                raise Exception("Ninguno de los modelos intentados está disponible.")
             except Exception as e:
                 error_str = str(e)
                 print(f"API Key {idx + 1} falló: {error_str}")
