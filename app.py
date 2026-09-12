@@ -283,15 +283,15 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
                         current_contents.append(item[idx])
                     else:
                         current_contents.append(item)
-                # Try multiple models (prioritize PRO for best reading quality, fallback to FLASH)
+                # Try multiple models (prioritize the most advanced PRO models from your 2026 API keys)
                 models_to_try = [
-                    'gemini-1.5-pro',
-                    'gemini-1.5-pro-latest',
+                    'gemini-3.1-pro-preview',
+                    'gemini-pro-latest',
                     'gemini-2.5-pro',
-                    'gemini-2.5-flash', 
-                    'gemini-2.0-flash', 
-                    'gemini-1.5-flash-latest', 
-                    'gemini-1.5-flash'
+                    'gemini-3.8-flash',
+                    'gemini-3.7-flash',
+                    'gemini-3.6-flash',
+                    'gemini-2.5-flash'
                 ]
                 for model_name in models_to_try:
                     try:
