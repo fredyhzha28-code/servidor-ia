@@ -322,14 +322,15 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
         else:
             raise Exception(f"Gemini falló tras probar todas las llaves {max_retries} veces. Último error: {last_error}")
 
-def extract_knowledge_from_catalog(files_list, title, progress_callback=None, client_idx=None):
+def extract_knowledge_from_catalog(files_list, title, progress_callback=None, client_idx=None, chunk_start=None, chunk_end=None):
     """Pide a Gemini que extraiga todos los productos de UN catálogo en formato JSON."""
     print(f"Extrayendo conocimiento de {title} (esto puede tardar)...")
     prompt_extract = f"""
     Lee detalladamente el catálogo adjunto llamado "{title}".
-    Tu tarea es extraer un listado exhaustivo, masivo y MILIMÉTRICO de TODOS los productos mencionados en este catálogo.
-    ATENCIÓN: Este es un catálogo largo (más de 200 páginas) y tienes la tendencia a cansarte y omitir productos de las últimas páginas o saltarte páginas enteras. ¡ESTO ESTÁ ESTRICTAMENTE PROHIBIDO! 
-    DEBES extraer ABSOLUTAMENTE TODOS los productos, desde la página 1 hasta la última página.
+    Tu tarea es extraer un listado exhaustivo, masivo y MILIMÉTRICO de TODOS los productos mencionados en este documento.
+    ATENCIÓN: Tienes la tendencia a cansarte y omitir productos. ¡ESTO ESTÁ ESTRICTAMENTE PROHIBIDO! 
+    DEBES extraer ABSOLUTAMENTE TODOS los productos de cada una de las páginas que se te han entregado.
+    "{" + ("" if chunk_start is None else f'NOTA: Este documento corresponde a las páginas {chunk_start} a {chunk_end} del catálogo original. Usa esos números de página reales en tu extracción.') + "}
     IMPORTANTE: Muchas páginas tienen 2, 3 o más productos diferentes. DEBES extraer CADA UNO de ellos como un elemento separado en el JSON, con su respectivo precio y nombre. No agrupes productos, no omitas ninguno. Si una página tiene 3 productos, deben haber 3 objetos JSON para esa página.
     Espero un JSON con CIENTOS de productos. Revisa cada maldita página.
     
@@ -364,6 +365,48 @@ def extract_knowledge_from_catalog(files_list, title, progress_callback=None, cl
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+
+import fitz
+import tempfile
+import os
+
+def download_and_chunk_pdf(url, cat_hash, update_progress, chunk_size=20):
+    try:
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk: tmp_file.write(chunk)
+                tmp_path = tmp_file.name
+            
+            update_progress("Generando miniaturas completas...", 10)
+            thumb_base_url = generate_and_upload_thumbnails(tmp_path, cat_hash, update_progress)
+            
+            update_progress("Dividiendo catálogo en bloques...", 20)
+            doc = fitz.open(tmp_path)
+            total_pages = len(doc)
+            chunk_paths = []
+            
+            for start_page in range(0, total_pages, chunk_size):
+                end_page = min(start_page + chunk_size, total_pages) - 1
+                chunk_doc = fitz.open()
+                chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page)
+                fd, tmp_chunk_path = tempfile.mkstemp(suffix=f"_{start_page+1}_{end_page+1}.pdf")
+                os.close(fd)
+                chunk_doc.save(tmp_chunk_path)
+                chunk_doc.close()
+                chunk_paths.append({
+                    'path': tmp_chunk_path,
+                    'start_page': start_page + 1,
+                    'end_page': end_page + 1
+                })
+            doc.close()
+            os.remove(tmp_path)
+            return chunk_paths, thumb_base_url
+        return None, None
+    except Exception as e:
+        print(f"Error en chunking: {e}")
+        return None, None
 def process_single_catalog(idx, cat):
     try:
         url = cat.get('url', '')
@@ -371,113 +414,108 @@ def process_single_catalog(idx, cat):
         if not url: return
         
         cat_hash = get_single_catalog_hash(url, title)
-        
-        # Asignar una llave dedicada basada en su posición en la fila
-        client_idx = idx % len(clients) if clients else None
-        
         appId = cat.get('appId', 'tienda-catalogos-app')
         status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status") if firebase_db else None
         
-        # Avisar al frontend (admin) que empezó
-        if status_collection:
-            status_collection.document(cat_hash).set({
-                "status": "processing",
-                "title": title,
-                "message": f"Iniciando lectura (Asignada a Llave {client_idx+1})...",
-                "progress": 5,
-                "updatedAt": firestore.SERVER_TIMESTAMP
-            })
-            
-        files_list = get_or_upload_file(cat, cat_hash, client_idx)
-        if not files_list: return
-        
-        if status_collection:
-            status_collection.document(cat_hash).update({
-                "message": "La IA está analizando los productos (esto demora un poco)...",
-                "progress": 60,
-                "updatedAt": firestore.SERVER_TIMESTAMP
-            })
-            
-        def extraction_progress(msg, pct):
+        def update_status(msg, pct):
             if status_collection:
                 try:
-                    status_collection.document(cat_hash).update({
-                        "message": msg,
-                        "progress": pct,
-                        "updatedAt": firestore.SERVER_TIMESTAMP
-                    })
+                    status_collection.document(cat_hash).set({
+                        "status": "processing", "title": title, "message": msg, "progress": pct, "updatedAt": firestore.SERVER_TIMESTAMP
+                    }, merge=True)
                 except: pass
-            
-        cached_text = extract_knowledge_from_catalog(files_list, title, progress_callback=extraction_progress, client_idx=client_idx)
-        if cached_text:
-            global memory_knowledge_cache
-            memory_knowledge_cache[cat_hash] = cached_text
-            
-            # EXTRAER PRODUCTOS INDIVIDUALES A FIREBASE
-            try:
-                import json
-                import re
-                
-                clean_text = cached_text.strip()
-                if clean_text.startswith('```json'):
-                    clean_text = clean_text.replace('```json', '', 1)
-                if clean_text.endswith('```'):
-                    clean_text = clean_text[:-3]
-                clean_text = clean_text.strip()
-                
-                products = []
-                try:
-                    products = json.loads(clean_text)
-                except Exception:
-                    pattern = re.compile(r'\{[^{}]*\}')
-                    for match in pattern.finditer(clean_text):
-                        try:
-                            obj = json.loads(match.group(0))
-                            products.append(obj)
-                        except: pass
-                
-                if firebase_db and products:
-                    products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
-                    thumb_base_url = f"{R2_PUBLIC_URL}/thumbnails/{cat_hash}"
-                    
-                    batch = firebase_db.batch()
-                    count = 0
-                    for p in products:
-                        if isinstance(p, dict) and 'nombre' in p:
-                            p_id = p.get('id', get_single_catalog_hash(f"{cat_hash}_{p.get('nombre')}_{p.get('pagina')}"))
-                            pag_num = p.get('pagina', '1')
-                            p['imagen'] = f"{thumb_base_url}/page_{pag_num}.jpg"
-                            p['catalogo_url'] = url.split('?')[0]
-                            p['catalogo_hash'] = cat_hash
-                            
-                            doc_ref = products_col.document(p_id)
-                            batch.set(doc_ref, p)
-                            count += 1
-                            
-                            if count >= 400:
-                                batch.commit()
-                                batch = firebase_db.batch()
-                                count = 0
-                    if count > 0:
-                        batch.commit()
-                    print(f"Guardados {len(products)} productos individuales en Firebase.")
-            except Exception as e:
-                print(f"Error guardando productos a Firebase: {e}")
 
-            if status_collection:
-                # Guardar el JSON (este va en caché interno del backend, no necesita appId)
-                doc_ref = firebase_db.collection("ai_knowledge_cache_single").document(cat_hash)
-                doc_ref.set({"extracted_text": cached_text, "url": url.split('?')[0]}, merge=True)
+        update_status("Descargando y particionando PDF...", 5)
+        
+        # 1. Bajar y picar
+        chunks, thumb_base_url = download_and_chunk_pdf(url, cat_hash, update_status, chunk_size=20)
+        if not chunks: 
+            update_status("Error al descargar PDF", 0)
+            return
+            
+        if firebase_db and thumb_base_url:
+            try:
+                firebase_db.collection("ai_knowledge_cache_single").document(cat_hash).set({"thumb_base_url": thumb_base_url}, merge=True)
+            except: pass
+
+        update_status("Procesando bloques con múltiples IAs en paralelo...", 25)
+        
+        all_products = []
+        import json, re
+        
+        def process_chunk(chunk_idx, chunk):
+            # Asignar una llave específica
+            c_idx = chunk_idx % len(clients) if clients else None
+            c = clients[c_idx] if clients else None
+            
+            if c:
+                # Subir archivo
+                gf = c.files.upload(file=chunk['path'], config={'display_name': f"{title} (pags {chunk['start_page']}-{chunk['end_page']})"})
+                files_list = [None] * len(clients)
+                files_list[c_idx] = gf # Fake files list just for this client
                 
-                # Avisar al frontend que terminó
-                status_collection.document(cat_hash).set({
-                    "status": "completed",
-                    "title": title,
-                    "message": "¡Revista memorizada con éxito!",
-                    "progress": 100,
-                    "updatedAt": firestore.SERVER_TIMESTAMP
-                })
-                print(f"Conocimiento guardado en Firebase caché para: {title}!")
+                # Extraer
+                text = extract_knowledge_from_catalog(files_list, title, progress_callback=None, client_idx=c_idx, chunk_start=chunk['start_page'], chunk_end=chunk['end_page'])
+                
+                # Limpiar
+                try: os.remove(chunk['path'])
+                except: pass
+                
+                if text:
+                    clean_text = text.strip()
+                    if clean_text.startswith('```json'): clean_text = clean_text.replace('```json', '', 1)
+                    if clean_text.endswith('```'): clean_text = clean_text[:-3]
+                    
+                    try:
+                        prods = json.loads(clean_text)
+                        all_products.extend(prods)
+                    except Exception:
+                        pattern = re.compile(r'\{[^{}]*\}')
+                        for match in pattern.finditer(clean_text):
+                            try:
+                                obj = json.loads(match.group(0))
+                                all_products.append(obj)
+                            except: pass
+
+        # Procesar en paralelo
+        with ThreadPoolExecutor(max_workers=len(clients) if clients else 2) as executor:
+            futures = [executor.submit(process_chunk, i, chunk) for i, chunk in enumerate(chunks)]
+            for i, future in enumerate(futures):
+                future.result() # Wait for completion
+                update_status(f"Procesado bloque {i+1} de {len(chunks)}...", 30 + (60 * (i+1) // len(chunks)))
+
+        if all_products and firebase_db:
+            products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+            batch = firebase_db.batch()
+            count = 0
+            for p in all_products:
+                if isinstance(p, dict) and 'nombre' in p:
+                    p_id = p.get('id', get_single_catalog_hash(f"{cat_hash}_{p.get('nombre')}_{p.get('pagina')}"))
+                    pag_num = p.get('pagina', '1')
+                    p['imagen'] = f"{thumb_base_url}/page_{pag_num}.jpg"
+                    p['catalogo_url'] = url.split('?')[0]
+                    p['catalogo_hash'] = cat_hash
+                    
+                    doc_ref = products_col.document(p_id)
+                    batch.set(doc_ref, p)
+                    count += 1
+                    
+                    if count >= 400:
+                        batch.commit()
+                        batch = firebase_db.batch()
+                        count = 0
+            if count > 0:
+                batch.commit()
+            print(f"Guardados {len(all_products)} productos individuales de todos los bloques en Firebase.")
+            
+            # Guardar el JSON concatenado (para caché)
+            doc_ref = firebase_db.collection("ai_knowledge_cache_single").document(cat_hash)
+            doc_ref.set({"extracted_text": json.dumps(all_products), "url": url.split('?')[0]}, merge=True)
+            
+            update_status("¡Revista memorizada con éxito!", 100)
+    except Exception as e:
+        print(f"Error procesando catálogo {cat.get('title')}: {e}")
+
     except Exception as e:
         print(f"Error procesando catálogo {cat.get('title')}: {e}")
         try:
@@ -685,6 +723,93 @@ def search_products():
         error_msg = str(e)
         print(f"Error crítico: {error_msg}")
         return jsonify({"error": error_msg}), 500
+
+
+@app.route('/api/extract_missing_product', methods=['POST'])
+def extract_missing_product():
+    data = request.json
+    url = data.get('catalog_url')
+    page_number = data.get('page_number')
+    instruction = data.get('instruction')
+    appId = data.get('appId')
+    title = data.get('title', 'Catálogo')
+
+    if not all([url, page_number, instruction, appId]):
+        return jsonify({"error": "Missing parameters"}), 400
+
+    cat_hash = get_single_catalog_hash(url, title)
+    thumb_url = f"{R2_PUBLIC_URL}/thumbnails/{cat_hash}/page_{page_number}.jpg"
+    
+    img_resp = requests.get(thumb_url)
+    if img_resp.status_code != 200:
+        return jsonify({"error": "No se pudo obtener la imagen de la página."}), 404
+        
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
+        tmp_img.write(img_resp.content)
+        tmp_img_path = tmp_img.name
+
+    try:
+        client_idx = 0
+        c = clients[client_idx]
+        gf = c.files.upload(file=tmp_img_path, config={'display_name': f"page_{page_number}"})
+        
+        prompt = f'''
+        Estás revisando la página {page_number} del catálogo '{title}'.
+        El usuario ha indicado que falta un producto específico en la extracción anterior.
+        Instrucción del usuario: "{instruction}"
+        
+        Extrae ÚNICAMENTE el producto que menciona el usuario, basándote en la imagen adjunta y la instrucción.
+        Responde estrictamente con un objeto JSON (no array, solo el objeto) con la siguiente estructura:
+        {{
+            "id": "crea_un_id_unico_corto",
+            "nombre": "Nombre del producto",
+            "precio": "Precio",
+            "descripcion_corta": "Descripción atractiva",
+            "categoria": "Dama, Caballero, Niños, Niñas o Hogar",
+            "seccion": "Ropa, Zapatos, Belleza y Perfumería, Cuidado Personal, Accesorios o Varios",
+            "subcategoria": "...",
+            "catalogo": "{title}",
+            "pagina": "{page_number}"
+        }}
+        No añadas ningún texto antes ni después del JSON.
+        '''
+        response = generate_content_robust(contents=[gf, prompt], client_idx=client_idx)
+        
+        import json, re
+        clean_text = response.strip() if isinstance(response, str) else response.text.strip()
+        if clean_text.startswith('```json'): clean_text = clean_text.replace('```json', '', 1)
+        if clean_text.endswith('```'): clean_text = clean_text[:-3]
+        clean_text = clean_text.strip()
+        
+        product = None
+        try:
+            product = json.loads(clean_text)
+        except Exception:
+            # Fallback to regex
+            pattern = re.compile(r'\{[^{}]*\}')
+            match = pattern.search(clean_text)
+            if match:
+                product = json.loads(match.group(0))
+                
+        if not product:
+            raise Exception("No se pudo parsear el JSON generado.")
+            
+        product['imagen'] = thumb_url
+        product['catalogo_url'] = url.split('?')[0]
+        product['catalogo_hash'] = cat_hash
+        
+        if firebase_db:
+            p_id = product.get('id', get_single_catalog_hash(f"{cat_hash}_missing_{page_number}_{instruction}"))
+            product['id'] = p_id
+            firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products").document(p_id).set(product)
+            
+        os.remove(tmp_img_path)
+        return jsonify({"success": True, "product": product})
+    except Exception as e:
+        try: os.remove(tmp_img_path)
+        except: pass
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
