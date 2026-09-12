@@ -223,15 +223,14 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     prompt = f"""
     Analiza COMPLETAMENTE esta página del catálogo "{title}" (Página {page_num}).
     
-    Identifica TODOS los productos presentes en esta página.
-    No selecciones solamente los productos principales. No omitas productos.
-    Cada producto distinto debe ser un objeto independiente.
-    Si existen 3 productos, devuelve 3 objetos. Si existen 10 productos, devuelve 10 objetos.
+    Identifica TODOS los productos presentes en esta página, PERO SIGUIENDO ESTAS REGLAS ESTRICTAS:
+    1. EXTRACCIÓN CONDICIONAL AL PRECIO: SOLO extrae un producto si tiene un PRECIO ASOCIADO CLARO Y EXPLÍCITO. Ignora modelos, fotos decorativas, textos genéricos o productos de ambientación que no tengan precio. SI NO HAY PRECIO, NO HAY PRODUCTO.
+    2. NO DUPLICAR: No extraigas el mismo producto múltiples veces. Si hay variantes de color o talla para el mismo precio, agrúpalos como un solo producto.
+    3. PRECIOS INDEPENDIENTES = PRODUCTOS INDEPENDIENTES: Si hay 3 precios diferentes en la página, deben existir exactamente 3 objetos en tu respuesta. Relaciona correctamente cada producto con su precio.
+    
+    Cada producto distinto debe ser un objeto independiente en el JSON.
     Lee toda la página de arriba hacia abajo y de izquierda a derecha.
-    Relaciona correctamente cada producto con su precio.
-    No mezcles precios entre productos. No agrupes productos diferentes. No inventes información.
-    Utiliza el texto y la imagen para determinar los productos.
-    Revisa también las zonas pequeñas de la página, esquinas, tablas, promociones y secciones inferiores.
+    Revisa también las zonas pequeñas de la página, esquinas, tablas y promociones.
     
     Texto extraído por OCR como referencia:
     {page_text}
@@ -239,7 +238,7 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     Devuelve exclusivamente un JSON con la siguiente estructura (Array de objetos):
     [
       {{
-        "nombre": "Nombre del producto",
+        "nombre": "Nombre del producto (sin repetir palabras como Ropa Ropa)",
         "precio": "Precio del producto (con símbolo de moneda)",
         "descripcion_corta": "Descripción atractiva o características breves",
         "categoria": "Categoría principal (Dama, Caballero, Niños, Niñas, Hogar)",
@@ -432,6 +431,12 @@ def process_single_catalog(idx, cat):
         total_pages = len(doc)
         
         for p in range(last_successful_page + 1, total_pages + 1):
+            if status_collection:
+                # Verificar si el documento aún existe; si no, la revista fue eliminada
+                if not status_collection.document(cat_hash).get().exists:
+                    print(f"Catálogo {title} eliminado por el usuario. Abortando proceso.")
+                    break
+                    
             try:
                 process_single_page(doc, p, cat)
             except Exception as e:
