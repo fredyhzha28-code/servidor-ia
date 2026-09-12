@@ -292,10 +292,11 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
                     try:
                         return current_client.models.generate_content(model=model_name, contents=current_contents)
                     except Exception as me:
-                        if "404" in str(me):
-                            continue # Try next model
-                        raise me # If it's a real error (like quota or auth), let it bubble up to the key retry logic
-                raise Exception("Ninguno de los modelos intentados está disponible.")
+                        error_msg = str(me)
+                        if "404" in error_msg or "429" in error_msg or "503" in error_msg:
+                            continue # Try next model (e.g. fallback from Pro to Flash)
+                        raise me # If it's a real error (like auth), let it bubble up
+                raise Exception(f"Ninguno de los modelos intentados está disponible. Último error: {str(me) if 'me' in locals() else 'Desconocido'}")
             except Exception as e:
                 error_str = str(e)
                 print(f"API Key {idx + 1} falló: {error_str}")
