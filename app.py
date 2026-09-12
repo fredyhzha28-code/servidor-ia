@@ -277,7 +277,7 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
                     else:
                         current_contents.append(item)
                         
-                return current_client.models.generate_content(model='gemini-1.5-pro', contents=current_contents)
+                return current_client.models.generate_content(model='gemini-1.5-flash', contents=current_contents)
             except Exception as e:
                 error_str = str(e)
                 print(f"API Key {idx + 1} falló: {error_str}")
@@ -286,8 +286,8 @@ def generate_content_robust(contents, client_idx=None, max_retries=10, progress_
                 if "429" in error_str or "503" in error_str:
                     last_error = error_str
                     continue
-                # Si la llave es inválida (ej. 401, 403, 400), la ignoramos y probamos la siguiente
-                elif "401" in error_str or "403" in error_str or "400" in error_str:
+                # Si la llave es inválida (ej. 401, 403, 400, 404), la ignoramos y probamos la siguiente
+                elif "401" in error_str or "403" in error_str or "400" in error_str or "404" in error_str:
                     last_error = error_str
                     continue
                 else:
