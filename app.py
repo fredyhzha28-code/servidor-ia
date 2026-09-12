@@ -338,10 +338,23 @@ def process_single_page(doc, page_num, cat_info):
         products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
         batch = firebase_db.batch()
         count = 0
+        
+        # Deduplicar antes de subir (para evitar repetición por comas o espacios)
+        unique_products = []
+        seen_keys = set()
         for p in products:
             if isinstance(p, dict) and 'nombre' in p:
-                p_id = p.get('id', get_single_catalog_hash(f"{cat_hash}_{p.get('nombre')}_{page_num}"))
-                p['imagen'] = img_url
+                for k, v in p.items():
+                    if isinstance(v, str): p[k] = v.strip()
+                
+                u_key = f"{normalize_text(p.get('nombre', ''))}_{str(p.get('precio', ''))}"
+                if u_key not in seen_keys:
+                    seen_keys.add(u_key)
+                    unique_products.append(p)
+                    
+        for p in unique_products:
+            p_id = p.get('id', get_single_catalog_hash(f"{cat_hash}_{p.get('nombre')}_{p.get('precio', '')}_{page_num}"))
+            p['imagen'] = img_url
                 p['catalogo_url'] = url.split('?')[0]
                 p['catalogo_hash'] = cat_hash
                 p['pagina'] = str(page_num)
