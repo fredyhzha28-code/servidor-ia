@@ -263,12 +263,48 @@ def get_price_number(price_str):
     nums = re.sub(r'[^0-9]', '', str(price_str))
     return int(nums) if nums else 0
 
+GENERIC_FASHION_TERMS = {
+    'vestido', 'camiseta', 'blusa', 'pantalon', 'enterizo', 'falda', 'short',
+    'jean', 'jeans', 'chaqueta', 'buzo', 'sueter', 'saco', 'top', 'crop', 'body',
+    'pijama', 'conjunto', 'leggings', 'jogger', 'chaleco', 'cardigan', 'blazer',
+    'bata', 'camisa', 'polo', 'zapato', 'zapatos', 'sandalia', 'sandalias',
+    'tenis', 'tacones', 'botas', 'botines', 'bolso', 'morral', 'cartera',
+    'perfume', 'colonia', 'fragancia', 'labial', 'mascara', 'crema', 'locion',
+    'esmalte', 'delineador', 'polvo', 'base', 'aretes', 'collar', 'pulsera', 'reloj'
+}
+
+def is_duplicate_product_pair(item_a, item_b):
+    # Criterio 1: Misma viñeta (ej: ambos 'a.' con mismo precio)
+    if item_a['ref_letter'] and item_b['ref_letter'] and item_a['ref_letter'] == item_b['ref_letter']:
+        return True
+        
+    norm_a = item_a['norm_name']
+    norm_b = item_b['norm_name']
+    
+    # Criterio 2: Nombres normalizados exactamente idénticos
+    if norm_a and norm_b and norm_a == norm_b:
+        return True
+        
+    # Criterio 3: Mismo precio numérico y uno es solo el encabezado genérico de una palabra (ej: 'Vestido' vs 'Vestido amplio')
+    if item_a['price_num'] > 0 and item_a['price_num'] == item_b['price_num']:
+        words_a = norm_a.split()
+        words_b = norm_b.split()
+        
+        # Caso A: norm_a es 1 sola palabra genérica (ej: 'vestido') y norm_b es específico (ej: 'vestido amplio...')
+        if len(words_a) == 1 and (norm_a in GENERIC_FASHION_TERMS or len(norm_a) <= 10) and len(words_b) > 1 and norm_a in norm_b:
+            return True
+        # Caso B: norm_b es 1 sola palabra genérica y norm_a es específico
+        if len(words_b) == 1 and (norm_b in GENERIC_FASHION_TERMS or len(norm_b) <= 10) and len(words_a) > 1 and norm_b in norm_a:
+            return True
+            
+    return False
+
 def deduplicate_and_merge_page_products(products):
     """
-    Filtra y consolida productos de una misma página para garantizar:
-    1. Que si hay N precios, no se creen productos ficticios o duplicados.
-    2. Que un título (ej: "Vestido") y su subtítulo (ej: "Vestido amplio") se unifiquen en un solo producto.
-    3. Que se eliminen las viñetas "a.", "b." del nombre.
+    Filtra y consolida productos de una misma página:
+    1. Si un producto es solo el título genérico (ej: 'Vestido') y el otro es el nombre completo (ej: 'Vestido amplio') con el mismo precio, los unifica.
+    2. Productos distintos que compartan precio (ej: 'Mon L\'Bel Parfum' y 'Mon L\'Bel Diamant Parfum' a $104.990, o '10ml' vs '50ml') SE PRESERVAN ambos.
+    3. Limpia viñetas 'a.', 'b.' del nombre.
     """
     if not products:
         return []
@@ -312,31 +348,8 @@ def deduplicate_and_merge_page_products(products):
                 continue
             
             item_b = cleaned_items[j]
-            is_duplicate = False
             
-            # Criterio 1: Mismo precio numérico
-            if item_a['price_num'] > 0 and item_a['price_num'] == item_b['price_num']:
-                # Misma letra de viñeta (ej: ambos eran 'a.' con precio 79999)
-                if item_a['ref_letter'] and item_b['ref_letter'] and item_a['ref_letter'] == item_b['ref_letter']:
-                    is_duplicate = True
-                else:
-                    norm_a = item_a['norm_name']
-                    norm_b = item_b['norm_name']
-                    # Uno contiene al otro (ej: 'vestido' en 'vestido amplio', o 'camiseta' en 'camiseta semiajustada')
-                    if norm_a and norm_b and (norm_a in norm_b or norm_b in norm_a):
-                        is_duplicate = True
-                    else:
-                        # Palabras compartidas importantes (raíz de moda)
-                        words_a = set(w for w in norm_a.split() if len(w) > 3)
-                        words_b = set(w for w in norm_b.split() if len(w) > 3)
-                        if words_a & words_b:
-                            is_duplicate = True
-            
-            # Criterio 2: Nombres idénticos normalizados aunque no tengan precio
-            elif item_a['norm_name'] and item_a['norm_name'] == item_b['norm_name']:
-                is_duplicate = True
-                
-            if is_duplicate:
+            if is_duplicate_product_pair(item_a, item_b):
                 used_indices.add(j)
                 # Escoger el nombre más completo / específico
                 if len(item_b['clean_name']) > len(best_product['nombre']):
@@ -363,33 +376,31 @@ def deduplicate_and_merge_page_products(products):
 
 def extract_products_from_page(page_text, image_path, title, page_num, is_audit=False):
     prompt = f"""
-    Analiza con máxima atención esta página del catálogo de moda "{title}" (Página {page_num}).
+    Analiza con máxima atención esta página del catálogo de moda/belleza "{title}" (Página {page_num}).
     
-    Tu objetivo es extraer ÚNICAMENTE los productos reales a la venta, SIN DUPLICARLOS, siguiendo estas REGLAS ESTRICTAS:
+    Tu objetivo es extraer con precisión TODOS los productos reales a la venta, distinguiendo variantes y evitando duplicados:
 
-    1. GUÍA ESTRICTA POR PRECIOS (1 PRECIO = 1 PRODUCTO):
-       - Cuenta las etiquetas de precio y ofertas individuales que hay en esta página.
-       - Si en la página hay exactamente 2 precios (ejemplo: $79.999 y $35.999), DEBEN EXISTIR EXACTAMENTE 2 PRODUCTOS en el JSON. NI MÁS, NI MENOS.
-       - Si hay 3 precios, DEBEN EXISTIR EXACTAMENTE 3 PRODUCTOS.
-       - Cada precio corresponde a UN SOLO producto a la venta.
-       - Si un elemento en la imagen no tiene precio de venta asignado (como fondos decorativos o modelos), NO lo extraigas.
+    1. CADA PRODUCTO DISTINTO ES UN OBJETO EN EL JSON:
+       - Si en la página hay varios productos a la venta (por ejemplo: perfumes como 'BLEU FEMME OASIS PARFUM', 'MON L'BEL PARFUM' y 'MON L'BEL DIAMANT PARFUM', o varias prendas o tonos de labial), DEBES EXTRAERLOS TODOS.
+       - ¡MUY IMPORTANTE - PRODUCTOS DISTINTOS CON EL MISMO PRECIO!:
+         Dos o más productos a menudo tienen el mismo precio (ej: dos perfumes diferentes que cuestan $104.990 cada uno, o dos presentaciones de 10ml y 50ml, o dos labiales de distinto tono).
+         * NO los unas ni los descartes. Tienen nombres diferentes (como 'MON L'BEL' vs 'MON L'BEL DIAMANT' o '10ml' vs '50ml'). Son productos independientes y ambos deben estar en el JSON.
+       - Cada producto físico o variante individual con su propio nombre comercial debe tener su propio objeto en el JSON.
 
-    2. TÍTULO vs SUBTÍTULO / DESCRIPCIÓN (¡PROHIBIDO CREAR PRODUCTOS DUPLICADOS!):
-       - En las revistas de moda (Pacifika, Carmel, Leonisa, etc.), los bloques de producto contienen:
-         * Un Título principal grande (ej: "Vestido", "Camiseta", "Enterizo"), a veces precedido de una letra ("a.", "b.").
-         * Un Subtítulo o detalle de silueta/corte justo debajo (ej: "Vestido amplio", "Camiseta semiajustada", "Silueta amplia").
-         * Detalles de tela y confección (ej: "Tejido plano...", "Algodón poliéster...").
-       - ¡IMPORTANTE!: El subtítulo ("Vestido amplio" o "Camiseta semiajustada") es la DESCRIPCIÓN del mismo producto, ¡NO ES OTRO PRODUCTO!
-       - JAMÁS crees dos productos separados como "Vestido" y "Vestido amplio" con el mismo precio. Crea SOLAMENTE UN producto consolidado.
-       - Para el campo "nombre": usa el nombre más claro y completo SIN incluir la letra de viñeta (ej: "Vestido amplio", "Camiseta semiajustada"). No incluyas 'a.' o 'b.' en el nombre.
-       - Para el campo "descripcion_corta": incluye el subtítulo, silueta, corte, tela y características (ej: "Vestido amplio, silueta amplia en tejido plano poliéster").
+    2. CUÁNDO SÍ ES UN DUPLICADO (LO QUE DEBES EVITAR):
+       - Solo es un duplicado cuando para UN SOLO producto físico (ej: un solo vestido en la modelo), la página muestra un título genérico ("VESTIDO") y abajo un subtítulo descriptivo ("Vestido amplio en tejido plano...") con el mismo precio.
+       - En ese caso de un solo producto físico: NO crees dos productos ("Vestido" y "Vestido amplio"). Extrae SOLAMENTE UNO con el nombre completo descriptivo ("Vestido amplio") y coloca el resto en "descripcion_corta".
+       - JAMÁS crees productos clones o con nombres 100% idénticos.
 
-    3. VARIANTES DE TALLA Y COLOR:
-       - Si un producto lista varias tallas (XS, S, M, L, XL) o códigos para el mismo precio, agrúpalos como un único producto.
+    3. LIMPIEZA DE NOMBRES Y VIÑETAS:
+       - Limpia viñetas como 'a.', 'b.', 'c.', '1.', '2.' al inicio del nombre.
+       - En "nombre", coloca el nombre específico y completo del producto (ej: "Mon L'Bel Diamant Parfum", "Mon L'Bel Parfum", "Bleu Femme Oasis Parfum", "Vestido amplio").
+       - En "precio", incluye el precio visible exacto con su signo de moneda.
+       - En "descripcion_corta", incluye notas olfativas, mililitros, tela, silueta o detalles.
 
-    4. AUTO-VERIFICACIÓN FINAL ANTES DE EMITIR EL JSON:
-       - Cuenta cuántos precios hay en la página y cuántos objetos creaste en el JSON.
-       - Si la página tiene 2 precios y generaste 4 objetos porque separaste título y subtítulo, fusiona de inmediato cada título con su subtítulo para que queden EXACTAMENTE 2 objetos.
+    4. AUTO-VERIFICACIÓN FINAL:
+       - Asegúrate de que cada producto físico independiente de la página esté en el JSON.
+       - Verifica que no hayas creado clones de un mismo producto, pero que tampoco hayas omitido productos distintos que compartan precio.
 
     Texto extraído por OCR como referencia:
     {page_text}
@@ -397,12 +408,12 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     Devuelve exclusivamente un JSON con la siguiente estructura (Array de objetos):
     [
       {{
-        "nombre": "Nombre descriptivo limpio (ej: Vestido amplio, Camiseta semiajustada - sin viñetas a. o b.)",
-        "precio": "Precio con signo peso (ej: $79.999)",
-        "descripcion_corta": "Subtítulo, silueta, detalles de tela y confección",
+        "nombre": "Nombre descriptivo limpio (ej: Mon L'Bel Diamant Parfum, Vestido amplio - sin viñetas a. o b.)",
+        "precio": "Precio con signo peso (ej: $104.990)",
+        "descripcion_corta": "Notas olfativas, mililitros, subtítulo, silueta o tela",
         "categoria": "Categoría principal (Dama, Caballero, Niños, Niñas, Hogar)",
         "seccion": "Sección general (Ropa, Zapatos, Belleza y Perfumería, Cuidado Personal, Accesorios, Varios)",
-        "subcategoria": "Subcategoría específica (ej: Vestidos, Camisetas)",
+        "subcategoria": "Subcategoría específica (ej: Perfumes, Vestidos, Labiales)",
         "catalogo": "{title}",
         "pagina": "{page_num}"
       }}
