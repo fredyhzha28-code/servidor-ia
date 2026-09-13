@@ -273,7 +273,19 @@ GENERIC_FASHION_TERMS = {
     'esmalte', 'delineador', 'polvo', 'base', 'aretes', 'collar', 'pulsera', 'reloj'
 }
 
+def extract_cod(item):
+    if not isinstance(item, dict): return None
+    text = f"{item.get('raw_name', '')} {item.get('descripcion', '')} {item.get('clean_name', '')} {item.get('raw', {}).get('descripcion_corta', '')}"
+    m = re.search(r'c[oó]d\.?\s*([0-9]{3,7})', text, re.IGNORECASE)
+    return m.group(1) if m else None
+
 def is_duplicate_product_pair(item_a, item_b):
+    # Si ambos tienen códigos de referencia distintos (ej: Cód. 09583 vs Cód. 09582), son productos DISTINTOS
+    cod_a = extract_cod(item_a)
+    cod_b = extract_cod(item_b)
+    if cod_a and cod_b and cod_a != cod_b:
+        return False
+
     # Criterio 1: Misma viñeta (ej: ambos 'a.' con mismo precio)
     if item_a['ref_letter'] and item_b['ref_letter'] and item_a['ref_letter'] == item_b['ref_letter']:
         return True
@@ -304,7 +316,8 @@ def deduplicate_and_merge_page_products(products):
     Filtra y consolida productos de una misma página:
     1. Si un producto es solo el título genérico (ej: 'Vestido') y el otro es el nombre completo (ej: 'Vestido amplio') con el mismo precio, los unifica.
     2. Productos distintos que compartan precio (ej: 'Mon L\'Bel Parfum' y 'Mon L\'Bel Diamant Parfum' a $104.990, o '10ml' vs '50ml') SE PRESERVAN ambos.
-    3. Limpia viñetas 'a.', 'b.' del nombre.
+    3. Productos sin precio pero con código (ej: 'Confirmar con Erika') con códigos distintos se preservan.
+    4. Limpia viñetas 'a.', 'b.' del nombre.
     """
     if not products:
         return []
@@ -378,29 +391,43 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     prompt = f"""
     Analiza con máxima atención esta página del catálogo de moda/belleza "{title}" (Página {page_num}).
     
-    Tu objetivo es extraer con precisión TODOS los productos reales a la venta, distinguiendo variantes y evitando duplicados:
+    Tu objetivo es extraer con precisión TODOS los productos reales a la venta, distinguiendo variantes y calculando precios unitarios:
 
-    1. CADA PRODUCTO DISTINTO ES UN OBJETO EN EL JSON:
-       - Si en la página hay varios productos a la venta (por ejemplo: perfumes como 'BLEU FEMME OASIS PARFUM', 'MON L'BEL PARFUM' y 'MON L'BEL DIAMANT PARFUM', o varias prendas o tonos de labial), DEBES EXTRAERLOS TODOS.
-       - ¡MUY IMPORTANTE - PRODUCTOS DISTINTOS CON EL MISMO PRECIO!:
-         Dos o más productos a menudo tienen el mismo precio (ej: dos perfumes diferentes que cuestan $104.990 cada uno, o dos presentaciones de 10ml y 50ml, o dos labiales de distinto tono).
-         * NO los unas ni los descartes. Tienen nombres diferentes (como 'MON L'BEL' vs 'MON L'BEL DIAMANT' o '10ml' vs '50ml'). Son productos independientes y ambos deben estar en el JSON.
-       - Cada producto físico o variante individual con su propio nombre comercial debe tener su propio objeto en el JSON.
+    1. CÁLCULO DE PRECIO POR MILILITRO O GRAMO (MUY IMPORTANTE):
+       - En catálogos de perfumería y cosmética (L'Bel, Esika, Cyzone, etc.), a veces el precio total no está en letras gigantes, pero la ficha del producto indica el contenido y el precio por mililitro o gramo.
+       - EJEMPLO REAL 1:
+         "EXTRÉME L'BEL PARFUM MASCULINO 100 ml e 3.3 fl. oz. Cód. 09327 ml a $1.249,90"
+         -> Multiplica: 100 ml * 1.249,90 = 124.990.
+         -> El precio del producto ES: "$124.990".
+       - EJEMPLO REAL 2:
+         "LIVE ADVENTURE PARFUM MASCULINO 100 ml e 3.3 fl. oz. Cód. 03623 ml a $1.249,90"
+         -> Multiplica: 100 ml * 1.249,90 = 124.990.
+         -> El precio del producto ES: "$124.990".
+       - OTRO EJEMPLO: 50 ml y "ml a $2.000" -> 50 * 2000 = "$100.000".
+       - Siempre que veas el precio por unidad de medida (ml a $... o g a $...) y el tamaño (ml o g), calcula el precio total multiplicando y asígnalo en el campo "precio".
 
-    2. CUÁNDO SÍ ES UN DUPLICADO (LO QUE DEBES EVITAR):
+    2. PRODUCTOS SIN PRECIO PERO CON CÓDIGO (CÓD. / COD.):
+       - En algunas páginas promocionales de fragancias, maquillaje o cremas (ejemplo: "DESTINÉ FRAGRANCE MIST: BUDAPEST CITRUS PUNCH Cód. 09583", "VIENNA FRUITY PEACH Cód. 09582", "ROMA ROUGE BERRIES Cód. 12291"):
+         * Los productos NO tienen precio directo ni precio por ml impreso en esa página.
+         * CONDICIÓN ESTRICTA: SI TIENEN UN CÓDIGO ASIGNADO (ej: 'Cód. 09583', 'Cód. 03623', 'Cod. 12291'), DEBES EXTRAER EL PRODUCTO.
+         * En "precio", pon exactamente: "Confirmar con Erika".
+         * En "descripcion_corta", incluye obligatoriamente el código (ej: "Cód. 09583") y sus notas olfativas o características (ej: "Cód. 09583. Familia Cítrica. Brillantes acentos cítricos combinados con notas de toronja").
+       - ¡REGLA DE EXCLUSIÓN!: Si un elemento o texto decorativo NO tiene precio NI TIENE CÓDIGO (Cód. o Cod.), NO LO EXTRAIGAS. Solo se extraen productos que tengan precio O tengan código asignado.
+
+    3. CADA PRODUCTO DISTINTO ES UN OBJETO EN EL JSON:
+       - Si en la página hay varios productos a la venta (por ejemplo: perfumes como 'EXTRÉME L'BEL PARFUM' y 'LIVE ADVENTURE PARFUM', o 'BUDAPEST CITRUS PUNCH', 'VIENNA FRUITY PEACH', 'ROMA ROUGE BERRIES'), DEBES EXTRAERLOS TODOS INDIVIDUALMENTE.
+       - Dos o más productos a menudo tienen el mismo precio (o ambos dicen "Confirmar con Erika"). NO los unas ni los descartes. Tienen nombres y códigos distintos. Son productos independientes y ambos deben estar en el JSON.
+
+    4. CUÁNDO SÍ ES UN DUPLICADO (LO QUE DEBES EVITAR):
        - Solo es un duplicado cuando para UN SOLO producto físico (ej: un solo vestido en la modelo), la página muestra un título genérico ("VESTIDO") y abajo un subtítulo descriptivo ("Vestido amplio en tejido plano...") con el mismo precio.
        - En ese caso de un solo producto físico: NO crees dos productos ("Vestido" y "Vestido amplio"). Extrae SOLAMENTE UNO con el nombre completo descriptivo ("Vestido amplio") y coloca el resto en "descripcion_corta".
        - JAMÁS crees productos clones o con nombres 100% idénticos.
 
-    3. LIMPIEZA DE NOMBRES Y VIÑETAS:
+    5. LIMPIEZA DE NOMBRES Y VIÑETAS:
        - Limpia viñetas como 'a.', 'b.', 'c.', '1.', '2.' al inicio del nombre.
-       - En "nombre", coloca el nombre específico y completo del producto (ej: "Mon L'Bel Diamant Parfum", "Mon L'Bel Parfum", "Bleu Femme Oasis Parfum", "Vestido amplio").
-       - En "precio", incluye el precio visible exacto con su signo de moneda.
-       - En "descripcion_corta", incluye notas olfativas, mililitros, tela, silueta o detalles.
-
-    4. AUTO-VERIFICACIÓN FINAL:
-       - Asegúrate de que cada producto físico independiente de la página esté en el JSON.
-       - Verifica que no hayas creado clones de un mismo producto, pero que tampoco hayas omitido productos distintos que compartan precio.
+       - En "nombre", coloca el nombre específico y completo del producto (ej: "Extréme L'Bel Parfum Masculino", "Live Adventure Parfum Masculino", "Destiné Mist Budapest Citrus Punch").
+       - En "precio", incluye el precio calculado/visible con su signo de moneda (ej: "$124.990") o "Confirmar con Erika".
+       - En "descripcion_corta", incluye el código ('Cód. XXXXX'), notas olfativas, mililitros, tela, silueta o detalles.
 
     Texto extraído por OCR como referencia:
     {page_text}
@@ -408,12 +435,12 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     Devuelve exclusivamente un JSON con la siguiente estructura (Array de objetos):
     [
       {{
-        "nombre": "Nombre descriptivo limpio (ej: Mon L'Bel Diamant Parfum, Vestido amplio - sin viñetas a. o b.)",
-        "precio": "Precio con signo peso (ej: $104.990)",
-        "descripcion_corta": "Notas olfativas, mililitros, subtítulo, silueta o tela",
+        "nombre": "Nombre descriptivo limpio (ej: Extréme L'Bel Parfum Masculino, Destiné Mist Budapest Citrus Punch)",
+        "precio": "Precio con signo peso (ej: $124.990) o 'Confirmar con Erika'",
+        "descripcion_corta": "Cód. XXXXX. Notas olfativas, mililitros, subtítulo o detalles",
         "categoria": "Categoría principal (Dama, Caballero, Niños, Niñas, Hogar)",
         "seccion": "Sección general (Ropa, Zapatos, Belleza y Perfumería, Cuidado Personal, Accesorios, Varios)",
-        "subcategoria": "Subcategoría específica (ej: Perfumes, Vestidos, Labiales)",
+        "subcategoria": "Subcategoría específica (ej: Perfumes, Colonias, Splash, Vestidos, Labiales)",
         "catalogo": "{title}",
         "pagina": "{page_num}"
       }}
@@ -788,22 +815,23 @@ def extract_missing_product():
         
         Examina con cuidado la imagen y el texto de la página y extrae los datos de ESE producto específico.
         REGLAS:
-        - Si el producto tiene un título y un subtítulo (ej: 'Vestido' y 'Vestido amplio'), usa el nombre completo ('Vestido amplio') y no los dupliques.
+        - Si el precio está por unidad de medida (ej: '100 ml ... ml a $1.249,90'), calcula el precio multiplicando: 100 * 1249.90 = '$124.990'.
+        - Si el producto NO tiene precio pero SÍ tiene código (ej: 'Cód. 09583'), en precio pon exactamente: 'Confirmar con Erika'.
+        - Si el producto tiene un título y un subtítulo (ej: 'Vestido' y 'Vestido amplio'), usa el nombre completo ('Vestido amplio').
         - Limpia viñetas como 'a.', 'b.' del nombre.
-        - Obtén el precio real asociado en la página.
-        - En descripcion_corta incluye el subtítulo, silueta o detalles de tela.
+        - En descripcion_corta incluye el código ('Cód. XXXXX'), subtítulo, notas olfativas o detalles.
         
         Texto OCR de la página:
         {page_text}
         
         Devuelve exclusivamente un JSON con un único objeto (o array de 1 objeto):
         {{
-          "nombre": "Nombre descriptivo limpio",
-          "precio": "Precio con símbolo de moneda",
-          "descripcion_corta": "Subtítulo, silueta y detalles",
+          "nombre": "Nombre comercial completo limpio",
+          "precio": "Precio calculado con signo peso (ej: $124.990) o 'Confirmar con Erika'",
+          "descripcion_corta": "Cód. XXXXX. Subtítulo, notas olfativas o detalles",
           "categoria": "Categoría principal (Dama, Caballero, Niños, Niñas, Hogar)",
-          "seccion": "Sección general (Ropa, Zapatos, Belleza y Perfumería, Accesorios, Varios)",
-          "subcategoria": "Tipo de prenda (ej: Vestidos, Camisetas)",
+          "seccion": "Sección general (Ropa, Zapatos, Belleza y Perfumería, Cuidado Personal, Accesorios, Varios)",
+          "subcategoria": "Tipo de prenda o cosmético (ej: Perfumes, Splash, Vestidos)",
           "catalogo": "{title}",
           "pagina": "{page_number}"
         }}
