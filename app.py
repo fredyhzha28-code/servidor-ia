@@ -40,7 +40,22 @@ s3_client = boto3.client(
 )
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,PUT,POST,DELETE,OPTIONS'
+    return response
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    print(f"[Unhandled Error] {e}")
+    resp = jsonify({"error": str(e)})
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    return resp, 500
+
 
 # =====================================================================
 # INITIALIZATION
@@ -718,19 +733,25 @@ def extract_missing_product():
         # Extraer página usando pdf_render_lock para proteger la memoria RAM
         with pdf_render_lock:
             doc = fitz.open(tmp_path)
-            if page_number < 1 or page_number > len(doc):
+            try:
+                if page_number < 1 or page_number > len(doc):
+                    if os.path.exists(tmp_path):
+                        try: os.remove(tmp_path)
+                        except: pass
+                    return jsonify({"error": f"Página {page_number} fuera de rango"}), 400
+                    
+                page = doc.load_page(page_number - 1)
+                page_text = page.get_text()
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
+                img_bytes = pix.tobytes("jpeg")
+                del page
+                del pix
+            finally:
                 doc.close()
-                os.remove(tmp_path)
-                return jsonify({"error": f"Página {page_number} fuera de rango"}), 400
-                
-            page = doc.load_page(page_number - 1)
-            page_text = page.get_text()
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
-            img_bytes = pix.tobytes("jpeg")
-            doc.close()
-            del page
-            del doc
-            del pix
+            
+        if os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except: pass
         
         fd, tmp_img_path = tempfile.mkstemp(suffix=f"_page_{page_number}.jpg")
         os.close(fd)
@@ -739,11 +760,13 @@ def extract_missing_product():
             
         folder_path = f"thumbnails/{cat_hash}"
         object_name = f"{folder_path}/page_{page_number}.jpg"
+        s3_client.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=object_name,
+            Body=img_bytes,
+            ContentType='image/jpeg'
+        )
         img_url = f"{R2_PUBLIC_URL}/{object_name}"
-        
-        doc.close()
-        os.remove(tmp_path)
-        del pix
         del img_bytes
         gc.collect()
         
