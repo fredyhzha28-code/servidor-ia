@@ -52,8 +52,9 @@ for i in range(2, 21):
     if key:
         api_keys.append(key)
         
-if not api_keys:
-    api_keys.append("")
+valid_keys = [k for k in api_keys if k and k.strip()]
+if not valid_keys:
+    valid_keys = ["DUMMY_KEY"]
 
 # Inicializar Firebase
 firebase_db = None
@@ -78,18 +79,26 @@ else:
 
 class GeminiKeyManager:
     def __init__(self, keys):
-        self.keys = keys
-        self.clients = [genai.Client(api_key=key) for key in keys]
-        self.status = [{'available': True, 'cooldown_until': 0} for _ in keys]
+        self.keys = []
+        self.clients = []
+        for key in keys:
+            if key and key.strip():
+                try:
+                    client = genai.Client(api_key=key)
+                    self.clients.append(client)
+                    self.keys.append(key)
+                except Exception as e:
+                    print(f"Aviso creando cliente Gemini: {e}")
+        self.status = [{'available': True, 'cooldown_until': 0} for _ in self.clients]
         self.current_idx = 0
         self.lock = threading.Lock()
 
     def get_client(self):
         with self.lock:
             now = time.time()
-            for _ in range(len(self.keys)):
+            for _ in range(len(self.clients)):
                 idx = self.current_idx
-                self.current_idx = (self.current_idx + 1) % len(self.keys)
+                self.current_idx = (self.current_idx + 1) % len(self.clients)
                 
                 # Check if it's available or if cooldown has expired
                 if self.status[idx]['available'] or now > self.status[idx]['cooldown_until']:
@@ -105,7 +114,7 @@ class GeminiKeyManager:
             self.status[idx]['cooldown_until'] = time.time() + seconds
             print(f"[KeyManager] Key {idx+1} marcada en cooldown por {seconds}s.")
 
-key_manager = GeminiKeyManager(api_keys)
+key_manager = GeminiKeyManager(valid_keys)
 
 # =====================================================================
 # HELPER FUNCTIONS
@@ -219,31 +228,163 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=10, model_name=
                 
     raise Exception(f"Gemini falló tras {max_retries} intentos en todas las llaves.")
 
+def clean_product_name(raw_name):
+    if not raw_name:
+        return "", ""
+    s = str(raw_name).strip()
+    m = re.match(r'^([a-zA-Z0-9])\s*[\.\-\)]\s+(.*)$', s)
+    if m:
+        letter = m.group(1).lower()
+        clean = m.group(2).strip()
+        return letter, clean
+    return "", s
+
+def get_price_number(price_str):
+    if not price_str:
+        return 0
+    nums = re.sub(r'[^0-9]', '', str(price_str))
+    return int(nums) if nums else 0
+
+def deduplicate_and_merge_page_products(products):
+    """
+    Filtra y consolida productos de una misma página para garantizar:
+    1. Que si hay N precios, no se creen productos ficticios o duplicados.
+    2. Que un título (ej: "Vestido") y su subtítulo (ej: "Vestido amplio") se unifiquen en un solo producto.
+    3. Que se eliminen las viñetas "a.", "b." del nombre.
+    """
+    if not products:
+        return []
+    
+    cleaned_items = []
+    for p in products:
+        if not isinstance(p, dict) or not p.get('nombre'):
+            continue
+        
+        raw_name = str(p.get('nombre', '')).strip()
+        precio = str(p.get('precio', '')).strip()
+        
+        ref_letter, clean_name = clean_product_name(raw_name)
+        price_num = get_price_number(precio)
+        norm_name = normalize_text(clean_name if clean_name else raw_name)
+        
+        cleaned_items.append({
+            'raw': dict(p),
+            'clean_name': clean_name if clean_name else raw_name,
+            'raw_name': raw_name,
+            'ref_letter': ref_letter,
+            'precio': precio,
+            'price_num': price_num,
+            'norm_name': norm_name,
+            'descripcion': str(p.get('descripcion_corta', '')).strip()
+        })
+    
+    merged_products = []
+    used_indices = set()
+    
+    for i in range(len(cleaned_items)):
+        if i in used_indices:
+            continue
+        
+        item_a = cleaned_items[i]
+        best_product = dict(item_a['raw'])
+        best_product['nombre'] = item_a['clean_name']
+        
+        for j in range(i + 1, len(cleaned_items)):
+            if j in used_indices:
+                continue
+            
+            item_b = cleaned_items[j]
+            is_duplicate = False
+            
+            # Criterio 1: Mismo precio numérico
+            if item_a['price_num'] > 0 and item_a['price_num'] == item_b['price_num']:
+                # Misma letra de viñeta (ej: ambos eran 'a.' con precio 79999)
+                if item_a['ref_letter'] and item_b['ref_letter'] and item_a['ref_letter'] == item_b['ref_letter']:
+                    is_duplicate = True
+                else:
+                    norm_a = item_a['norm_name']
+                    norm_b = item_b['norm_name']
+                    # Uno contiene al otro (ej: 'vestido' en 'vestido amplio', o 'camiseta' en 'camiseta semiajustada')
+                    if norm_a and norm_b and (norm_a in norm_b or norm_b in norm_a):
+                        is_duplicate = True
+                    else:
+                        # Palabras compartidas importantes (raíz de moda)
+                        words_a = set(w for w in norm_a.split() if len(w) > 3)
+                        words_b = set(w for w in norm_b.split() if len(w) > 3)
+                        if words_a & words_b:
+                            is_duplicate = True
+            
+            # Criterio 2: Nombres idénticos normalizados aunque no tengan precio
+            elif item_a['norm_name'] and item_a['norm_name'] == item_b['norm_name']:
+                is_duplicate = True
+                
+            if is_duplicate:
+                used_indices.add(j)
+                # Escoger el nombre más completo / específico
+                if len(item_b['clean_name']) > len(best_product['nombre']):
+                    best_product['nombre'] = item_b['clean_name']
+                
+                # Consolidar descripción
+                desc_b = item_b['descripcion']
+                curr_desc = best_product.get('descripcion_corta', '')
+                if desc_b and desc_b.lower() not in curr_desc.lower():
+                    if curr_desc:
+                        best_product['descripcion_corta'] = f"{curr_desc}. {desc_b}"
+                    else:
+                        best_product['descripcion_corta'] = desc_b
+                        
+                if not best_product.get('precio') and item_b['precio']:
+                    best_product['precio'] = item_b['precio']
+                    
+                print(f"[Deduplicador] Fusionado duplicado en página: '{item_a['raw_name']}' y '{item_b['raw_name']}' -> '{best_product['nombre']}' (${best_product.get('precio')})")
+                
+        merged_products.append(best_product)
+        used_indices.add(i)
+        
+    return merged_products
+
 def extract_products_from_page(page_text, image_path, title, page_num, is_audit=False):
     prompt = f"""
-    Analiza COMPLETAMENTE esta página del catálogo "{title}" (Página {page_num}).
+    Analiza con máxima atención esta página del catálogo de moda "{title}" (Página {page_num}).
     
-    Identifica TODOS los productos presentes en esta página, PERO SIGUIENDO ESTAS REGLAS ESTRICTAS:
-    1. EXTRACCIÓN CONDICIONAL AL PRECIO: SOLO extrae un producto si tiene un PRECIO ASOCIADO CLARO Y EXPLÍCITO. Ignora modelos, fotos decorativas, textos genéricos o productos de ambientación que no tengan precio. SI NO HAY PRECIO, NO HAY PRODUCTO.
-    2. NO DUPLICAR: No extraigas el mismo producto múltiples veces. Si hay variantes de color o talla para el mismo precio, agrúpalos como un solo producto.
-    3. PRECIOS INDEPENDIENTES = PRODUCTOS INDEPENDIENTES: Si hay 3 precios diferentes en la página, deben existir exactamente 3 objetos en tu respuesta. Relaciona correctamente cada producto con su precio.
-    
-    Cada producto distinto debe ser un objeto independiente en el JSON.
-    Lee toda la página de arriba hacia abajo y de izquierda a derecha.
-    Revisa también las zonas pequeñas de la página, esquinas, tablas y promociones.
-    
+    Tu objetivo es extraer ÚNICAMENTE los productos reales a la venta, SIN DUPLICARLOS, siguiendo estas REGLAS ESTRICTAS:
+
+    1. GUÍA ESTRICTA POR PRECIOS (1 PRECIO = 1 PRODUCTO):
+       - Cuenta las etiquetas de precio y ofertas individuales que hay en esta página.
+       - Si en la página hay exactamente 2 precios (ejemplo: $79.999 y $35.999), DEBEN EXISTIR EXACTAMENTE 2 PRODUCTOS en el JSON. NI MÁS, NI MENOS.
+       - Si hay 3 precios, DEBEN EXISTIR EXACTAMENTE 3 PRODUCTOS.
+       - Cada precio corresponde a UN SOLO producto a la venta.
+       - Si un elemento en la imagen no tiene precio de venta asignado (como fondos decorativos o modelos), NO lo extraigas.
+
+    2. TÍTULO vs SUBTÍTULO / DESCRIPCIÓN (¡PROHIBIDO CREAR PRODUCTOS DUPLICADOS!):
+       - En las revistas de moda (Pacifika, Carmel, Leonisa, etc.), los bloques de producto contienen:
+         * Un Título principal grande (ej: "Vestido", "Camiseta", "Enterizo"), a veces precedido de una letra ("a.", "b.").
+         * Un Subtítulo o detalle de silueta/corte justo debajo (ej: "Vestido amplio", "Camiseta semiajustada", "Silueta amplia").
+         * Detalles de tela y confección (ej: "Tejido plano...", "Algodón poliéster...").
+       - ¡IMPORTANTE!: El subtítulo ("Vestido amplio" o "Camiseta semiajustada") es la DESCRIPCIÓN del mismo producto, ¡NO ES OTRO PRODUCTO!
+       - JAMÁS crees dos productos separados como "Vestido" y "Vestido amplio" con el mismo precio. Crea SOLAMENTE UN producto consolidado.
+       - Para el campo "nombre": usa el nombre más claro y completo SIN incluir la letra de viñeta (ej: "Vestido amplio", "Camiseta semiajustada"). No incluyas 'a.' o 'b.' en el nombre.
+       - Para el campo "descripcion_corta": incluye el subtítulo, silueta, corte, tela y características (ej: "Vestido amplio, silueta amplia en tejido plano poliéster").
+
+    3. VARIANTES DE TALLA Y COLOR:
+       - Si un producto lista varias tallas (XS, S, M, L, XL) o códigos para el mismo precio, agrúpalos como un único producto.
+
+    4. AUTO-VERIFICACIÓN FINAL ANTES DE EMITIR EL JSON:
+       - Cuenta cuántos precios hay en la página y cuántos objetos creaste en el JSON.
+       - Si la página tiene 2 precios y generaste 4 objetos porque separaste título y subtítulo, fusiona de inmediato cada título con su subtítulo para que queden EXACTAMENTE 2 objetos.
+
     Texto extraído por OCR como referencia:
     {page_text}
     
     Devuelve exclusivamente un JSON con la siguiente estructura (Array de objetos):
     [
       {{
-        "nombre": "Nombre del producto (sin repetir palabras como Ropa Ropa)",
-        "precio": "Precio del producto (con símbolo de moneda)",
-        "descripcion_corta": "Descripción atractiva o características breves",
+        "nombre": "Nombre descriptivo limpio (ej: Vestido amplio, Camiseta semiajustada - sin viñetas a. o b.)",
+        "precio": "Precio con signo peso (ej: $79.999)",
+        "descripcion_corta": "Subtítulo, silueta, detalles de tela y confección",
         "categoria": "Categoría principal (Dama, Caballero, Niños, Niñas, Hogar)",
         "seccion": "Sección general (Ropa, Zapatos, Belleza y Perfumería, Cuidado Personal, Accesorios, Varios)",
-        "subcategoria": "Subcategoría específica",
+        "subcategoria": "Subcategoría específica (ej: Vestidos, Camisetas)",
         "catalogo": "{title}",
         "pagina": "{page_num}"
       }}
@@ -251,7 +392,7 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     """
     
     if is_audit:
-        prompt = f"AUDITORÍA ESTRICTA:\nVuelve a examinar la página exclusivamente buscando productos omitidos.\nCuenta mentalmente cada producto independiente.\nComprueba cada precio.\nComprueba las esquinas, parte inferior, tablas, promociones y productos secundarios.\n\n" + prompt
+        prompt = f"AUDITORÍA ESTRICTA:\nVuelve a examinar la página exclusivamente buscando productos omitidos sin duplicar.\nComprueba cada precio independiente.\n\n" + prompt
 
     text_resp = call_gemini_with_key_manager(prompt, files=[image_path])
     
@@ -327,18 +468,9 @@ def process_single_page(doc, page_num, cat_info):
         batch = firebase_db.batch()
         count = 0
         
-        # Deduplicar antes de subir (para evitar repetición por comas o espacios)
-        unique_products = []
-        seen_keys = set()
-        for p in products:
-            if isinstance(p, dict) and 'nombre' in p:
-                for k, v in p.items():
-                    if isinstance(v, str): p[k] = v.strip()
-                
-                u_key = f"{normalize_text(p.get('nombre', ''))}_{str(p.get('precio', ''))}"
-                if u_key not in seen_keys:
-                    seen_keys.add(u_key)
-                    unique_products.append(p)
+        # Deduplicar y consolidar inteligentemente (evitar separar título de subtítulo y guiar por precios)
+        unique_products = deduplicate_and_merge_page_products(products)
+        print(f"[Filtro] Productos consolidados y limpios en Pág {page_num}: {len(unique_products)}")
                     
         for p in unique_products:
             p_id = p.get('id', get_single_catalog_hash(f"{cat_hash}_{p.get('nombre')}_{p.get('precio', '')}_{page_num}"))
@@ -521,6 +653,122 @@ def search_products():
         return jsonify({"response": "Proceso de sincronización iniciado."})
         
     return jsonify({"response": "¡Búsqueda con IA optimizándose! El buscador inteligente se reactivará pronto."})
+
+@app.route('/api/extract_missing_product', methods=['POST'])
+def extract_missing_product():
+    try:
+        data = request.json or {}
+        catalog_url = data.get('catalog_url', '')
+        title = data.get('title', 'Revista')
+        page_number = int(data.get('page_number', 1))
+        instruction = data.get('instruction', '').strip()
+        appId = data.get('appId', 'tienda-catalogos-app')
+        
+        if not catalog_url or not instruction:
+            return jsonify({"error": "Faltan datos requeridos (catalog_url o instrucción)"}), 400
+            
+        cat_hash = get_single_catalog_hash(catalog_url, title)
+        
+        # Descargar PDF para obtener la página solicitada
+        resp = requests.get(catalog_url, stream=True)
+        if resp.status_code != 200:
+            return jsonify({"error": f"No se pudo descargar el PDF: {resp.status_code}"}), 400
+            
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk: tmp_file.write(chunk)
+            tmp_path = tmp_file.name
+            
+        doc = fitz.open(tmp_path)
+        if page_number < 1 or page_number > len(doc):
+            doc.close()
+            os.remove(tmp_path)
+            return jsonify({"error": f"Página {page_number} fuera de rango (1 a {len(doc)})"}), 400
+            
+        page = doc.load_page(page_number - 1)
+        page_text = page.get_text()
+        
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
+        img_bytes = pix.tobytes("jpeg")
+        
+        fd, tmp_img_path = tempfile.mkstemp(suffix=f"_page_{page_number}.jpg")
+        os.close(fd)
+        with open(tmp_img_path, 'wb') as f:
+            f.write(img_bytes)
+            
+        folder_path = f"thumbnails/{cat_hash}"
+        object_name = f"{folder_path}/page_{page_number}.jpg"
+        img_url = f"{R2_PUBLIC_URL}/{object_name}"
+        
+        doc.close()
+        os.remove(tmp_path)
+        del pix
+        del img_bytes
+        gc.collect()
+        
+        prompt = f"""
+        El usuario está auditando la página {page_number} del catálogo de moda "{title}".
+        Indica que en esta página hay un producto que desea extraer con la siguiente indicación:
+        "{instruction}"
+        
+        Examina con cuidado la imagen y el texto de la página y extrae los datos de ESE producto específico.
+        REGLAS:
+        - Si el producto tiene un título y un subtítulo (ej: 'Vestido' y 'Vestido amplio'), usa el nombre completo ('Vestido amplio') y no los dupliques.
+        - Limpia viñetas como 'a.', 'b.' del nombre.
+        - Obtén el precio real asociado en la página.
+        - En descripcion_corta incluye el subtítulo, silueta o detalles de tela.
+        
+        Texto OCR de la página:
+        {page_text}
+        
+        Devuelve exclusivamente un JSON con un único objeto (o array de 1 objeto):
+        {{
+          "nombre": "Nombre descriptivo limpio",
+          "precio": "Precio con símbolo de moneda",
+          "descripcion_corta": "Subtítulo, silueta y detalles",
+          "categoria": "Categoría principal (Dama, Caballero, Niños, Niñas, Hogar)",
+          "seccion": "Sección general (Ropa, Zapatos, Belleza y Perfumería, Accesorios, Varios)",
+          "subcategoria": "Tipo de prenda (ej: Vestidos, Camisetas)",
+          "catalogo": "{title}",
+          "pagina": "{page_number}"
+        }}
+        """
+        
+        text_resp = call_gemini_with_key_manager(prompt, files=[tmp_img_path])
+        if os.path.exists(tmp_img_path):
+            os.remove(tmp_img_path)
+            
+        clean_text = text_resp.strip()
+        if clean_text.startswith('```json'): clean_text = clean_text.replace('```json', '', 1)
+        if clean_text.endswith('```'): clean_text = clean_text[:-3]
+        clean_text = clean_text.strip()
+        
+        prod_data = json.loads(clean_text)
+        if isinstance(prod_data, list) and len(prod_data) > 0:
+            prod_data = prod_data[0]
+            
+        if not isinstance(prod_data, dict) or not prod_data.get('nombre'):
+            return jsonify({"error": "No se pudo identificar el producto solicitado en la página"}), 400
+            
+        _, clean_name = clean_product_name(prod_data.get('nombre', ''))
+        prod_data['nombre'] = clean_name if clean_name else prod_data.get('nombre', '')
+        prod_data['imagen'] = img_url
+        prod_data['catalogo'] = title
+        prod_data['catalogo_url'] = catalog_url.split('?')[0]
+        prod_data['catalogo_hash'] = cat_hash
+        prod_data['pagina'] = str(page_number)
+        
+        if firebase_db:
+            p_id = get_single_catalog_hash(f"{cat_hash}_{prod_data.get('nombre')}_{prod_data.get('precio', '')}_{page_number}")
+            prod_data['id'] = p_id
+            products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+            products_col.document(p_id).set(prod_data)
+            
+        return jsonify({"success": True, "product": prod_data})
+        
+    except Exception as e:
+        print(f"Error en extract_missing_product: {e}")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
