@@ -686,8 +686,22 @@ def extract_missing_product():
         instruction = data.get('instruction', '').strip()
         appId = data.get('appId', 'tienda-catalogos-app')
         
-        if not catalog_url or not instruction:
-            return jsonify({"error": "Faltan datos requeridos (catalog_url o instrucción)"}), 400
+        if not instruction:
+            return jsonify({"error": "Debes ingresar una descripción del producto faltante"}), 400
+            
+        # Si catalog_url viene vacío, como 'undefined' o sin esquema http, buscarlo en Firestore por el título
+        if not catalog_url or catalog_url == 'undefined' or not str(catalog_url).startswith('http'):
+            if firebase_db:
+                catalogs_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("catalogs")
+                all_cats = catalogs_collection.get()
+                for c in all_cats:
+                    c_data = c.to_dict()
+                    if c_data.get('title') == title:
+                        catalog_url = c_data.get('pdfUrl') or c_data.get('url', '')
+                        break
+                        
+        if not catalog_url or catalog_url == 'undefined' or not str(catalog_url).startswith('http'):
+            return jsonify({"error": f"No se encontró la URL del PDF para la revista '{title}'. Por favor recarga el panel."}), 400
             
         cat_hash = get_single_catalog_hash(catalog_url, title)
         
@@ -701,17 +715,22 @@ def extract_missing_product():
                 if chunk: tmp_file.write(chunk)
             tmp_path = tmp_file.name
             
-        doc = fitz.open(tmp_path)
-        if page_number < 1 or page_number > len(doc):
+        # Extraer página usando pdf_render_lock para proteger la memoria RAM
+        with pdf_render_lock:
+            doc = fitz.open(tmp_path)
+            if page_number < 1 or page_number > len(doc):
+                doc.close()
+                os.remove(tmp_path)
+                return jsonify({"error": f"Página {page_number} fuera de rango"}), 400
+                
+            page = doc.load_page(page_number - 1)
+            page_text = page.get_text()
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
+            img_bytes = pix.tobytes("jpeg")
             doc.close()
-            os.remove(tmp_path)
-            return jsonify({"error": f"Página {page_number} fuera de rango (1 a {len(doc)})"}), 400
-            
-        page = doc.load_page(page_number - 1)
-        page_text = page.get_text()
-        
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
-        img_bytes = pix.tobytes("jpeg")
+            del page
+            del doc
+            del pix
         
         fd, tmp_img_path = tempfile.mkstemp(suffix=f"_page_{page_number}.jpg")
         os.close(fd)
