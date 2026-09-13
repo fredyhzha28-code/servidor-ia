@@ -8,7 +8,10 @@ import time
 import gc
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Lock para serializar el renderizado gráfico de páginas en RAM y proteger los 512MB de Render
+pdf_render_lock = threading.Lock()
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from google import genai
@@ -419,29 +422,31 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
             except: pass
         return products
 
-def process_single_page(doc, page_num, cat_info):
+def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
     url = cat_info.get('url', '')
     title = cat_info.get('title', 'Revista')
     cat_hash = cat_info.get('hash', '')
     appId = cat_info.get('appId', 'tienda-catalogos-app')
     
-    print(f"[CATALOG] Página {page_num}/{len(doc)}")
-    
-    page = doc.load_page(page_num - 1)
-    
-    # 1. Extraer texto
-    page_text = page.get_text()
-    
-    # 2. Renderizar imagen a /tmp/
-    pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
-    img_bytes = pix.tobytes("jpeg")
-    
-    fd, tmp_img_path = tempfile.mkstemp(suffix=f"_page_{page_num}.jpg")
+    # 1. Renderizar imagen a /tmp/ con lock rápido para proteger la memoria RAM (Render 512MB)
+    # Solo 1 página a la vez tiene pixmap en RAM (toma ~30-50ms), luego se libera de inmediato
+    with pdf_render_lock:
+        doc = fitz.open(tmp_pdf_path)
+        page = doc.load_page(page_num - 1)
+        page_text = page.get_text()
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
+        img_bytes = pix.tobytes("jpeg")
+        doc.close()
+        del page
+        del doc
+        del pix
+
+    fd, tmp_img_path = tempfile.mkstemp(suffix=f"_{cat_hash}_p{page_num}.jpg")
     os.close(fd)
     with open(tmp_img_path, 'wb') as f:
         f.write(img_bytes)
         
-    # 3. Subir a R2
+    # 2. Subir a Cloudflare R2
     folder_path = f"thumbnails/{cat_hash}"
     object_name = f"{folder_path}/page_{page_num}.jpg"
     s3_client.put_object(
@@ -452,26 +457,23 @@ def process_single_page(doc, page_num, cat_info):
     )
     img_url = f"{R2_PUBLIC_URL}/{object_name}"
     
-    # Limpiar RAM gráfica
-    del pix
     del img_bytes
     gc.collect()
     
-    # 4. Enviar a Gemini
+    # 3. Enviar a Gemini (Ejecutándose en paralelo con múltiples API keys rotativas)
     products = extract_products_from_page(page_text, tmp_img_path, title, page_num)
+    del page_text
     
-    print(f"[Gemini] Productos finales en Pág {page_num}: {len(products)}")
+    # 4. Deduplicar y consolidar inteligentemente (evitar separar título de subtítulo y guiar por precios)
+    unique_products = deduplicate_and_merge_page_products(products)
+    print(f"[{title} | Pág {page_num}/{total_pages}] Gemini: {len(products)} -> Consolidados: {len(unique_products)}")
     
-    # 6. Guardar productos en Firebase inmediatamente
+    # 5. Guardar productos en Firebase inmediatamente
     if firebase_db:
         products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
         batch = firebase_db.batch()
         count = 0
         
-        # Deduplicar y consolidar inteligentemente (evitar separar título de subtítulo y guiar por precios)
-        unique_products = deduplicate_and_merge_page_products(products)
-        print(f"[Filtro] Productos consolidados y limpios en Pág {page_num}: {len(unique_products)}")
-                    
         for p in unique_products:
             p_id = p.get('id', get_single_catalog_hash(f"{cat_hash}_{p.get('nombre')}_{p.get('precio', '')}_{page_num}"))
             p['imagen'] = img_url
@@ -490,30 +492,19 @@ def process_single_page(doc, page_num, cat_info):
         if count > 0:
             batch.commit()
             
-        # 7. Actualizar progreso de la página
+        # 6. Actualizar progreso de la página individual
         page_ref = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("catalogs_progress").document(cat_hash).collection("pages").document(str(page_num))
         page_ref.set({
             "status": "completed",
-            "products_count": len(products),
+            "products_count": len(unique_products),
             "image_url": img_url,
             "processed_at": firestore.SERVER_TIMESTAMP
         })
         
-        # Actualizar progreso global del catálogo
-        progress_ref = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status").document(cat_hash)
-        progress_ref.set({
-            "status": "processing",
-            "title": title,
-            "message": f"Procesando página {page_num}/{len(doc)}...",
-            "progress": int((page_num / len(doc)) * 100),
-            "last_successful_page": page_num,
-            "updatedAt": firestore.SERVER_TIMESTAMP
-        }, merge=True)
-        
-    # 8. Liberar memoria final
-    os.remove(tmp_img_path)
-    del page
-    del page_text
+    # 7. Liberar memoria final y borrar archivo temporal de disco
+    if os.path.exists(tmp_img_path):
+        try: os.remove(tmp_img_path)
+        except: pass
     gc.collect()
 
 def process_single_catalog(idx, cat):
@@ -530,13 +521,7 @@ def process_single_catalog(idx, cat):
     
     # 0. Verificación ABSOLUTA de que el catálogo existe en la base de datos
     if catalogs_collection:
-        # Buscamos si existe algún documento en 'catalogs' que tenga exactamente esta url
-        # Separamos el '?' por si tiene parámetros temporales
         clean_url = url.split('?')[0]
-        # Query
-        query_docs = catalogs_collection.where("pdfUrl", ">=", clean_url).where("pdfUrl", "<=", clean_url + "\uf8ff").limit(1).get()
-        
-        # Como Firebase en el cliente guarda el pdfUrl exacto, comprobamos con get() simple o filtrando en python
         all_cats = catalogs_collection.get()
         exists_in_db = False
         for c in all_cats:
@@ -549,7 +534,6 @@ def process_single_catalog(idx, cat):
         if not exists_in_db:
             print(f"[{title}] CATÁLOGO FANTASMA DETECTADO (No existe en Firebase 'catalogs'). Abortando.")
             if status_collection:
-                # Si de casualidad hay un status, lo matamos
                 try: status_collection.document(cat_hash).delete()
                 except: pass
             return
@@ -570,7 +554,7 @@ def process_single_catalog(idx, cat):
                 "status": "processing", "title": title, "message": "Descargando PDF...", "progress": 1, "last_successful_page": 0, "updatedAt": firestore.SERVER_TIMESTAMP
             })
 
-    # 2. Bajar PDF
+    # 2. Bajar PDF a archivo temporal
     try:
         response = requests.get(url, stream=True)
         if response.status_code == 200:
@@ -586,32 +570,67 @@ def process_single_catalog(idx, cat):
         if status_collection: status_collection.document(cat_hash).update({"message": "Error de conexión", "status": "error"})
         return
         
-    # 3. Procesar página por página
+    # 3. Procesar páginas en paralelo con rotación de API Keys (Ultra-rápido y seguro para 512MB RAM)
     try:
-        doc = fitz.open(tmp_path)
-        total_pages = len(doc)
+        with fitz.open(tmp_path) as doc_info:
+            total_pages = len(doc_info)
+            
+        # Determinar número óptimo de workers concurrentes (entre 2 y 4 para respetar los 512MB de Render)
+        num_keys = len(key_manager.clients)
+        max_workers = min(max(num_keys, 2), 4)
+        print(f"[{title}] Iniciando extracción acelerada en paralelo con {max_workers} trabajadores ({num_keys} API keys disponibles) para {total_pages} páginas...")
         
-        for p in range(last_successful_page + 1, total_pages + 1):
-            if status_collection:
-                # Verificar si el documento aún existe; si no, la revista fue eliminada
-                if not status_collection.document(cat_hash).get().exists:
-                    print(f"Catálogo {title} eliminado por el usuario. Abortando proceso.")
-                    break
+        pages_to_process = list(range(last_successful_page + 1, total_pages + 1))
+        
+        if not pages_to_process:
+            print(f"[{title}] Todas las páginas ya estaban procesadas.")
+        else:
+            progress_lock = threading.Lock()
+            completed_count = last_successful_page
+            stop_event = threading.Event()
+            
+            def run_page_worker(p_num):
+                if stop_event.is_set():
+                    return
+                # Chequear si el catálogo fue eliminado por el usuario
+                if status_collection and p_num % 4 == 0:
+                    if not status_collection.document(cat_hash).get().exists:
+                        print(f"Catálogo {title} eliminado por el usuario. Deteniendo hilos.")
+                        stop_event.set()
+                        return
+                        
+                try:
+                    process_single_page(tmp_path, p_num, cat, total_pages)
                     
-            try:
-                process_single_page(doc, p, cat)
-            except Exception as e:
-                print(f"Error fatal procesando página {p}: {e}")
-                if status_collection:
-                    status_collection.document(cat_hash).update({"message": f"Pausado por error en pág {p}. Intentaremos reanudar después.", "status": "error"})
-                doc.close()
-                os.remove(tmp_path)
-                return
-                
-        # 4. Finalizado!
-        doc.close()
-        os.remove(tmp_path)
-        if status_collection:
+                    with progress_lock:
+                        nonlocal completed_count
+                        completed_count += 1
+                        pct = int((completed_count / total_pages) * 100)
+                        if status_collection and not stop_event.is_set():
+                            status_collection.document(cat_hash).set({
+                                "status": "processing",
+                                "title": title,
+                                "message": f"Memorizando con IA: {completed_count}/{total_pages} páginas ({pct}%)...",
+                                "progress": pct,
+                                "last_successful_page": completed_count,
+                                "updatedAt": firestore.SERVER_TIMESTAMP
+                            }, merge=True)
+                except Exception as page_err:
+                    print(f"[Aviso] Error en página {p_num}: {page_err}")
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as page_executor:
+                futures = [page_executor.submit(run_page_worker, p) for p in pages_to_process]
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as err:
+                        print(f"Error procesando lote de páginas: {err}")
+                        
+        # 4. Finalizado exitosamente
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            
+        if status_collection and not stop_event.is_set():
             status_collection.document(cat_hash).set({
                 "status": "completed",
                 "title": title,
@@ -619,12 +638,15 @@ def process_single_catalog(idx, cat):
                 "progress": 100,
                 "updatedAt": firestore.SERVER_TIMESTAMP
             })
+            print(f"[{title}] ¡Proceso completado al 100% exitosamente!")
             
     except Exception as e:
         print(f"Error procesando PDF: {e}")
-        if status_collection: status_collection.document(cat_hash).update({"message": "Error leyendo PDF", "status": "error"})
-        try: os.remove(tmp_path)
-        except: pass
+        if status_collection:
+            status_collection.document(cat_hash).update({"message": "Error leyendo PDF", "status": "error"})
+        if os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except: pass
 
 def background_extract_and_save(missing_catalogs):
     print(f"Iniciando extracción en segundo plano para {len(missing_catalogs)} revistas nuevas...")
