@@ -414,9 +414,18 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
          * En "descripcion_corta", incluye obligatoriamente el código (ej: "Cód. 09583") y sus notas olfativas o características (ej: "Cód. 09583. Familia Cítrica. Brillantes acentos cítricos combinados con notas de toronja").
        - ¡REGLA DE EXCLUSIÓN!: Si un elemento o texto decorativo NO tiene precio NI TIENE CÓDIGO (Cód. o Cod.), NO LO EXTRAIGAS. Solo se extraen productos que tengan precio O tengan código asignado.
 
-    3. CADA PRODUCTO DISTINTO ES UN OBJETO EN EL JSON:
-       - Si en la página hay varios productos a la venta (por ejemplo: perfumes como 'EXTRÉME L'BEL PARFUM' y 'LIVE ADVENTURE PARFUM', o 'BUDAPEST CITRUS PUNCH', 'VIENNA FRUITY PEACH', 'ROMA ROUGE BERRIES'), DEBES EXTRAERLOS TODOS INDIVIDUALMENTE.
-       - Dos o más productos a menudo tienen el mismo precio (o ambos dicen "Confirmar con Erika"). NO los unas ni los descartes. Tienen nombres y códigos distintos. Son productos independientes y ambos deben estar en el JSON.
+    3. PROMOCIONES "A SOLO $ XX.XXX c/u" O "CUALQUIERA POR..." (PRECIO COMPARTIDO PARA VARIAS VARIANTES):
+       - En catálogos de cosmética y cuidado personal, a menudo aparece un único precio promocional grande que dice "A SOLO $ 49,990 c/u" (donde 'c/u' significa 'cada uno').
+       - ¡ESE PRECIO APLICA INDIVIDUALMENTE A CADA PRODUCTO O VARIANTE DE LA PÁGINA!
+       - EJEMPLO REAL:
+         La página muestra 3 tubos de Sérum Corporal L'Bel Body Expert (275 ml) con la oferta "A SOLO $ 49,990 c/u":
+         1) "L'Bel Body Expert Sérum Firmeza + Reparación" (Cód. 06471) -> Precio: "$49.990"
+         2) "L'Bel Body Expert Sérum Antiedad + Nutrición" (Cód. 06475) -> Precio: "$49.990"
+         3) "L'Bel Body Expert Sérum Luminosidad + Antimanchas" (Cód. 06473) -> Precio: "$49.990"
+       - DEBES EXTRAER LOS 3 PRODUCTOS POR SEPARADO:
+         * Cada variante tiene su propio código de referencia ('Cód. 06471', 'Cód. 06475', 'Cód. 06473') y activos diferentes (Colágeno, Ácido Hialurónico, Vitamina C).
+         * A cada uno le asignas su nombre comercial descriptivo completo, su código en la descripción y el precio exacto "$49.990".
+       - Si en la página hay varios productos con código (ej: perfumes, labiales o cremas), extráelos TODOS individualmente.
 
     4. CUÁNDO SÍ ES UN DUPLICADO (LO QUE DEBES EVITAR):
        - Solo es un duplicado cuando para UN SOLO producto físico (ej: un solo vestido en la modelo), la página muestra un título genérico ("VESTIDO") y abajo un subtítulo descriptivo ("Vestido amplio en tejido plano...") con el mismo precio.
@@ -425,9 +434,9 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
 
     5. LIMPIEZA DE NOMBRES Y VIÑETAS:
        - Limpia viñetas como 'a.', 'b.', 'c.', '1.', '2.' al inicio del nombre.
-       - En "nombre", coloca el nombre específico y completo del producto (ej: "Extréme L'Bel Parfum Masculino", "Live Adventure Parfum Masculino", "Destiné Mist Budapest Citrus Punch").
-       - En "precio", incluye el precio calculado/visible con su signo de moneda (ej: "$124.990") o "Confirmar con Erika".
-       - En "descripcion_corta", incluye el código ('Cód. XXXXX'), notas olfativas, mililitros, tela, silueta o detalles.
+       - En "nombre", coloca el nombre específico y completo del producto (ej: "L'Bel Body Expert Sérum Firmeza + Reparación", "Extréme L'Bel Parfum Masculino", "Destiné Mist Budapest Citrus Punch").
+       - En "precio", incluye el precio calculado/visible con su signo de moneda (ej: "$49.990", "$124.990") o "Confirmar con Erika".
+       - En "descripcion_corta", incluye el código ('Cód. XXXXX'), notas olfativas, activos, mililitros, tela, silueta o detalles.
 
     Texto extraído por OCR como referencia:
     {page_text}
@@ -816,6 +825,7 @@ def extract_missing_product():
         Examina con cuidado la imagen y el texto de la página y extrae los datos de ESE producto específico.
         REGLAS:
         - Si el precio está por unidad de medida (ej: '100 ml ... ml a $1.249,90'), calcula el precio multiplicando: 100 * 1249.90 = '$124.990'.
+        - Si la página indica una oferta compartida como 'A SOLO $ 49,990 c/u' (cada uno), asigna ese precio ('$49.990') al producto.
         - Si el producto NO tiene precio pero SÍ tiene código (ej: 'Cód. 09583'), en precio pon exactamente: 'Confirmar con Erika'.
         - Si el producto tiene un título y un subtítulo (ej: 'Vestido' y 'Vestido amplio'), usa el nombre completo ('Vestido amplio').
         - Limpia viñetas como 'a.', 'b.' del nombre.
