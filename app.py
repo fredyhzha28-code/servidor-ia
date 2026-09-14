@@ -91,6 +91,8 @@ if firebase_creds_b64:
 else:
     print("No se encontró FIREBASE_CREDENTIALS_B64. Funcionando sin caché en Firebase.")
 
+memory_knowledge_cache = {}  # Cache en memoria RAM: cat_hash -> list(products)
+
 # =====================================================================
 # GEMINI KEY MANAGER
 # =====================================================================
@@ -152,17 +154,23 @@ def normalize_text(text):
     text = re.sub(r'[^a-z0-9\s]', '', text)
     return text
 
-def local_search_in_json(query, products_json_str):
+def local_search_in_json(query, products_data):
     try:
         products = []
-        pattern = re.compile(r'\{[^{}]*\}')
-        for match in pattern.finditer(products_json_str):
+        if isinstance(products_data, list):
+            products = products_data
+        elif isinstance(products_data, str):
             try:
-                obj = json.loads(match.group(0))
-                if isinstance(obj, dict) and 'nombre' in obj:
-                    products.append(obj)
+                products = json.loads(products_data)
             except Exception:
-                continue
+                pattern = re.compile(r'\{[^{}]*\}')
+                for match in pattern.finditer(products_data):
+                    try:
+                        obj = json.loads(match.group(0))
+                        if isinstance(obj, dict) and 'nombre' in obj:
+                            products.append(obj)
+                    except Exception:
+                        continue
                 
         normalized_query = normalize_text(query)
         query_words = [w for w in normalized_query.split() if len(w) > 2]
@@ -171,25 +179,25 @@ def local_search_in_json(query, products_json_str):
             
         results = []
         for p in products:
-            text_to_search = normalize_text(f"{p.get('nombre', '')} {p.get('catalogo', '')}")
+            text_to_search = normalize_text(f"{p.get('nombre', '')} {p.get('catalogo', '')} {p.get('seccion', '')} {p.get('subcategoria', '')} {p.get('descripcion_corta', '')}")
             score = sum(1 for w in query_words if w in text_to_search)
             if score > 0:
                 results.append((score, p))
                 
         if not results:
-            return "¡Hola! He buscado en todas nuestras revistas actuales pero no encontré exactamente eso. ¡Intenta buscar con otras palabras relacionadas!"
+            return "¡Hola! He buscado en todas nuestras revistas actuales pero no encontré exactamente eso. ¡Intenta buscar con otras palabras relacionadas o pregúntale directo a Erika por WhatsApp!"
             
         results.sort(key=lambda x: x[0], reverse=True)
-        top_results = [r[1] for r in results[:10]]
+        top_results = [r[1] for r in results[:8]]
         
-        html = "¡Hola! He encontrado estas excelentes opciones para ti:<br><br><ul>"
+        html = "¡Hola! He encontrado estas excelentes opciones en nuestras revistas para ti:<br><br><ul>"
         for r in top_results:
             nombre = r.get('nombre', 'Producto')
             precio = r.get('precio', '')
-            cat = r.get('catalogo', '').replace('"', '&quot;')
-            pag = r.get('pagina', '').replace('"', '&quot;')
-            html += f"<li style='margin-bottom:12px'><b>{nombre}</b> - <b class='text-pink-600'>{precio}</b><br><span style='color:#64748b; font-size:0.95em'>Catálogo {cat}, Pág {pag}</span> <button onclick=\"window.openCatalogByTitle(this.getAttribute('data-cat'), this.getAttribute('data-pag'))\" data-cat=\"{cat}\" data-pag=\"{pag}\" class='ml-2 inline-flex items-center gap-1 bg-pink-50 text-pink-600 px-3 py-1 rounded-full text-xs font-bold hover:bg-pink-100 transition-colors shadow-sm'><i class='fas fa-book-open'></i> VER</button></li>"
-        html += "</ul><br>¡Si te gusta alguno, anímate y dale al botón verde para pedirlo por WhatsApp!"
+            cat = str(r.get('catalogo', '')).replace('"', '&quot;')
+            pag = str(r.get('pagina', '1')).replace('"', '&quot;')
+            html += f"<li style='margin-bottom:14px'><b>{nombre}</b> - <b class='text-pink-600'>{precio}</b><br><span style='color:#64748b; font-size:0.95em'>Revista: {cat} &bull; Pág: {pag}</span> <button onclick=\"window.openCatalogByTitle(this.getAttribute('data-cat'), this.getAttribute('data-pag'))\" data-cat=\"{cat}\" data-pag=\"{pag}\" class='ml-2 inline-flex items-center gap-1 bg-pink-50 hover:bg-pink-100 text-pink-600 px-3 py-1 rounded-full text-xs font-bold transition-colors shadow-sm cursor-pointer'><i class='fas fa-book-open'></i> VER</button></li>"
+        html += "</ul><br>¡Si te gusta alguno, dale al botón verde de abajo para pedirlo directo a Erika por WhatsApp!"
         return html
     except Exception as e:
         print(f"Error parseando JSON local: {e}")
@@ -910,24 +918,175 @@ def background_extract_and_save(missing_catalogs):
 
 @app.route('/api/search', methods=['POST'])
 def search_products():
-    data = request.json
-    query = data.get('query', '')
+    data = request.json or {}
+    query = data.get('query', '').strip()
     catalogs = data.get('catalogs', [])
     appId = data.get('appId', 'tienda-catalogos-app')
 
     for cat in catalogs:
         cat['appId'] = appId
 
-    if not query or not catalogs:
-        return jsonify({"error": "Parámetros inválidos."}), 400
-        
-    if query == "ignorar":
-        missing_catalogs = catalogs # Forzar inicio
-        thread = threading.Thread(target=background_extract_and_save, args=(missing_catalogs,))
-        thread.start()
-        return jsonify({"response": "Proceso de sincronización iniciado."})
-        
-    return jsonify({"response": "¡Búsqueda con IA optimizándose! El buscador inteligente se reactivará pronto."})
+    if not query:
+        return jsonify({"error": "No se proporcionó término de búsqueda."}), 400
+
+    if not catalogs:
+        return jsonify({"error": "No hay catálogos activos disponibles para buscar."}), 400
+
+    try:
+        global memory_knowledge_cache
+        active_hashes = {}
+        for cat in catalogs:
+            url = cat.get('url', '')
+            if not url: continue
+            title = cat.get('title', 'Revista')
+            h = get_single_catalog_hash(url, title)
+            active_hashes[h] = title
+
+        # Limpiar de memoria catálogos que ya no están activos (ej. eliminados)
+        for h in list(memory_knowledge_cache.keys()):
+            if h not in active_hashes:
+                del memory_knowledge_cache[h]
+
+        missing_catalogs = []
+        combined_items = []
+
+        # Cargar productos de cada catálogo activo
+        for cat in catalogs:
+            url = cat.get('url', '')
+            if not url: continue
+            title = cat.get('title', 'Revista')
+            cat_hash = get_single_catalog_hash(url, title)
+
+            # 1. Revisar caché en memoria
+            prods = memory_knowledge_cache.get(cat_hash)
+
+            # 2. Si no está en RAM, consultar Firestore
+            if prods is None and firebase_db:
+                try:
+                    clean_url = url.split('?')[0]
+                    products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+                    
+                    # Buscar por hash de catálogo
+                    docs = list(products_col.where("catalogo_hash", "==", cat_hash).stream())
+                    # Si no hay por hash, buscar por url
+                    if not docs:
+                        docs = list(products_col.where("catalogo_url", "==", clean_url).stream())
+                        
+                    prods = []
+                    for d in docs:
+                        p_data = d.to_dict()
+                        if p_data.get('nombre'):
+                            prods.append({
+                                "nombre": p_data.get("nombre", ""),
+                                "precio": p_data.get("precio", ""),
+                                "catalogo": p_data.get("catalogo", title),
+                                "pagina": str(p_data.get("pagina", "1")),
+                                "seccion": p_data.get("seccion", ""),
+                                "subcategoria": p_data.get("subcategoria", ""),
+                                "descripcion_corta": p_data.get("descripcion_corta", "")
+                            })
+                    if prods:
+                        memory_knowledge_cache[cat_hash] = prods
+                except Exception as e:
+                    print(f"Error consultando Firestore para {title}: {e}")
+
+            if prods:
+                combined_items.extend(prods)
+            else:
+                missing_catalogs.append(cat)
+
+        # Si se solicitó sincronización forzada ("ignorar") desde el panel de admin
+        if query == "ignorar":
+            if missing_catalogs:
+                thread = threading.Thread(target=background_extract_and_save, args=(missing_catalogs,))
+                thread.start()
+            return jsonify({"response": "Proceso de sincronización iniciado."})
+
+        # Si no hay productos en caché todavía y faltan catálogos por procesar
+        if missing_catalogs and not combined_items:
+            thread = threading.Thread(target=background_extract_and_save, args=(missing_catalogs,))
+            thread.start()
+            return jsonify({
+                "response": "¡Hola! Estoy memorizando nuestras revistas por primera vez en la nube. 🚀<br><br>"
+                            "Esto tomará solo un momento.<br><br>"
+                            "Por favor, <b>intenta tu búsqueda de nuevo en breve</b>."
+            })
+
+        if not combined_items:
+            return jsonify({
+                "response": "¡Hola! He revisado nuestras revistas pero aún no hay productos registrados. Puedes sincronizar o subir revistas desde el panel de administración."
+            })
+
+        # Si faltaban algunos pero otros ya están listos, arrancar worker para los faltantes en background
+        if missing_catalogs:
+            thread = threading.Thread(target=background_extract_and_save, args=(missing_catalogs,))
+            thread.start()
+
+        # Preparar contexto para la IA Asesora
+        active_titles = [cat.get('title', 'Revista') for cat in catalogs if cat.get('title')]
+        active_catalogs_str = ", ".join(active_titles)
+
+        # Pre-filtro inteligente para pasar los productos más relevantes a Gemini (o los primeros 60)
+        normalized_q = normalize_text(query)
+        q_words = [w for w in normalized_q.split() if len(w) > 2]
+        if q_words:
+            scored = []
+            for item in combined_items:
+                haystack = normalize_text(f"{item.get('nombre','')} {item.get('catalogo','')} {item.get('seccion','')} {item.get('subcategoria','')} {item.get('descripcion_corta','')}")
+                score = sum(1 for w in q_words if w in haystack)
+                scored.append((score, item))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            gemini_candidates = [x[1] for x in scored[:60]] if scored and scored[0][0] > 0 else combined_items[:60]
+        else:
+            gemini_candidates = combined_items[:60]
+
+        gemini_json_str = json.dumps(gemini_candidates, ensure_ascii=False)
+
+        prompt = f"""
+Eres la asesora de ventas estrella y experta en belleza, perfumería y moda para la "Tiendita de Erika".
+Tu objetivo es atender al cliente con máxima amabilidad, carisma, persuasión y cercanía, asesorándolo con las mejores opciones de nuestras revistas activas.
+
+Revistas actualmente activas en la tienda: {active_catalogs_str}.
+IMPORTANTE: Recomienda ÚNICAMENTE productos reales que estén en la siguiente lista en JSON. No inventes productos ni precios:
+
+LISTA DE PRODUCTOS DISPONIBLES:
+{gemini_json_str}
+
+BÚSQUEDA DEL CLIENTE: "{query}"
+
+INSTRUCCIONES DE RESPUESTA:
+1. Saluda cálidamente y muestra entusiasmo por ayudar (ej: "¡Hola! Qué gusto saludarte...", "Para lo que buscas, tengo opciones espectaculares que te van a encantar:").
+2. Recomienda entre 2 y 4 opciones ideales que coincidan con la necesidad del cliente. Si busca un regalo, asesóralo explicando por qué es ideal.
+3. Para CADA producto recomendado, incluye:
+   - Nombre en negrita (<b>Nombre</b>)
+   - Precio destacado (<b>Precio</b>)
+   - Revista y Página exacta
+   - Justo al lado o abajo, incluye SIEMPRE el botón VER usando EXACTAMENTE este código HTML:
+     <button onclick="window.openCatalogByTitle(this.getAttribute('data-cat'), this.getAttribute('data-pag'))" data-cat="TITULO_REVISTA" data-pag="PAGINA" class="inline-flex items-center gap-1 bg-pink-50 hover:bg-pink-100 text-pink-600 px-3 py-1 rounded-full text-xs font-bold transition-colors shadow-sm ml-2 cursor-pointer"><i class="fas fa-book-open"></i> VER</button>
+     (Reemplaza TITULO_REVISTA y PAGINA con los datos del producto en el JSON).
+   - Una breve frase explicando sus beneficios o por qué le encantará.
+4. Formatea todo con HTML limpio (<b>, <ul>, <li style="margin-bottom:14px">, <p>, <br>). No uses etiquetas ```html ni ``` de markdown.
+5. Cierra siempre animándolo a hacer clic en el botón de WhatsApp para pedirlo de inmediato con Erika.
+"""
+
+        try:
+            print(f"[Search] Consultando a Gemini para responder la búsqueda: '{query}'...")
+            ai_text = call_gemini_with_key_manager(prompt, json_mode=False)
+            if ai_text:
+                ai_text = re.sub(r'```html\s*', '', ai_text)
+                ai_text = re.sub(r'```\s*$', '', ai_text)
+                ai_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', ai_text)
+                return jsonify({"response": ai_text.strip()})
+        except Exception as e:
+            print(f"[Search] Error consultando Gemini en búsqueda: {e}. Usando fallback local...")
+
+        # Si Gemini falló o se agotó la cuota, respaldo a búsqueda local rápida
+        html_fallback = local_search_in_json(query, combined_items)
+        return jsonify({"response": html_fallback})
+
+    except Exception as e:
+        print(f"Error crítico en search_products: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/extract_missing_product', methods=['POST'])
 def extract_missing_product():
