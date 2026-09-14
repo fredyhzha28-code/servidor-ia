@@ -593,6 +593,75 @@ def is_duplicate_product_pair(item_a, item_b):
             
     return False
 
+def get_facing_page_num(page_num, total_pages=None):
+    """
+    Calcula la página compañera de pliego (libro abierto) en una revista física.
+    - Pág 1: Portada (sola).
+    - Págs 2 y 3: Pliego abierto (2 izquierda, 3 derecha).
+    - Págs 4 y 5: Pliego abierto (4 izquierda, 5 derecha).
+    - En general: página par 2k (izq) acompaña a 2k+1 (der).
+    """
+    try:
+        page_num = int(page_num)
+    except:
+        return None
+    if page_num <= 1:
+        return None
+    if page_num % 2 == 0:
+        facing = page_num + 1
+        if total_pages and facing > int(total_pages):
+            return None
+        return facing
+    else:
+        facing = page_num - 1
+        return facing if facing >= 2 else None
+
+def normalize_words_set(text):
+    text = str(text or '').lower()
+    text = re.sub(r'[^a-záéíóúüñ0-9\s]', ' ', text)
+    stop = {'de', 'la', 'el', 'los', 'las', 'en', 'y', 'con', 'para', 'un', 'una', 'c', 'u', 'cyzone', 'l', 'bel', 'esika'}
+    return set(w for w in text.split() if len(w) > 2 and w not in stop)
+
+def find_matching_price_in_facing_page(prod, facing_prods):
+    """
+    Busca si hay un precio compartido en la página compañera del pliego (libro abierto).
+    """
+    if not isinstance(prod, dict) or not facing_prods:
+        return None
+        
+    p_name = prod.get('nombre', '')
+    p_desc = prod.get('descripcion_corta', '')
+    p_words = normalize_words_set(f"{p_name} {p_desc}")
+    
+    numeric_facing = [fp for fp in facing_prods if re.search(r'\d', str(fp.get('precio', ''))) and 'confirmar' not in str(fp.get('precio', '')).lower()]
+    if not numeric_facing:
+        return None
+        
+    prices = set(fp.get('precio').strip() for fp in numeric_facing)
+    
+    best_match = None
+    max_overlap = 0
+    for fp in numeric_facing:
+        fp_name = fp.get('nombre', '')
+        fp_desc = fp.get('descripcion_corta', '')
+        fp_words = normalize_words_set(f"{fp_name} {fp_desc}")
+        overlap = len(p_words.intersection(fp_words))
+        if overlap > max_overlap:
+            max_overlap = overlap
+            best_match = fp
+            
+    # Coincidencia directa por nombre de línea o colección (ej: 'Studio Look Juicy Lips')
+    if best_match and max_overlap >= 2:
+        return best_match.get('precio')
+        
+    # Precio único para todo el pliego de la misma familia/categoría (ej: Taste colonias a $19.990 c/u)
+    if len(prices) == 1:
+        single_price = list(prices)[0]
+        if best_match and max_overlap >= 1:
+            return single_price
+            
+    return None
+
 def deduplicate_and_merge_page_products(products):
     """
     Filtra y consolida productos de una misma página:
@@ -841,10 +910,24 @@ def clean_product_taxonomy(p):
     p['subcategoria'] = sub
     return p
 
-def extract_products_from_page(page_text, image_path, title, page_num, is_audit=False):
+def extract_products_from_page(page_text, image_path, title, page_num, is_audit=False, facing_text="", facing_img_path=None, facing_page_num=None):
+    spread_instruction = ""
+    if facing_page_num:
+        spread_instruction = f"""
+    0.1 REGLA DE ORO DE LIBRO ABIERTO / PLIEGO DE DOBLE PÁGINA (PÁGINA DERECHA E IZQUIERDA):
+       - Las revistas de catálogo se diseñan y leen físicamente como un LIBRO ABIERTO:
+         * La Imagen 1 corresponde a la PÁGINA PRINCIPAL ({page_num}) de la cual debes extraer los productos a la venta.
+         * La Imagen 2 corresponde a la PÁGINA COMPAÑERA ({facing_page_num}) que forma el pliego abierto ('libro abierto') frente a frente.
+       - ¡OFERTAS Y PRECIOS COMPARTIDOS EN EL LIBRO ABIERTO!:
+         En los catálogos físicos (Cyzone, L'Bel, Esika, etc.), las colecciones completas (ej: colonias refrescantes Taste, labiales Studio Look, bases y polvos, delineadores) se exhiben distribuidas a lo largo de las DOS páginas del libro abierto (ej: 3 colonias en la página izquierda {page_num} y 3 colonias en la página derecha {facing_page_num}).
+         Sin embargo, el encabezado de oferta o el precio destacado ('55% DSCTO', 'A SOLO $19.990 c/u', 'LLEVA CUALQUIERA POR $XX.XXX') casi siempre se imprime ÚNICAMENTE en una de las dos páginas (frecuentemente en la página derecha o en un banner grande que corona el pliego).
+       - Si los productos de la Página {page_num} forman parte de la misma línea, colección, familia o categoría que la oferta visible en la página compañera ({facing_page_num}), o comparten características similares y el precio 'c/u' (cada uno) aplica para toda la colección del pliego: DEBES ASIGNAR ESE PRECIO EXACTO (ej: '$19.990', '$16.990', '$14.990', etc.) a cada producto de la Página {page_num} en lugar de poner 'Confirmar con Erika'.
+       - RECUERDA: En la lista JSON devuelve ÚNICAMENTE los productos que están ubicados físicamente en la Página {page_num} (los de la página {facing_page_num} se extraen por separado), pero APROVECHANDO los precios y condiciones de oferta visibles en la página compañera.
+        """
+
     prompt = f"""
     Analiza con máxima atención esta página del catálogo de moda/belleza "{title}" (Página {page_num}).
-    
+    {spread_instruction}
     Tu objetivo es extraer con precisión ÚNICAMENTE los productos reales a la venta, distinguiendo variantes, detectando promociones y calculando precios unitarios:
 
     0. REGLA DE ORO: EXCLUSIÓN DE PORTADAS Y FOTOS EDITORIALES/PUBLICITARIAS SIN PRODUCTO A LA VENTA:
@@ -935,8 +1018,9 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
          * Para "Zapatos": "Sandalias", "Tacones", "Tenis y deportivos", "Botas y botines", "Calzado casual".
          * Para "Hogar": "Dormitorio y cama", "Cocina y mesa", "Baño", "Hogar y decoración".
 
-    Texto extraído por OCR como referencia:
+    Texto extraído por OCR como referencia (Página {page_num}):
     {page_text}
+    {f"\nTexto OCR de la página compañera {facing_page_num} del libro abierto como referencia contextual de precios y ofertas:\n{facing_text}\n" if facing_text else ""}
     
     Devuelve exclusivamente un JSON con la siguiente estructura (Array de objetos):
     [
@@ -958,7 +1042,11 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     if is_audit:
         prompt = f"AUDITORÍA ESTRICTA:\nVuelve a examinar la página exclusivamente buscando productos omitidos sin duplicar.\nComprueba cada precio independiente.\n\n" + prompt
 
-    res = call_gemini_with_key_manager(prompt, files=[image_path], page_num=page_num)
+    files_to_send = [image_path]
+    if facing_img_path and os.path.exists(facing_img_path):
+        files_to_send.append(facing_img_path)
+
+    res = call_gemini_with_key_manager(prompt, files=files_to_send, page_num=page_num)
     if isinstance(res, tuple):
         text_resp, used_key = res
     else:
@@ -997,6 +1085,10 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
     
     key_manager.register_worker_start(thread_id, page_num, "Renderizando imagen...")
     
+    facing_page_num = get_facing_page_num(page_num, total_pages)
+    facing_img_path = None
+    facing_text = ""
+    
     # 1. Renderizar imagen a /tmp/ con lock rápido para proteger la memoria RAM (Render 512MB)
     # Solo 1 página a la vez tiene pixmap en RAM (toma ~30-50ms), luego se libera de inmediato
     with pdf_render_lock:
@@ -1005,6 +1097,19 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
         page_text = page.get_text()
         pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
         img_bytes = pix.tobytes("jpeg")
+        
+        facing_img_bytes = None
+        if facing_page_num and 1 <= facing_page_num <= len(doc):
+            try:
+                f_page = doc.load_page(facing_page_num - 1)
+                facing_text = f_page.get_text()
+                f_pix = f_page.get_pixmap(matrix=fitz.Matrix(0.8, 0.8))
+                facing_img_bytes = f_pix.tobytes("jpeg")
+                del f_page
+                del f_pix
+            except Exception as fe:
+                print(f"Aviso extrayendo página compañera {facing_page_num}: {fe}")
+                
         doc.close()
         del page
         del doc
@@ -1015,6 +1120,13 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
     os.close(fd)
     with open(tmp_img_path, 'wb') as f:
         f.write(img_bytes)
+
+    if facing_img_bytes:
+        fd_f, facing_img_path = tempfile.mkstemp(suffix=f"_{cat_hash}_facing_p{facing_page_num}.jpg")
+        os.close(fd_f)
+        with open(facing_img_path, 'wb') as f:
+            f.write(facing_img_bytes)
+        del facing_img_bytes
         
     # 2. Subir a Cloudflare R2
     folder_path = f"thumbnails/{cat_hash}"
@@ -1030,9 +1142,17 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
     del img_bytes
     free_memory()
     
-    # 3. Enviar a Gemini (Ejecutándose en paralelo con múltiples API keys rotativas)
+    # 3. Enviar a Gemini (Ejecutándose en paralelo con múltiples API keys rotativas y contexto de libro abierto)
     key_manager.register_worker_start(thread_id, page_num, "Analizando con IA...")
-    products, used_key = extract_products_from_page(page_text, tmp_img_path, title, page_num)
+    try:
+        products, used_key = extract_products_from_page(
+            page_text, tmp_img_path, title, page_num,
+            facing_text=facing_text, facing_img_path=facing_img_path, facing_page_num=facing_page_num
+        )
+    finally:
+        if facing_img_path and os.path.exists(facing_img_path):
+            try: os.remove(facing_img_path)
+            except: pass
     del page_text
     
     # 4. Deduplicar y consolidar inteligentemente (evitar separar título de subtítulo y guiar por precios)
@@ -1366,6 +1486,12 @@ def process_single_catalog(idx, cat):
                 try: status_collection.document(cat_hash).delete()
                 except: pass
         elif status_collection:
+            # Reconciliación automática de libro abierto (sincroniza ofertas de pliegos 30-31, 32-33, etc.)
+            try:
+                reconcile_spread_prices_for_catalog(cat_hash, appId=appId, title=title)
+            except Exception as re_err:
+                print(f"Aviso reconciliando libro abierto: {re_err}")
+
             status_collection.document(cat_hash).set({
                 "status": "completed",
                 "title": title,
@@ -1382,6 +1508,73 @@ def process_single_catalog(idx, cat):
         if os.path.exists(tmp_path):
             try: os.remove(tmp_path)
             except: pass
+
+def reconcile_spread_prices_for_catalog(cat_hash, appId='tienda-catalogos-app', title=''):
+    """
+    Recorre los productos del catálogo por pliegos de libro abierto (Pág 2-3, 4-5, etc.).
+    Si algún producto quedó con 'Confirmar con Erika', analiza si su página compañera
+    en el pliego tiene productos de la misma línea/categoría con precio numérico, y los unifica automáticamente.
+    """
+    if not firebase_db:
+        return 0
+    try:
+        products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+        docs = list(products_col.where("catalogo_hash", "==", cat_hash).stream())
+        if not docs and title:
+            docs = list(products_col.where("catalogo", "==", title).stream())
+            
+        by_page = {}
+        for d in docs:
+            p = d.to_dict()
+            p['id'] = d.id
+            pag_val = p.get('pagina', '1')
+            if str(pag_val).isdigit():
+                by_page.setdefault(int(pag_val), []).append(p)
+                
+        max_p = max(by_page.keys()) if by_page else 0
+        updated = 0
+        batch = firebase_db.batch()
+        batch_count = 0
+        
+        for left_p in range(2, max_p + 1, 2):
+            right_p = left_p + 1
+            prods_left = by_page.get(left_p, [])
+            prods_right = by_page.get(right_p, [])
+            
+            for p in prods_left:
+                if "confirmar" in str(p.get("precio", "")).lower() or not p.get("precio"):
+                    new_p = find_matching_price_in_facing_page(p, prods_right)
+                    if new_p:
+                        clean_p = new_p.strip()
+                        if not clean_p.startswith('$'): clean_p = f"${clean_p}"
+                        batch.update(products_col.document(p['id']), {'precio': clean_p})
+                        batch_count += 1
+                        updated += 1
+                        
+            for p in prods_right:
+                if "confirmar" in str(p.get("precio", "")).lower() or not p.get("precio"):
+                    new_p = find_matching_price_in_facing_page(p, prods_left)
+                    if new_p:
+                        clean_p = new_p.strip()
+                        if not clean_p.startswith('$'): clean_p = f"${clean_p}"
+                        batch.update(products_col.document(p['id']), {'precio': clean_p})
+                        batch_count += 1
+                        updated += 1
+                        
+            if batch_count >= 300:
+                batch.commit()
+                batch = firebase_db.batch()
+                batch_count = 0
+                
+        if batch_count > 0:
+            batch.commit()
+            
+        if updated > 0:
+            print(f"[{title or cat_hash}] Reconciliación de libro abierto: {updated} producto(s) completados con su precio.")
+        return updated
+    except Exception as e:
+        print(f"Aviso en reconcile_spread_prices: {e}")
+        return 0
 
 active_processing_hashes = set()
 active_processing_lock = threading.Lock()
@@ -1826,6 +2019,28 @@ def extract_missing_product():
         
     except Exception as e:
         print(f"Error en extract_missing_product: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/sync_spread_prices', methods=['POST'])
+def sync_spread_prices():
+    try:
+        data = request.json or {}
+        catalog_hash = data.get('catalog_hash', '')
+        catalog_url = data.get('catalog_url', '')
+        title = data.get('title', '')
+        appId = data.get('appId', 'tienda-catalogos-app')
+        
+        if not catalog_hash and catalog_url:
+            catalog_hash = get_single_catalog_hash(catalog_url, title)
+            
+        updated = reconcile_spread_prices_for_catalog(catalog_hash, appId=appId, title=title)
+        return jsonify({
+            "success": True,
+            "updated_count": updated,
+            "message": f"Se sincronizaron {updated} precios de libro abierto con éxito."
+        })
+    except Exception as e:
+        print(f"Error en sync_spread_prices: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
