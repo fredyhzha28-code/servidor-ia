@@ -9,6 +9,20 @@ import gc
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import ctypes
+
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+except Exception:
+    _libc = None
+
+def free_memory():
+    gc.collect()
+    if _libc and hasattr(_libc, 'malloc_trim'):
+        try:
+            _libc.malloc_trim(0)
+        except Exception:
+            pass
 
 # Lock para serializar el renderizado gráfico de páginas en RAM y proteger los 512MB de Render
 pdf_render_lock = threading.Lock()
@@ -968,6 +982,7 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
         del page
         del doc
         del pix
+        free_memory()
 
     fd, tmp_img_path = tempfile.mkstemp(suffix=f"_{cat_hash}_p{page_num}.jpg")
     os.close(fd)
@@ -986,7 +1001,7 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
     img_url = f"{R2_PUBLIC_URL}/{object_name}"
     
     del img_bytes
-    gc.collect()
+    free_memory()
     
     # 3. Enviar a Gemini (Ejecutándose en paralelo con múltiples API keys rotativas)
     key_manager.register_worker_start(thread_id, page_num, "Analizando con IA...")
@@ -1037,7 +1052,8 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
     if os.path.exists(tmp_img_path):
         try: os.remove(tmp_img_path)
         except: pass
-    gc.collect()
+    del unique_products
+    free_memory()
 
 def process_single_catalog(idx, cat):
     url = cat.get('url', '')
@@ -1080,6 +1096,28 @@ def process_single_catalog(idx, cat):
                 print(f"Catálogo {title} ya estaba procesado completamente al 100%. Abortando re-lectura.")
                 return
 
+    # 1.1 Si la base de datos ya tiene los productos de esta revista registrados, marcar completado y no re-leer
+    if firebase_db:
+        try:
+            clean_url = url.split('?')[0]
+            products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+            existing_count = len(list(products_col.where("catalogo_hash", "==", cat_hash).limit(10).stream()))
+            if existing_count == 0:
+                existing_count = len(list(products_col.where("catalogo_url", "==", clean_url).limit(10).stream()))
+            if existing_count >= 5:
+                print(f"[{title}] Ya cuenta con productos registrados en Firebase. Marcando completado al 100% sin re-descargar.")
+                if status_collection:
+                    status_collection.document(cat_hash).set({
+                        "status": "completed",
+                        "title": title,
+                        "message": "¡Revista memorizada con éxito!",
+                        "progress": 100,
+                        "updatedAt": firestore.SERVER_TIMESTAMP
+                    }, merge=True)
+                return
+        except Exception as e:
+            print(f"Aviso comprobando productos existentes: {e}")
+
     if status_collection and (not doc_snap or not doc_snap.exists):
         status_collection.document(cat_hash).set({
             "status": "processing", "title": title, "message": "Descargando PDF...", "progress": 1, "last_successful_page": 0, "updatedAt": firestore.SERVER_TIMESTAMP
@@ -1110,8 +1148,8 @@ def process_single_catalog(idx, cat):
         # Protege al 100% la memoria RAM (<180MB en Render sobre los 500MB) mediante pdf_render_lock
         primary_count = key_manager.get_active_primary_count()
         total_keys = key_manager.get_total_active_count()
-        max_workers = 5 if primary_count >= 5 else min(5, max(3, total_keys))
-        print(f"[{title}] Extracción ultra-rápida: {max_workers} trabajadores en paralelo (5 en 5) con {primary_count} API keys principales multicuenta para {total_pages} páginas...")
+        max_workers = min(4, max(2, primary_count)) if primary_count > 0 else min(3, max(2, total_keys))
+        print(f"[{title}] Extracción optimizada: {max_workers} trabajadores concurrentes protegidos en RAM con {primary_count} API keys principales para {total_pages} páginas...")
         
         # Recuperar exhaustivamente qué páginas ya fueron procesadas y guardadas previamente en Firebase
         already_processed_pages = set()
@@ -1153,127 +1191,142 @@ def process_single_catalog(idx, cat):
         
         if not pages_to_process:
             print(f"[{title}] Todas las páginas ({total_pages}) ya estaban procesadas.")
-        else:
-            progress_lock = threading.Lock()
-            stop_event = threading.Event()
-            
-            # Registrar estado inicial reflejando páginas ya recuperadas
+            if os.path.exists(tmp_path):
+                try: os.remove(tmp_path)
+                except: pass
             if status_collection:
-                pct = int((completed_count / total_pages) * 100) if total_pages > 0 else 0
-                telemetry = key_manager.get_telemetry_snapshot()
                 status_collection.document(cat_hash).set({
-                    "status": "processing",
+                    "status": "completed",
                     "title": title,
-                    "message": f"Memorizando con IA: {completed_count}/{total_pages} páginas ({pct}%)...",
-                    "progress": pct,
-                    "completed_pages": completed_count,
+                    "message": "¡Revista memorizada con éxito!",
+                    "progress": 100,
+                    "completed_pages": total_pages,
                     "total_pages": total_pages,
-                    "last_successful_page": completed_count,
-                    "active_workers": telemetry["active_workers"],
-                    "recent_events": telemetry["recent_events"],
-                    "keys_summary": {
-                        "primary_active": telemetry["primary_active"],
-                        "primary_cooldown": telemetry["primary_cooldown"],
-                        "primary_disabled": telemetry["primary_disabled"],
-                        "backup_active": telemetry["backup_active"]
-                    },
+                    "last_successful_page": total_pages,
                     "updatedAt": firestore.SERVER_TIMESTAMP
-                }, merge=True)
+                })
+            return
+
+        progress_lock = threading.Lock()
+        stop_event = threading.Event()
             
-            last_cancel_check = 0.0
-            catalog_alive = True
-            cancel_check_lock = threading.Lock()
+        # Registrar estado inicial reflejando páginas ya recuperadas
+        if status_collection:
+            pct = int((completed_count / total_pages) * 100) if total_pages > 0 else 0
+            telemetry = key_manager.get_telemetry_snapshot()
+            status_collection.document(cat_hash).set({
+                "status": "processing",
+                "title": title,
+                "message": f"Memorizando con IA: {completed_count}/{total_pages} páginas ({pct}%)...",
+                "progress": pct,
+                "completed_pages": completed_count,
+                "total_pages": total_pages,
+                "last_successful_page": completed_count,
+                "active_workers": telemetry["active_workers"],
+                "recent_events": telemetry["recent_events"],
+                "keys_summary": {
+                    "primary_active": telemetry["primary_active"],
+                    "primary_cooldown": telemetry["primary_cooldown"],
+                    "primary_disabled": telemetry["primary_disabled"],
+                    "backup_active": telemetry["backup_active"]
+                },
+                "updatedAt": firestore.SERVER_TIMESTAMP
+            }, merge=True)
+        
+        last_cancel_check = 0.0
+        catalog_alive = True
+        cancel_check_lock = threading.Lock()
 
-            def is_cancelled():
-                nonlocal last_cancel_check, catalog_alive
-                if stop_event.is_set():
-                    return True
-                now = time.time()
-                with cancel_check_lock:
-                    if now - last_cancel_check > 2.0:
-                        last_cancel_check = now
-                        try:
-                            # 1. Si el usuario borró el documento de status
-                            if status_collection:
-                                doc_s = status_collection.document(cat_hash).get()
-                                if not doc_s.exists:
-                                    print(f"[{title}] Estado de IA eliminado por el usuario. Cancelando lectura.")
-                                    catalog_alive = False
-                                    stop_event.set()
-                                    return True
-                            # 2. Si el usuario borró la revista de la colección de catálogos
-                            if catalogs_collection:
-                                clean_u = url.split('?')[0]
-                                cats = catalogs_collection.get()
-                                exists = any(
-                                    ((c.to_dict().get('pdfUrl') or c.to_dict().get('url') or '').split('?')[0] == clean_u or
-                                     (c.to_dict().get('title') and c.to_dict().get('title').strip() == title.strip()))
-                                    for c in cats
-                                )
-                                if not exists:
-                                    print(f"[{title}] Revista eliminada de Firebase catalogs. Cancelando lectura de inmediato.")
-                                    catalog_alive = False
-                                    stop_event.set()
-                                    return True
-                        except Exception:
-                            pass
-                return not catalog_alive
+        def is_cancelled():
+            nonlocal last_cancel_check, catalog_alive
+            if stop_event.is_set():
+                return True
+            now = time.time()
+            with cancel_check_lock:
+                if now - last_cancel_check > 2.0:
+                    last_cancel_check = now
+                    try:
+                        # 1. Si el usuario borró el documento de status
+                        if status_collection:
+                            doc_s = status_collection.document(cat_hash).get()
+                            if not doc_s.exists:
+                                print(f"[{title}] Estado de IA eliminado por el usuario. Cancelando lectura.")
+                                catalog_alive = False
+                                stop_event.set()
+                                return True
+                        # 2. Si el usuario borró la revista de la colección de catálogos
+                        if catalogs_collection:
+                            clean_u = url.split('?')[0]
+                            cats = catalogs_collection.get()
+                            exists = any(
+                                ((c.to_dict().get('pdfUrl') or c.to_dict().get('url') or '').split('?')[0] == clean_u or
+                                 (c.to_dict().get('title') and c.to_dict().get('title').strip() == title.strip()))
+                                for c in cats
+                            )
+                            if not exists:
+                                print(f"[{title}] Revista eliminada de Firebase catalogs. Cancelando lectura de inmediato.")
+                                catalog_alive = False
+                                stop_event.set()
+                                return True
+                    except Exception:
+                        pass
+            return not catalog_alive
 
-            def run_page_worker(p_num):
+        def run_page_worker(p_num):
+            if is_cancelled():
+                return
+            
+            # Reintento robusto de página en caso de fallos transitorios
+            max_page_retries = 3
+            for attempt in range(1, max_page_retries + 1):
                 if is_cancelled():
                     return
-                
-                # Reintento robusto de página en caso de fallos transitorios
-                max_page_retries = 3
-                for attempt in range(1, max_page_retries + 1):
-                    if is_cancelled():
+                try:
+                    time.sleep(0.05)
+                    process_single_page(tmp_path, p_num, cat, total_pages)
+                    break
+                except Exception as page_err:
+                    print(f"[Aviso] Reintento {attempt}/{max_page_retries} en página {p_num}: {page_err}")
+                    if attempt == max_page_retries:
+                        print(f"[Error] No se pudo procesar la página {p_num} tras {max_page_retries} intentos.")
                         return
-                    try:
-                        time.sleep(0.05)
-                        process_single_page(tmp_path, p_num, cat, total_pages)
-                        break
-                    except Exception as page_err:
-                        print(f"[Aviso] Reintento {attempt}/{max_page_retries} en página {p_num}: {page_err}")
-                        if attempt == max_page_retries:
-                            print(f"[Error] No se pudo procesar la página {p_num} tras {max_page_retries} intentos.")
-                            return
-                        time.sleep(2.0)
-                    
-                if is_cancelled():
-                    return
+                    time.sleep(2.0)
                 
-                with progress_lock:
-                    nonlocal completed_count
-                    completed_count += 1
-                    pct = int((completed_count / total_pages) * 100)
-                    if status_collection and not stop_event.is_set():
-                        telemetry = key_manager.get_telemetry_snapshot()
-                        status_collection.document(cat_hash).set({
-                            "status": "processing",
-                            "title": title,
-                            "message": f"Memorizando con IA: {completed_count}/{total_pages} páginas ({pct}%)...",
-                            "progress": pct,
-                            "completed_pages": completed_count,
-                            "total_pages": total_pages,
-                            "last_successful_page": completed_count,
-                            "active_workers": telemetry["active_workers"],
-                            "recent_events": telemetry["recent_events"],
-                            "keys_summary": {
-                                "primary_active": telemetry["primary_active"],
-                                "primary_cooldown": telemetry["primary_cooldown"],
-                                "primary_disabled": telemetry["primary_disabled"],
-                                "backup_active": telemetry["backup_active"]
-                            },
-                            "updatedAt": firestore.SERVER_TIMESTAMP
-                        }, merge=True)
+            if is_cancelled():
+                return
             
-            with ThreadPoolExecutor(max_workers=max_workers) as page_executor:
-                futures = [page_executor.submit(run_page_worker, p) for p in pages_to_process]
-                for f in as_completed(futures):
-                    try:
-                        f.result()
-                    except Exception as err:
-                        print(f"Error en hilo de procesamiento de páginas: {err}")
+            with progress_lock:
+                nonlocal completed_count
+                completed_count += 1
+                pct = int((completed_count / total_pages) * 100)
+                if status_collection and not stop_event.is_set():
+                    telemetry = key_manager.get_telemetry_snapshot()
+                    status_collection.document(cat_hash).set({
+                        "status": "processing",
+                        "title": title,
+                        "message": f"Memorizando con IA: {completed_count}/{total_pages} páginas ({pct}%)...",
+                        "progress": pct,
+                        "completed_pages": completed_count,
+                        "total_pages": total_pages,
+                        "last_successful_page": completed_count,
+                        "active_workers": telemetry["active_workers"],
+                        "recent_events": telemetry["recent_events"],
+                        "keys_summary": {
+                            "primary_active": telemetry["primary_active"],
+                            "primary_cooldown": telemetry["primary_cooldown"],
+                            "primary_disabled": telemetry["primary_disabled"],
+                            "backup_active": telemetry["backup_active"]
+                        },
+                        "updatedAt": firestore.SERVER_TIMESTAMP
+                    }, merge=True)
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as page_executor:
+            futures = [page_executor.submit(run_page_worker, p) for p in pages_to_process]
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as err:
+                    print(f"Error en hilo de procesamiento de páginas: {err}")
                         
         # 4. Finalizado exitosamente o Cancelado
         if os.path.exists(tmp_path):
@@ -1333,6 +1386,74 @@ def background_extract_and_save(missing_catalogs):
         finally:
             with active_processing_lock:
                 active_processing_hashes.discard(cat_h)
+
+def auto_resume_unfinished_catalogs():
+    """
+    Revisa automáticamente al arrancar el servidor si hay revistas que quedaron
+    a medias (ej. tras un reinicio de Render o corte) y las reanuda en segundo plano
+    sin esperar a que el usuario presione ningún botón.
+    """
+    time.sleep(12)  # Dar margen a que Gunicorn termine de enlazar el puerto y Firebase conecte
+    if not firebase_db:
+        return
+    try:
+        appId = 'tienda-catalogos-app'
+        catalogs_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("catalogs")
+        status_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status")
+        
+        cats = list(catalogs_col.stream())
+        to_resume = []
+        for c in cats:
+            c_data = c.to_dict()
+            url = c_data.get('pdfUrl') or c_data.get('url')
+            title = c_data.get('title', 'Revista')
+            if not url:
+                continue
+            cat_hash = get_single_catalog_hash(url, title)
+            s_doc = status_col.document(cat_hash).get()
+            if s_doc.exists:
+                s_data = s_doc.to_dict()
+                # Si ya está marcado como completado al 100%, omitir
+                if s_data.get('status') == 'completed' and s_data.get('progress', 0) >= 100:
+                    continue
+                # Si el estado es processing o < 100%, verificar si ya tiene sus productos
+                clean_url = url.split('?')[0]
+                products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+                has_prods = len(list(products_col.where("catalogo_hash", "==", cat_hash).limit(5).stream())) > 0 or \
+                            len(list(products_col.where("catalogo_url", "==", clean_url).limit(5).stream())) > 0
+                if has_prods and s_data.get('status') != 'processing':
+                    status_col.document(cat_hash).set({"status": "completed", "progress": 100, "message": "¡Revista memorizada con éxito!"}, merge=True)
+                    continue
+
+                c_data['url'] = url
+                c_data['title'] = title
+                c_data['hash'] = cat_hash
+                c_data['appId'] = appId
+                to_resume.append(c_data)
+            else:
+                # No tiene doc de status aún: verificar si ya tiene productos
+                clean_url = url.split('?')[0]
+                products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+                has_prods = len(list(products_col.where("catalogo_hash", "==", cat_hash).limit(5).stream())) > 0 or \
+                            len(list(products_col.where("catalogo_url", "==", clean_url).limit(5).stream())) > 0
+                if has_prods:
+                    status_col.document(cat_hash).set({"status": "completed", "progress": 100, "message": "¡Revista memorizada con éxito!", "title": title}, merge=True)
+                    continue
+
+                c_data['url'] = url
+                c_data['title'] = title
+                c_data['hash'] = cat_hash
+                c_data['appId'] = appId
+                to_resume.append(c_data)
+                
+        if to_resume:
+            print(f"[AutoResume] Se detectaron {len(to_resume)} revista(s) incompletas/pendientes. Reanudando lectura automáticamente en segundo plano...")
+            background_extract_and_save(to_resume)
+    except Exception as e:
+        print(f"[AutoResume] Aviso en verificación de revistas pendientes: {e}")
+
+# Iniciar auto-reanudación en segundo plano al arrancar
+threading.Thread(target=auto_resume_unfinished_catalogs, daemon=True).start()
 
 @app.route('/api/search', methods=['POST'])
 def search_products():
@@ -1419,6 +1540,20 @@ def search_products():
                             is_completed = True
                 except Exception:
                     pass
+
+            if prods and len(prods) >= 10:
+                is_completed = True
+                if firebase_db:
+                    try:
+                        firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status").document(cat_hash).set({
+                            "status": "completed",
+                            "title": title,
+                            "message": "¡Revista memorizada con éxito!",
+                            "progress": 100,
+                            "updatedAt": firestore.SERVER_TIMESTAMP
+                        }, merge=True)
+                    except Exception:
+                        pass
 
             if prods:
                 combined_items.extend(prods)
