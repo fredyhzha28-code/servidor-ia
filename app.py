@@ -167,6 +167,8 @@ class GeminiKeyManager:
         self.primary_idx = 0
         self.backup_idx = 0
         self.backup_group_cooldown_until = 0.0  # El grupo de respaldo comparte proyecto
+        self.active_workers = {}  # {thread_id: {'page': p, 'key': k, 'status': s, 'time': t}}
+        self.recent_events = []
         self.lock = threading.Lock()
         
         print(f"[KeyManager] Cargadas {len(self.primary_items)} API keys PRINCIPALES (Cuentas y Proyectos Independientes).")
@@ -179,6 +181,68 @@ class GeminiKeyManager:
     def get_total_active_count(self):
         with self.lock:
             return sum(1 for item in self.primary_items + self.backup_items if not item.permanently_disabled)
+
+    def register_worker_start(self, thread_id, page_num, status="Renderizando página..."):
+        with self.lock:
+            self.active_workers[str(thread_id)] = {
+                "page": page_num,
+                "key": "Asignando...",
+                "status": status,
+                "time": time.strftime("%H:%M:%S")
+            }
+
+    def register_worker_key(self, thread_id, page_num, key_name):
+        with self.lock:
+            self.active_workers[str(thread_id)] = {
+                "page": page_num,
+                "key": key_name,
+                "status": "Extrayendo con IA",
+                "time": time.strftime("%H:%M:%S")
+            }
+            ev = f"[{time.strftime('%H:%M:%S')}] Pág {page_num}: asignada a {key_name}"
+            self.recent_events.append(ev)
+            if len(self.recent_events) > 8:
+                self.recent_events.pop(0)
+
+    def register_worker_finish(self, thread_id, page_num, key_name, count):
+        with self.lock:
+            self.active_workers.pop(str(thread_id), None)
+            ev = f"[{time.strftime('%H:%M:%S')}] Pág {page_num}: {count} productos guardados ({key_name})"
+            self.recent_events.append(ev)
+            if len(self.recent_events) > 8:
+                self.recent_events.pop(0)
+
+    def register_key_alert(self, key_name, alert_type, seconds=0):
+        with self.lock:
+            if alert_type == "403":
+                ev = f"[{time.strftime('%H:%M:%S')}] ⚠️ {key_name}: Deshabilitada permanentemente (403 cuenta suspendida/sin permisos)"
+            elif alert_type == "429":
+                ev = f"[{time.strftime('%H:%M:%S')}] ⏳ {key_name}: Pausa temporal por cuota ({seconds}s)"
+            elif alert_type == "503":
+                ev = f"[{time.strftime('%H:%M:%S')}] 🔄 {key_name}: Alta demanda en modelo (503), alternando modelo..."
+            else:
+                ev = f"[{time.strftime('%H:%M:%S')}] Aviso {key_name}: {alert_type}"
+            self.recent_events.append(ev)
+            if len(self.recent_events) > 8:
+                self.recent_events.pop(0)
+
+    def get_telemetry_snapshot(self):
+        with self.lock:
+            now = time.time()
+            p_active = sum(1 for k in self.primary_items if not k.permanently_disabled and now >= k.cooldown_until)
+            p_wait = sum(1 for k in self.primary_items if not k.permanently_disabled and now < k.cooldown_until)
+            p_disabled = sum(1 for k in self.primary_items if k.permanently_disabled)
+            b_active = sum(1 for k in self.backup_items if not k.permanently_disabled and now >= k.cooldown_until)
+            
+            return {
+                "active_workers": list(self.active_workers.values()),
+                "recent_events": list(self.recent_events),
+                "primary_active": p_active,
+                "primary_cooldown": p_wait,
+                "primary_disabled": p_disabled,
+                "backup_active": b_active,
+                "total_keys": len(self.primary_items) + len(self.backup_items)
+            }
 
     def get_client(self):
         sleep_needed = 0.0
@@ -348,7 +412,7 @@ def wait_for_gemini_slot(min_interval=3.2):
             time.sleep(min_interval - elapsed)
         last_gemini_dispatch_time = time.time()
 
-def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name='gemini-3.5-flash-lite', json_mode=True):
+def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name='gemini-3.5-flash-lite', json_mode=True, page_num=None):
     actual_attempts = 0
     quota_cooldown_cycles = 0
     max_quota_cycles = 60
@@ -363,6 +427,10 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
             
         if pre_sleep > 0:
             time.sleep(pre_sleep)
+            
+        thread_id = threading.get_ident()
+        if page_num:
+            key_manager.register_worker_key(thread_id, page_num, key_name)
             
         uploaded_files = []
         try:
@@ -406,26 +474,33 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
                 raise last_err
             
             if response and response.text:
-                return response.text
+                return response.text, key_name
             raise Exception("Respuesta vacía de Gemini")
             
         except Exception as e:
             error_str = str(e)
             print(f"[Gemini] Aviso con {key_name}: {error_str[:160]}...")
             
-            if "429" in error_str or "503" in error_str or "quota" in error_str.lower() or "resource_exhausted" in error_str.lower():
+            if "429" in error_str or "quota" in error_str.lower() or "resource_exhausted" in error_str.lower():
                 quota_cooldown_cycles += 1
                 delay = extract_retry_delay(error_str, default=21)
                 cd = max(10, min(delay + 1, 45))
                 key_manager.mark_cooldown(key_item, cd)
-                # Un 429 no consume reintentos de la página
+                key_manager.register_key_alert(key_name, "429", cd)
+                time.sleep(1.0)
+            elif "503" in error_str or "unavailable" in error_str.lower() or "demand" in error_str.lower():
+                quota_cooldown_cycles += 1
+                key_manager.mark_cooldown(key_item, 20)
+                key_manager.register_key_alert(key_name, "503")
                 time.sleep(1.0)
             elif "401" in error_str or "403" in error_str:
                 actual_attempts += 1
                 key_manager.mark_cooldown(key_item, 86400, permanent=True)
+                key_manager.register_key_alert(key_name, "403")
             elif "400" in error_str or "404" in error_str:
                 actual_attempts += 1
                 key_manager.mark_cooldown(key_item, 86400, permanent=True)
+                key_manager.register_key_alert(key_name, "404")
             else:
                 actual_attempts += 1
                 key_manager.mark_cooldown(key_item, 5)
@@ -842,7 +917,12 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     if is_audit:
         prompt = f"AUDITORÍA ESTRICTA:\nVuelve a examinar la página exclusivamente buscando productos omitidos sin duplicar.\nComprueba cada precio independiente.\n\n" + prompt
 
-    text_resp = call_gemini_with_key_manager(prompt, files=[image_path])
+    res = call_gemini_with_key_manager(prompt, files=[image_path], page_num=page_num)
+    if isinstance(res, tuple):
+        text_resp, used_key = res
+    else:
+        text_resp = res
+        used_key = "Gemini"
     
     # Parse JSON
     try:
@@ -854,7 +934,7 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
         products = json.loads(clean_text)
         if not isinstance(products, list):
             products = [products]
-        return products
+        return products, used_key
     except Exception as e:
         print(f"Error parseando JSON de Gemini: {e}")
         # Intentar extraer por regex
@@ -865,13 +945,16 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
                 obj = json.loads(match.group(0))
                 products.append(obj)
             except: pass
-        return products
+        return products, used_key
 
 def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
     url = cat_info.get('url', '')
     title = cat_info.get('title', 'Revista')
     cat_hash = cat_info.get('hash', '')
     appId = cat_info.get('appId', 'tienda-catalogos-app')
+    thread_id = threading.get_ident()
+    
+    key_manager.register_worker_start(thread_id, page_num, "Renderizando imagen...")
     
     # 1. Renderizar imagen a /tmp/ con lock rápido para proteger la memoria RAM (Render 512MB)
     # Solo 1 página a la vez tiene pixmap en RAM (toma ~30-50ms), luego se libera de inmediato
@@ -906,13 +989,14 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
     gc.collect()
     
     # 3. Enviar a Gemini (Ejecutándose en paralelo con múltiples API keys rotativas)
-    products = extract_products_from_page(page_text, tmp_img_path, title, page_num)
+    key_manager.register_worker_start(thread_id, page_num, "Analizando con IA...")
+    products, used_key = extract_products_from_page(page_text, tmp_img_path, title, page_num)
     del page_text
     
     # 4. Deduplicar y consolidar inteligentemente (evitar separar título de subtítulo y guiar por precios)
     unique_products = deduplicate_and_merge_page_products(products)
     unique_products = [clean_product_taxonomy(p) for p in unique_products]
-    print(f"[{title} | Pág {page_num}/{total_pages}] Gemini: {len(products)} -> Consolidados y unificados: {len(unique_products)}")
+    print(f"[{title} | Pág {page_num}/{total_pages}] {used_key}: {len(products)} -> Consolidados y unificados: {len(unique_products)}")
     
     # 5. Guardar productos en Firebase inmediatamente
     if firebase_db:
@@ -947,6 +1031,8 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
             "processed_at": firestore.SERVER_TIMESTAMP
         })
         
+    key_manager.register_worker_finish(thread_id, page_num, used_key, len(unique_products))
+    
     # 7. Liberar memoria final y borrar archivo temporal de disco
     if os.path.exists(tmp_img_path):
         try: os.remove(tmp_img_path)
@@ -990,28 +1076,8 @@ def process_single_catalog(idx, cat):
         doc_snap = status_collection.document(cat_hash).get()
         if doc_snap.exists:
             data = doc_snap.to_dict()
-            if data.get('status') == 'completed':
+            if data.get('status') == 'completed' and data.get('progress', 0) >= 100:
                 print(f"Catálogo {title} ya estaba procesado completamente al 100%. Abortando re-lectura.")
-                return
-                
-    # Verificación de seguridad ABSOLUTA: Si ya existen productos guardados (ej: L'BEL con 138 productos)
-    # y no está en estado explícito 'processing', marcarlo como completed y jamás volver a leerlo.
-    if firebase_db:
-        products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
-        existing_docs = list(products_col.where("catalogo_hash", "==", cat_hash).limit(60).stream())
-        if not existing_docs:
-            existing_docs = list(products_col.where("catalogo", "==", title).limit(60).stream())
-        if len(existing_docs) >= 50:
-            if not doc_snap or not doc_snap.exists or doc_snap.to_dict().get('status') != 'processing':
-                print(f"[{title}] Ya tiene {len(existing_docs)}+ productos guardados. Está completamente finalizado. Saltando.")
-                if status_collection:
-                    status_collection.document(cat_hash).set({
-                        "status": "completed",
-                        "title": title,
-                        "message": "¡Revista memorizada con éxito!",
-                        "progress": 100,
-                        "updatedAt": firestore.SERVER_TIMESTAMP
-                    }, merge=True)
                 return
 
     if status_collection and (not doc_snap or not doc_snap.exists):
@@ -1094,12 +1160,23 @@ def process_single_catalog(idx, cat):
             # Registrar estado inicial reflejando páginas ya recuperadas
             if status_collection:
                 pct = int((completed_count / total_pages) * 100) if total_pages > 0 else 0
+                telemetry = key_manager.get_telemetry_snapshot()
                 status_collection.document(cat_hash).set({
                     "status": "processing",
                     "title": title,
                     "message": f"Memorizando con IA: {completed_count}/{total_pages} páginas ({pct}%)...",
                     "progress": pct,
+                    "completed_pages": completed_count,
+                    "total_pages": total_pages,
                     "last_successful_page": completed_count,
+                    "active_workers": telemetry["active_workers"],
+                    "recent_events": telemetry["recent_events"],
+                    "keys_summary": {
+                        "primary_active": telemetry["primary_active"],
+                        "primary_cooldown": telemetry["primary_cooldown"],
+                        "primary_disabled": telemetry["primary_disabled"],
+                        "backup_active": telemetry["backup_active"]
+                    },
                     "updatedAt": firestore.SERVER_TIMESTAMP
                 }, merge=True)
             
@@ -1170,12 +1247,23 @@ def process_single_catalog(idx, cat):
                     completed_count += 1
                     pct = int((completed_count / total_pages) * 100)
                     if status_collection and not stop_event.is_set():
+                        telemetry = key_manager.get_telemetry_snapshot()
                         status_collection.document(cat_hash).set({
                             "status": "processing",
                             "title": title,
                             "message": f"Memorizando con IA: {completed_count}/{total_pages} páginas ({pct}%)...",
                             "progress": pct,
+                            "completed_pages": completed_count,
+                            "total_pages": total_pages,
                             "last_successful_page": completed_count,
+                            "active_workers": telemetry["active_workers"],
+                            "recent_events": telemetry["recent_events"],
+                            "keys_summary": {
+                                "primary_active": telemetry["primary_active"],
+                                "primary_cooldown": telemetry["primary_cooldown"],
+                                "primary_disabled": telemetry["primary_disabled"],
+                                "backup_active": telemetry["backup_active"]
+                            },
                             "updatedAt": firestore.SERVER_TIMESTAMP
                         }, merge=True)
             
@@ -1320,34 +1408,24 @@ def search_products():
                 except Exception as e:
                     print(f"Error consultando Firestore para {title}: {e}")
 
-            # 3. Verificar si el catálogo ya fue memorizado previamente
+            # 3. Verificar si el catálogo ya fue memorizado al 100%
             is_completed = False
             if firebase_db:
                 try:
                     status_doc = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status").document(cat_hash).get()
-                    if status_doc.exists and status_doc.to_dict().get('status') == 'completed':
-                        is_completed = True
+                    if status_doc.exists:
+                        s_data = status_doc.to_dict()
+                        if s_data.get('status') == 'completed' and s_data.get('progress', 0) >= 100:
+                            is_completed = True
                 except Exception:
                     pass
-
-            # REGLA DE ORO: Si ya tiene productos guardados (ej: L'BEL con 138 productos),
-            # significa que ya fue leída y auditada. ¡JAMÁS volver a leerla!
-            if prods and len(prods) >= 30:
-                is_completed = True
 
             if prods:
                 combined_items.extend(prods)
 
-            # Solo se agrega a missing_catalogs si es NUEVA (0 productos) o si está en estado 'processing' activo
-            if not prods or len(prods) == 0:
+            # Si NO está completado al 100%, se agrega para procesar o reanudar páginas pendientes
+            if not is_completed:
                 missing_catalogs.append(cat)
-            elif not is_completed:
-                try:
-                    s_snap = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status").document(cat_hash).get()
-                    if s_snap.exists and s_snap.to_dict().get('status') == 'processing':
-                        missing_catalogs.append(cat)
-                except Exception:
-                    pass
 
         # Si se solicitó sincronización forzada ("ignorar") desde el panel de admin
         if query == "ignorar":
