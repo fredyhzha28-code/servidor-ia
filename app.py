@@ -236,22 +236,38 @@ def extract_retry_delay(error_str, default=20):
         pass
     return default
 
-def call_gemini_with_key_manager(prompt, files=None, max_retries=30, model_name='gemini-3.6-flash', json_mode=True):
-    for attempt in range(max_retries):
+gemini_dispatch_lock = threading.Lock()
+last_gemini_dispatch_time = 0.0
+
+def wait_for_gemini_slot(min_interval=2.0):
+    global last_gemini_dispatch_time
+    with gemini_dispatch_lock:
+        now = time.time()
+        elapsed = now - last_gemini_dispatch_time
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        last_gemini_dispatch_time = time.time()
+
+def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name='gemini-3.6-flash', json_mode=True):
+    actual_attempts = 0
+    while actual_attempts < max_retries:
         idx, client_or_wait = key_manager.get_client()
         if idx is None:
             wait_time = min(max(1.0, client_or_wait + 0.5), 15.0)
             print(f"[Gemini] Todas las llaves en cooldown temporal. Esperando {wait_time:.1f}s al próximo turno...")
             time.sleep(wait_time)
+            # Esperar por cooldown NO es un fallo de llamada
             continue
             
         client = client_or_wait
         uploaded_files = []
         try:
+            # Control de ritmo global para evitar ráfagas simultáneas que saturen la cuota de Google
+            wait_for_gemini_slot(2.0)
             print(f"[Gemini] Intentando con Key {idx+1}...")
+            
             contents = []
             if files:
-                # Upload files to this specific client
                 for fpath in files:
                     gf = client.files.upload(file=fpath)
                     uploaded_files.append(gf)
@@ -273,18 +289,19 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=30, model_name=
             raise Exception("Respuesta vacía de Gemini")
             
         except Exception as e:
+            actual_attempts += 1
             error_str = str(e)
             print(f"[Gemini] Error con Key {idx+1}: {error_str[:160]}...")
             if "429" in error_str or "503" in error_str or "quota" in error_str.lower() or "resource_exhausted" in error_str.lower():
                 delay = extract_retry_delay(error_str, default=20)
                 cd = max(5, min(delay + 1, 45))
                 key_manager.mark_cooldown(idx, cd)
+                time.sleep(1.5) # Pausa preventiva antes de que este hilo intente la siguiente llave
             elif "401" in error_str or "403" in error_str or "400" in error_str or "404" in error_str:
                 key_manager.mark_cooldown(idx, 86400) # Invalid key, cooldown for a day
             else:
-                # Other errors, short wait and try next key
                 key_manager.mark_cooldown(idx, 5)
-                time.sleep(1)
+                time.sleep(1.0)
         finally:
             for gf in uploaded_files:
                 try:
@@ -292,7 +309,7 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=30, model_name=
                 except Exception:
                     pass
                 
-    raise Exception(f"Gemini no pudo responder tras {max_retries} intentos distribuidos en todas las llaves.")
+    raise Exception(f"Gemini falló tras {max_retries} intentos reales.")
 
 def clean_product_name(raw_name):
     if not raw_name:
@@ -840,17 +857,39 @@ def process_single_catalog(idx, cat):
             return
             
     # 1. Recuperar estado de procesamiento
+    doc_snap = None
     if status_collection:
         doc_snap = status_collection.document(cat_hash).get()
         if doc_snap.exists:
             data = doc_snap.to_dict()
             if data.get('status') == 'completed':
-                print(f"Catálogo {title} ya estaba procesado completamente al 100%.")
+                print(f"Catálogo {title} ya estaba procesado completamente al 100%. Abortando re-lectura.")
                 return
-        else:
-            status_collection.document(cat_hash).set({
-                "status": "processing", "title": title, "message": "Descargando PDF...", "progress": 1, "last_successful_page": 0, "updatedAt": firestore.SERVER_TIMESTAMP
-            })
+                
+    # Verificación de seguridad ABSOLUTA: Si ya existen productos guardados (ej: L'BEL con 138 productos)
+    # y no está en estado explícito 'processing', marcarlo como completed y jamás volver a leerlo.
+    if firebase_db:
+        products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+        existing_docs = list(products_col.where("catalogo_hash", "==", cat_hash).limit(60).stream())
+        if not existing_docs:
+            existing_docs = list(products_col.where("catalogo", "==", title).limit(60).stream())
+        if len(existing_docs) >= 50:
+            if not doc_snap or not doc_snap.exists or doc_snap.to_dict().get('status') != 'processing':
+                print(f"[{title}] Ya tiene {len(existing_docs)}+ productos guardados. Está completamente finalizado. Saltando.")
+                if status_collection:
+                    status_collection.document(cat_hash).set({
+                        "status": "completed",
+                        "title": title,
+                        "message": "¡Revista memorizada con éxito!",
+                        "progress": 100,
+                        "updatedAt": firestore.SERVER_TIMESTAMP
+                    }, merge=True)
+                return
+
+    if status_collection and (not doc_snap or not doc_snap.exists):
+        status_collection.document(cat_hash).set({
+            "status": "processing", "title": title, "message": "Descargando PDF...", "progress": 1, "last_successful_page": 0, "updatedAt": firestore.SERVER_TIMESTAMP
+        })
 
     # 2. Bajar PDF a archivo temporal
     try:
@@ -873,11 +912,11 @@ def process_single_catalog(idx, cat):
         with fitz.open(tmp_path) as doc_info:
             total_pages = len(doc_info)
             
-        # Con 20 API keys activas ejecutamos hasta 10 páginas simultáneas a máxima velocidad
-        # La memoria RAM de Render (512MB) se mantiene 100% segura (<180MB) porque el renderizado PDF está serializado por pdf_render_lock
+        # 3 trabajadores concurrentes sincronizados con el despachador de 2.0s
+        # Garantiza saturación máxima de velocidad sin colisionar jamás en el límite de cuota de Google
         num_keys = len(key_manager.clients)
-        max_workers = min(max(num_keys // 2, 4), 10)
-        print(f"[{title}] ¡Extracción acelerada activada! Procesando {max_workers} páginas simultáneas con {num_keys} API keys para {total_pages} páginas...")
+        max_workers = 3
+        print(f"[{title}] Extracción continua a máxima velocidad: {max_workers} trabajadores con rotación de {num_keys} API keys para {total_pages} páginas...")
         
         # Recuperar qué páginas ya fueron procesadas y guardadas previamente en Firebase
         already_processed_pages = set()
@@ -1081,7 +1120,7 @@ def search_products():
                 except Exception as e:
                     print(f"Error consultando Firestore para {title}: {e}")
 
-            # 3. Verificar si el catálogo fue completado al 100%
+            # 3. Verificar si el catálogo ya fue memorizado previamente
             is_completed = False
             if firebase_db:
                 try:
@@ -1091,12 +1130,24 @@ def search_products():
                 except Exception:
                     pass
 
+            # REGLA DE ORO: Si ya tiene productos guardados (ej: L'BEL con 138 productos),
+            # significa que ya fue leída y auditada. ¡JAMÁS volver a leerla!
+            if prods and len(prods) >= 30:
+                is_completed = True
+
             if prods:
                 combined_items.extend(prods)
 
-            # Si no tiene productos O aún no está completado al 100%, debe incluirse para finalizarlo
-            if not prods or not is_completed:
+            # Solo se agrega a missing_catalogs si es NUEVA (0 productos) o si está en estado 'processing' activo
+            if not prods or len(prods) == 0:
                 missing_catalogs.append(cat)
+            elif not is_completed:
+                try:
+                    s_snap = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status").document(cat_hash).get()
+                    if s_snap.exists and s_snap.to_dict().get('status') == 'processing':
+                        missing_catalogs.append(cat)
+                except Exception:
+                    pass
 
         # Si se solicitó sincronización forzada ("ignorar") desde el panel de admin
         if query == "ignorar":
