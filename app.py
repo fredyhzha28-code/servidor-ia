@@ -116,23 +116,26 @@ class GeminiKeyManager:
     def get_client(self):
         with self.lock:
             now = time.time()
+            if not self.clients:
+                return None, 60.0
             for _ in range(len(self.clients)):
                 idx = self.current_idx
                 self.current_idx = (self.current_idx + 1) % len(self.clients)
                 
                 # Check if it's available or if cooldown has expired
-                if self.status[idx]['available'] or now > self.status[idx]['cooldown_until']:
+                if self.status[idx]['available'] or now >= self.status[idx]['cooldown_until']:
                     self.status[idx]['available'] = True
                     return idx, self.clients[idx]
             
-            # If all are on cooldown, return None
-            return None, None
+            # If all are on cooldown, calculate exact minimum wait time needed
+            min_wait = min(max(0.5, self.status[i]['cooldown_until'] - now) for i in range(len(self.clients)))
+            return None, min_wait
 
-    def mark_cooldown(self, idx, seconds=60):
+    def mark_cooldown(self, idx, seconds=20):
         with self.lock:
             self.status[idx]['available'] = False
             self.status[idx]['cooldown_until'] = time.time() + seconds
-            print(f"[KeyManager] Key {idx+1} marcada en cooldown por {seconds}s.")
+            print(f"[KeyManager] Key {idx+1} en espera por {int(seconds)}s.")
 
 key_manager = GeminiKeyManager(valid_keys)
 
@@ -207,14 +210,30 @@ def local_search_in_json(query, products_data):
 # CORE PIPELINE
 # =====================================================================
 
-def call_gemini_with_key_manager(prompt, files=None, max_retries=10, model_name='gemini-3.6-flash', json_mode=True):
+def extract_retry_delay(error_str, default=20):
+    try:
+        # Extraer retraso si Google envía retryDelay: '39s' o 39
+        m = re.search(r"['\"]?retryDelay['\"]?\s*:\s*['\"]?(\d+)", error_str)
+        if m:
+            return int(m.group(1))
+        # Extraer si Google envía "Please retry in 40.311s"
+        m = re.search(r"retry in (\d+(?:\.\d+)?)s", error_str, re.IGNORECASE)
+        if m:
+            return int(float(m.group(1))) + 1
+    except Exception:
+        pass
+    return default
+
+def call_gemini_with_key_manager(prompt, files=None, max_retries=30, model_name='gemini-3.6-flash', json_mode=True):
     for attempt in range(max_retries):
-        idx, client = key_manager.get_client()
-        if client is None:
-            print("[Gemini] Todas las llaves en cooldown. Esperando 30s...")
-            time.sleep(30)
+        idx, client_or_wait = key_manager.get_client()
+        if idx is None:
+            wait_time = min(max(1.0, client_or_wait + 0.5), 15.0)
+            print(f"[Gemini] Todas las llaves en cooldown temporal. Esperando {wait_time:.1f}s al próximo turno...")
+            time.sleep(wait_time)
             continue
             
+        client = client_or_wait
         try:
             print(f"[Gemini] Intentando con Key {idx+1}...")
             contents = []
@@ -243,16 +262,19 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=10, model_name=
             
         except Exception as e:
             error_str = str(e)
-            print(f"[Gemini] Error con Key {idx+1}: {error_str}")
-            if "429" in error_str or "503" in error_str or "quota" in error_str.lower():
-                key_manager.mark_cooldown(idx, 60)
+            print(f"[Gemini] Error con Key {idx+1}: {error_str[:160]}...")
+            if "429" in error_str or "503" in error_str or "quota" in error_str.lower() or "resource_exhausted" in error_str.lower():
+                delay = extract_retry_delay(error_str, default=20)
+                cd = max(5, min(delay + 1, 45))
+                key_manager.mark_cooldown(idx, cd)
             elif "401" in error_str or "403" in error_str or "400" in error_str or "404" in error_str:
                 key_manager.mark_cooldown(idx, 86400) # Invalid key, cooldown for a day
             else:
-                # Other errors, just retry with another key
-                time.sleep(2)
+                # Other errors, short wait and try next key
+                key_manager.mark_cooldown(idx, 5)
+                time.sleep(1)
                 
-    raise Exception(f"Gemini falló tras {max_retries} intentos en todas las llaves.")
+    raise Exception(f"Gemini no pudo responder tras {max_retries} intentos distribuidos en todas las llaves.")
 
 def clean_product_name(raw_name):
     if not raw_name:
@@ -780,36 +802,33 @@ def process_single_catalog(idx, cat):
     status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status") if firebase_db else None
     catalogs_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("catalogs") if firebase_db else None
     
-    # 0. Verificación ABSOLUTA de que el catálogo existe en la base de datos
+    # 0. Verificación de que el catálogo existe en la base de datos
     if catalogs_collection:
         clean_url = url.split('?')[0]
         all_cats = catalogs_collection.get()
         exists_in_db = False
         for c in all_cats:
             c_data = c.to_dict()
-            db_url = c_data.get('pdfUrl', '').split('?')[0]
-            if db_url == clean_url:
+            db_url = (c_data.get('pdfUrl') or c_data.get('url') or '').split('?')[0]
+            if db_url == clean_url or (c_data.get('title') and c_data.get('title').strip() == title.strip()):
                 exists_in_db = True
                 break
                 
         if not exists_in_db:
-            print(f"[{title}] CATÁLOGO FANTASMA DETECTADO (No existe en Firebase 'catalogs'). Abortando.")
+            print(f"[{title}] Catálogo no encontrado en Firebase 'catalogs'. Abortando.")
             if status_collection:
                 try: status_collection.document(cat_hash).delete()
                 except: pass
             return
             
     # 1. Recuperar estado de procesamiento
-    last_successful_page = 0
     if status_collection:
         doc_snap = status_collection.document(cat_hash).get()
         if doc_snap.exists:
             data = doc_snap.to_dict()
             if data.get('status') == 'completed':
-                print(f"Catálogo {title} ya estaba procesado completamente.")
+                print(f"Catálogo {title} ya estaba procesado completamente al 100%.")
                 return
-            last_successful_page = data.get('last_successful_page', 0)
-            print(f"Retomando {title} desde la página {last_successful_page + 1}")
         else:
             status_collection.document(cat_hash).set({
                 "status": "processing", "title": title, "message": "Descargando PDF...", "progress": 1, "last_successful_page": 0, "updatedAt": firestore.SERVER_TIMESTAMP
@@ -831,36 +850,63 @@ def process_single_catalog(idx, cat):
         if status_collection: status_collection.document(cat_hash).update({"message": "Error de conexión", "status": "error"})
         return
         
-    # 3. Procesar páginas en paralelo con rotación de API Keys (Ultra-rápido y seguro para 512MB RAM)
+    # 3. Procesar páginas con concurrencia controlada y protección de cuotas/memoria
     try:
         with fitz.open(tmp_path) as doc_info:
             total_pages = len(doc_info)
             
-        # Determinar número óptimo de workers concurrentes (entre 2 y 4 para respetar los 512MB de Render)
-        num_keys = len(key_manager.clients)
-        max_workers = min(max(num_keys, 2), 4)
-        print(f"[{title}] Iniciando extracción acelerada en paralelo con {max_workers} trabajadores ({num_keys} API keys disponibles) para {total_pages} páginas...")
+        # Concurrencia de 2 trabajadores (óptimo para Render 512MB RAM y cuotas de Gemini)
+        max_workers = 2
+        print(f"[{title}] Iniciando extracción segura con {max_workers} trabajadores para {total_pages} páginas...")
         
-        pages_to_process = list(range(last_successful_page + 1, total_pages + 1))
+        # Recuperar qué páginas ya fueron procesadas y guardadas previamente en Firebase
+        already_processed_pages = set()
+        if firebase_db:
+            try:
+                products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+                existing_docs = products_col.where("catalogo_hash", "==", cat_hash).stream()
+                for ep in existing_docs:
+                    p_val = ep.to_dict().get("pagina")
+                    if p_val and str(p_val).isdigit():
+                        already_processed_pages.add(int(p_val))
+            except Exception as e:
+                print(f"Aviso consultando páginas ya procesadas: {e}")
+                
+        pages_to_process = [p for p in range(1, total_pages + 1) if p not in already_processed_pages]
+        completed_count = len(already_processed_pages)
+        print(f"[{title}] Páginas previamente guardadas: {completed_count}/{total_pages}. Pendientes: {len(pages_to_process)}")
         
         if not pages_to_process:
-            print(f"[{title}] Todas las páginas ya estaban procesadas.")
+            print(f"[{title}] Todas las páginas ({total_pages}) ya estaban procesadas.")
         else:
             progress_lock = threading.Lock()
-            completed_count = last_successful_page
             stop_event = threading.Event()
+            
+            # Registrar estado inicial reflejando páginas ya recuperadas
+            if status_collection:
+                pct = int((completed_count / total_pages) * 100) if total_pages > 0 else 0
+                status_collection.document(cat_hash).set({
+                    "status": "processing",
+                    "title": title,
+                    "message": f"Memorizando con IA: {completed_count}/{total_pages} páginas ({pct}%)...",
+                    "progress": pct,
+                    "last_successful_page": completed_count,
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                }, merge=True)
             
             def run_page_worker(p_num):
                 if stop_event.is_set():
                     return
                 # Chequear si el catálogo fue eliminado por el usuario
-                if status_collection and p_num % 4 == 0:
+                if status_collection and p_num % 5 == 0:
                     if not status_collection.document(cat_hash).get().exists:
-                        print(f"Catálogo {title} eliminado por el usuario. Deteniendo hilos.")
+                        print(f"Catálogo {title} eliminado por el usuario. Deteniendo.")
                         stop_event.set()
                         return
                         
                 try:
+                    # Pausa de cortesía para espaciar las llamadas a Gemini y evitar picos de 429
+                    time.sleep(1.2)
                     process_single_page(tmp_path, p_num, cat, total_pages)
                     
                     with progress_lock:
@@ -885,11 +931,12 @@ def process_single_catalog(idx, cat):
                     try:
                         f.result()
                     except Exception as err:
-                        print(f"Error procesando lote de páginas: {err}")
+                        print(f"Error en hilo de procesamiento de páginas: {err}")
                         
         # 4. Finalizado exitosamente
         if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+            try: os.remove(tmp_path)
+            except: pass
             
         if status_collection and not stop_event.is_set():
             status_collection.document(cat_hash).set({
@@ -909,12 +956,36 @@ def process_single_catalog(idx, cat):
             try: os.remove(tmp_path)
             except: pass
 
+active_processing_hashes = set()
+active_processing_lock = threading.Lock()
+
 def background_extract_and_save(missing_catalogs):
-    print(f"Iniciando extracción en segundo plano para {len(missing_catalogs)} revistas nuevas...")
-    # Empezar a procesar de forma completamente secuencial
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        for idx, cat in enumerate(missing_catalogs):
-            executor.submit(process_single_catalog, idx, cat)
+    global active_processing_hashes
+    catalogs_to_run = []
+    with active_processing_lock:
+        for cat in missing_catalogs:
+            url = cat.get('url', '')
+            title = cat.get('title', 'Revista')
+            h = get_single_catalog_hash(url, title)
+            if h not in active_processing_hashes:
+                active_processing_hashes.add(h)
+                catalogs_to_run.append(cat)
+            else:
+                print(f"[{title}] Ya se encuentra procesándose en segundo plano actualmente.")
+                
+    if not catalogs_to_run:
+        return
+        
+    print(f"Iniciando extracción en segundo plano para {len(catalogs_to_run)} catálogo(s)...")
+    for idx, cat in enumerate(catalogs_to_run):
+        url = cat.get('url', '')
+        title = cat.get('title', 'Revista')
+        cat_h = get_single_catalog_hash(url, title)
+        try:
+            process_single_catalog(idx, cat)
+        finally:
+            with active_processing_lock:
+                active_processing_hashes.discard(cat_h)
 
 @app.route('/api/search', methods=['POST'])
 def search_products():
@@ -990,21 +1061,33 @@ def search_products():
                 except Exception as e:
                     print(f"Error consultando Firestore para {title}: {e}")
 
+            # 3. Verificar si el catálogo fue completado al 100%
+            is_completed = False
+            if firebase_db:
+                try:
+                    status_doc = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status").document(cat_hash).get()
+                    if status_doc.exists and status_doc.to_dict().get('status') == 'completed':
+                        is_completed = True
+                except Exception:
+                    pass
+
             if prods:
                 combined_items.extend(prods)
-            else:
+
+            # Si no tiene productos O aún no está completado al 100%, debe incluirse para finalizarlo
+            if not prods or not is_completed:
                 missing_catalogs.append(cat)
 
         # Si se solicitó sincronización forzada ("ignorar") desde el panel de admin
         if query == "ignorar":
             if missing_catalogs:
-                thread = threading.Thread(target=background_extract_and_save, args=(missing_catalogs,))
+                thread = threading.Thread(target=background_extract_and_save, args=(missing_catalogs,), daemon=True)
                 thread.start()
             return jsonify({"response": "Proceso de sincronización iniciado."})
 
         # Si no hay productos en caché todavía y faltan catálogos por procesar
         if missing_catalogs and not combined_items:
-            thread = threading.Thread(target=background_extract_and_save, args=(missing_catalogs,))
+            thread = threading.Thread(target=background_extract_and_save, args=(missing_catalogs,), daemon=True)
             thread.start()
             return jsonify({
                 "response": "¡Hola! Estoy memorizando nuestras revistas por primera vez en la nube. 🚀<br><br>"
@@ -1019,7 +1102,7 @@ def search_products():
 
         # Si faltaban algunos pero otros ya están listos, arrancar worker para los faltantes en background
         if missing_catalogs:
-            thread = threading.Thread(target=background_extract_and_save, args=(missing_catalogs,))
+            thread = threading.Thread(target=background_extract_and_save, args=(missing_catalogs,), daemon=True)
             thread.start()
 
         # Preparar contexto para la IA Asesora
