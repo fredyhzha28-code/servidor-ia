@@ -845,7 +845,15 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     prompt = f"""
     Analiza con máxima atención esta página del catálogo de moda/belleza "{title}" (Página {page_num}).
     
-    Tu objetivo es extraer con precisión TODOS los productos reales a la venta, distinguiendo variantes y calculando precios unitarios:
+    Tu objetivo es extraer con precisión ÚNICAMENTE los productos reales a la venta, distinguiendo variantes, detectando promociones y calculando precios unitarios:
+
+    0. REGLA DE ORO: EXCLUSIÓN DE PORTADAS Y FOTOS EDITORIALES/PUBLICITARIAS SIN PRODUCTO A LA VENTA:
+       - ¡ATENCIÓN MÁXIMA!: Si esta página es la PORTADA de la revista (ej: logo de Cyzone o L'Bel grande), o es una FOTO PUBLICITARIA EDITORIAL (ej: modelo mirando a la cámara o sosteniendo un frasco con un eslogan de portada como "TU ESTILO ES TODO", "HAZLO TUYO", "SEDUCE CON NOTAS...") Y NO TIENE CÓDIGO NUMÉRICO DE 5 DÍGITOS (Cód. XXXXX) NI PRECIO EN PESOS ($XX.XXX):
+         ¡NO ES UN PRODUCTO A LA VENTA EN ESTA PÁGINA!
+         DEBES RETORNAR UNA LISTA VACÍA: []
+       - CONDICIÓN ESTRICTA PARA CONSIDERAR QUE HAY UN PRODUCTO:
+         El producto DEBE TENER UN CÓDIGO EXPLÍCITO (ej: "Cód. 35356", "Cod. 09327", o 5 dígitos numéricos impresos al lado del artículo) O UN PRECIO VISIBLE ($XX.XXX).
+         Si un frasco, accesorio o ropa en la foto NO tiene código de 5 dígitos NI precio: ¡ES SOLO PUBLICIDAD O DECORACIÓN! NO LO EXTRAIGAS. Devuelve [].
 
     1. CÁLCULO DE PRECIO POR MILILITRO O GRAMO (MUY IMPORTANTE):
        - En catálogos de perfumería y cosmética (L'Bel, Esika, Cyzone, etc.), a veces el precio total no está en letras gigantes, pero la ficha del producto indica el contenido y el precio por mililitro o gramo.
@@ -863,12 +871,30 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     2. PRODUCTOS SIN PRECIO PERO CON CÓDIGO (CÓD. / COD.):
        - En algunas páginas promocionales de fragancias, maquillaje o cremas (ejemplo: "DESTINÉ FRAGRANCE MIST: BUDAPEST CITRUS PUNCH Cód. 09583", "VIENNA FRUITY PEACH Cód. 09582", "ROMA ROUGE BERRIES Cód. 12291"):
          * Los productos NO tienen precio directo ni precio por ml impreso en esa página.
-         * CONDICIÓN ESTRICTA: SI TIENEN UN CÓDIGO ASIGNADO (ej: 'Cód. 09583', 'Cód. 03623', 'Cod. 12291'), DEBES EXTRAER EL PRODUCTO.
+         * CONDICIÓN ESTRICTA: SI TIENEN UN CÓDIGO NUMÉRICO DE 5 DÍGITOS ASIGNADO (ej: 'Cód. 09583', 'Cód. 03623', 'Cod. 12291'), DEBES EXTRAER EL PRODUCTO.
          * En "precio", pon exactamente: "Confirmar con Erika".
          * En "descripcion_corta", incluye obligatoriamente el código (ej: "Cód. 09583") y sus notas olfativas o características (ej: "Cód. 09583. Familia Cítrica. Brillantes acentos cítricos combinados con notas de toronja").
-       - ¡REGLA DE EXCLUSIÓN!: Si un elemento o texto decorativo NO tiene precio NI TIENE CÓDIGO (Cód. o Cod.), NO LO EXTRAIGAS. Solo se extraen productos que tengan precio O tengan código asignado.
+       - ¡REGLA DE EXCLUSIÓN!: Si un elemento o texto decorativo NO tiene precio NI TIENE CÓDIGO DE 5 DÍGITOS, NO LO EXTRAIGAS. Devuelve lista vacía si no hay productos válidos.
 
-    3. PROMOCIONES "A SOLO $ XX.XXX c/u" O "CUALQUIERA POR..." (PRECIO COMPARTIDO PARA VARIAS VARIANTES):
+    3. PROMOCIONES CONDICIONALES ("PROMO!", "POR LA COMPRA DE...", "A SOLO $XX.XXX LLEVANDO..."):
+       - En catálogos a menudo hay promociones que dicen:
+         "PROMO! PARLANTE BEAT BOX: Por la compra del perfume Icon en venta individual y/o en set. A SOLO $49,990* cód. 35356"
+         y más abajo dice:
+         "Pídelo individualmente así: Parlante beat box cód. 35348 $120.000"
+       - Si un producto requiere comprar otro artículo o cumplir una condición para aplicar a ese precio especial:
+         * En "nombre", prefija obligatoriamente "[PROMO]" y aclara la condición: "[PROMO] Parlante Beat Box (Por compra de Perfume Icon)"
+         * En "precio": "$49.990"
+         * En "es_promo": true
+         * En "requisito_promo": "Por la compra del perfume Icon en venta individual y/o en set (Cód. 35356)"
+         * En "descripcion_corta": "Cód. 35356. PROMOCIÓN CONDICIONAL: Aplica por la compra del perfume Icon en venta individual y/o en set. Material: Plástico..."
+       - Si en la misma página ofrecen la versión individual ("Pídelo individualmente así..."):
+         * En "nombre": "Parlante Beat Box (Venta Individual)"
+         * En "precio": "$120.000"
+         * En "es_promo": false
+         * En "requisito_promo": ""
+         * En "descripcion_corta": "Cód. 35348. Venta individual sin condición. ..."
+
+    4. PROMOCIONES "A SOLO $ XX.XXX c/u" O "CUALQUIERA POR..." (PRECIO COMPARTIDO PARA VARIAS VARIANTES):
        - En catálogos de cosmética y cuidado personal, a menudo aparece un único precio promocional grande que dice "A SOLO $ 49,990 c/u" (donde 'c/u' significa 'cada uno').
        - ¡ESE PRECIO APLICA INDIVIDUALMENTE A CADA PRODUCTO O VARIANTE DE LA PÁGINA!
        - EJEMPLO REAL:
@@ -877,34 +903,33 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
          2) "L'Bel Body Expert Sérum Antiedad + Nutrición" (Cód. 06475) -> Precio: "$49.990"
          3) "L'Bel Body Expert Sérum Luminosidad + Antimanchas" (Cód. 06473) -> Precio: "$49.990"
        - DEBES EXTRAER LOS 3 PRODUCTOS POR SEPARADO:
-         * Cada variante tiene su propio código de referencia ('Cód. 06471', 'Cód. 06475', 'Cód. 06473') y activos diferentes (Colágeno, Ácido Hialurónico, Vitamina C).
+         * Cada variante tiene su propio código de referencia ('Cód. 06471', 'Cód. 06475', 'Cód. 06473') y activos diferentes.
          * A cada uno le asignas su nombre comercial descriptivo completo, su código en la descripción y el precio exacto "$49.990".
-       - Si en la página hay varios productos con código (ej: perfumes, labiales o cremas), extráelos TODOS individualmente.
 
-    4. CUÁNDO SÍ ES UN DUPLICADO (LO QUE DEBES EVITAR):
+    5. CUÁNDO SÍ ES UN DUPLICADO (LO QUE DEBES EVITAR):
        - Solo es un duplicado cuando para UN SOLO producto físico (ej: un solo vestido en la modelo), la página muestra un título genérico ("VESTIDO") y abajo un subtítulo descriptivo ("Vestido amplio en tejido plano...") con el mismo precio.
        - En ese caso de un solo producto físico: NO crees dos productos ("Vestido" y "Vestido amplio"). Extrae SOLAMENTE UNO con el nombre completo descriptivo ("Vestido amplio") y coloca el resto en "descripcion_corta".
        - JAMÁS crees productos clones o con nombres 100% idénticos.
 
-    5. LIMPIEZA DE NOMBRES Y VIÑETAS:
+    6. LIMPIEZA DE NOMBRES Y VIÑETAS:
        - Limpia viñetas como 'a.', 'b.', 'c.', '1.', '2.' al inicio del nombre.
-       - En "nombre", coloca el nombre específico y completo del producto (ej: "L'Bel Body Expert Sérum Firmeza + Reparación", "Extréme L'Bel Parfum Masculino", "Destiné Mist Budapest Citrus Punch").
+       - En "nombre", coloca el nombre específico y completo del producto (ej: "L'Bel Body Expert Sérum Firmeza + Reparación", "Extréme L'Bel Parfum Masculino", "[PROMO] Parlante Beat Box (Por compra de Perfume Icon)").
        - En "precio", incluye el precio calculado/visible con su signo de moneda (ej: "$49.990", "$124.990") o "Confirmar con Erika".
        - En "descripcion_corta", incluye el código ('Cód. XXXXX'), notas olfativas, activos, mililitros, tela, silueta o detalles.
 
-    6. TAXONOMÍA CANÓNICA ESTRICTA (NO INVENTAR NUEVAS SUBCATEGORÍAS NI SECCIONES):
+    7. TAXONOMÍA CANÓNICA ESTRICTA (NO INVENTAR NUEVAS SUBCATEGORÍAS NI SECCIONES):
        - "categoria": Exclusivamente una de: "Dama", "Caballero", "Niños", "Niñas", "Hogar", "General".
        - "seccion": Exclusivamente una de:
          * "Belleza y perfumería" (TODOS los perfumes, fragancias, cosméticos, cremas corporales, jabones, desodorantes, champús van bajo esta sección. ¡NUNCA crees "Cuidado personal" como sección, siempre va dentro de "Belleza y perfumería"!).
-         * "Accesorios" (¡MUY IMPORTANTE!: Bolsas, bolsos, carteras, correas, cinturones, aretes, collares, joyas, relojes, neceseres, cosmetiqueras y estuches van EXCLUSIVAMENTE en "Accesorios". ¡NUNCA los pongas en "Belleza y perfumería"!).
+         * "Accesorios" (¡MUY IMPORTANTE!: Bolsas, bolsos, carteras, correas, cinturones, aretes, collares, joyas, relojes, parlantes, neceseres, cosmetiqueras y estuches van EXCLUSIVAMENTE en "Accesorios". ¡NUNCA los pongas en "Belleza y perfumería"!).
          * "Ropa"
          * "Zapatos"
          * "Hogar"
          * "Varios"
        - "subcategoria":
-         * Para "Accesorios": "Varios" (bolsas, carteras, correas, aretes, collares, joyas, relojes, neceseres, cosmetiqueras, gafas, etc.).
+         * Para "Accesorios": "Varios" (bolsas, carteras, correas, aretes, collares, joyas, relojes, parlantes, neceseres, cosmetiqueras, gafas, etc.).
          * Para "Belleza y perfumería", usa ÚNICAMENTE una de estas subcategorías canónicas:
-           - "Perfumes y fragancias": Para TODO tipo de perfumes (masculinos, femeninos, unisex), fragancias, colonias, lociones, splash, mist y sets de perfumes. ¡NO crees "Perfumes masculinos" ni "Sets de perfumes", unifícalos TODOS en "Perfumes y fragancias"!
+           - "Perfumes y fragancias": Para TODO tipo de perfumes (masculinos, femeninos, unisex), fragancias, colonias, lociones, splash, mist y sets de perfumes.
            - "Maquillaje y cuidado personal": Para bases, correctores, labiales, pestañinas, sombras, polvos, cejas, cremas faciales/corporales, sérums, limpiadoras, champú, jabones, desodorantes y bloqueadores solares.
          * Para "Ropa": "Vestidos y faldas", "Camisas y blusas", "Pantalones y jeans", "Chaquetas y buzos", "Ropa interior y pijamas", "Prendas varias".
          * Para "Zapatos": "Sandalias", "Tacones", "Tenis y deportivos", "Botas y botines", "Calzado casual".
@@ -916,12 +941,14 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     Devuelve exclusivamente un JSON con la siguiente estructura (Array de objetos):
     [
       {{
-        "nombre": "Nombre descriptivo limpio (ej: Extréme L'Bel Parfum Masculino, Destiné Mist Budapest Citrus Punch)",
+        "nombre": "Nombre descriptivo limpio (ej: Extréme L'Bel Parfum Masculino, [PROMO] Parlante Beat Box)",
         "precio": "Precio con signo peso (ej: $124.990) o 'Confirmar con Erika'",
-        "descripcion_corta": "Cód. XXXXX. Notas olfativas, mililitros, subtítulo o detalles",
+        "descripcion_corta": "Cód. XXXXX. Notas olfativas, condición si es promo, o detalles",
         "categoria": "Categoría principal (Dama, Caballero, Niños, Niñas, Hogar)",
         "seccion": "Sección general (Belleza y perfumería, Ropa, Zapatos, Accesorios, Hogar, Varios)",
-        "subcategoria": "Subcategoría canónica (ej: Perfumes y fragancias, Cuidado personal, Maquillaje, Cuidado facial)",
+        "subcategoria": "Subcategoría canónica (ej: Perfumes y fragancias, Maquillaje y cuidado personal)",
+        "es_promo": false,
+        "requisito_promo": "",
         "catalogo": "{title}",
         "pagina": "{page_num}"
       }}
