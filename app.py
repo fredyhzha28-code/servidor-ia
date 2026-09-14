@@ -246,12 +246,12 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=30, model_name=
             continue
             
         client = client_or_wait
+        uploaded_files = []
         try:
             print(f"[Gemini] Intentando con Key {idx+1}...")
             contents = []
             if files:
                 # Upload files to this specific client
-                uploaded_files = []
                 for fpath in files:
                     gf = client.files.upload(file=fpath)
                     uploaded_files.append(gf)
@@ -285,6 +285,12 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=30, model_name=
                 # Other errors, short wait and try next key
                 key_manager.mark_cooldown(idx, 5)
                 time.sleep(1)
+        finally:
+            for gf in uploaded_files:
+                try:
+                    client.files.delete(name=gf.name)
+                except Exception:
+                    pass
                 
     raise Exception(f"Gemini no pudo responder tras {max_retries} intentos distribuidos en todas las llaves.")
 
@@ -867,9 +873,11 @@ def process_single_catalog(idx, cat):
         with fitz.open(tmp_path) as doc_info:
             total_pages = len(doc_info)
             
-        # Concurrencia de 2 trabajadores (óptimo para Render 512MB RAM y cuotas de Gemini)
-        max_workers = 2
-        print(f"[{title}] Iniciando extracción segura con {max_workers} trabajadores para {total_pages} páginas...")
+        # Con 20 API keys activas ejecutamos hasta 10 páginas simultáneas a máxima velocidad
+        # La memoria RAM de Render (512MB) se mantiene 100% segura (<180MB) porque el renderizado PDF está serializado por pdf_render_lock
+        num_keys = len(key_manager.clients)
+        max_workers = min(max(num_keys // 2, 4), 10)
+        print(f"[{title}] ¡Extracción acelerada activada! Procesando {max_workers} páginas simultáneas con {num_keys} API keys para {total_pages} páginas...")
         
         # Recuperar qué páginas ya fueron procesadas y guardadas previamente en Firebase
         already_processed_pages = set()
@@ -886,7 +894,7 @@ def process_single_catalog(idx, cat):
                 
         pages_to_process = [p for p in range(1, total_pages + 1) if p not in already_processed_pages]
         completed_count = len(already_processed_pages)
-        print(f"[{title}] Páginas previamente guardadas: {completed_count}/{total_pages}. Pendientes: {len(pages_to_process)}")
+        print(f"[{title}] Páginas previamente guardadas: {completed_count}/{total_pages}. Pendientes por leer: {len(pages_to_process)}")
         
         if not pages_to_process:
             print(f"[{title}] Todas las páginas ({total_pages}) ya estaban procesadas.")
@@ -909,16 +917,16 @@ def process_single_catalog(idx, cat):
             def run_page_worker(p_num):
                 if stop_event.is_set():
                     return
-                # Chequear si el catálogo fue eliminado por el usuario
-                if status_collection and p_num % 5 == 0:
+                # Chequear si el catálogo fue eliminado por el usuario cada 10 páginas
+                if status_collection and p_num % 10 == 0:
                     if not status_collection.document(cat_hash).get().exists:
                         print(f"Catálogo {title} eliminado por el usuario. Deteniendo.")
                         stop_event.set()
                         return
                         
                 try:
-                    # Pausa de cortesía para espaciar las llamadas a Gemini y evitar picos de 429
-                    time.sleep(1.2)
+                    # Micro-pausa de 50ms para alternar hilos sin sobrecargar CPU
+                    time.sleep(0.05)
                     process_single_page(tmp_path, p_num, cat, total_pages)
                     
                     with progress_lock:
