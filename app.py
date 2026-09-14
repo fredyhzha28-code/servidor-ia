@@ -39,8 +39,19 @@ s3_client = boto3.client(
     region_name='auto'
 )
 
+from werkzeug.exceptions import HTTPException
+
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+@app.route('/', methods=['GET', 'HEAD'])
+@app.route('/health', methods=['GET', 'HEAD'])
+def health_check():
+    return jsonify({
+        "status": "online",
+        "service": "tienda-catalogos-backend",
+        "keys_loaded": len(valid_keys)
+    }), 200
 
 @app.after_request
 def add_cors_headers(response):
@@ -51,6 +62,8 @@ def add_cors_headers(response):
 
 @app.errorhandler(Exception)
 def handle_exception(e):
+    if isinstance(e, HTTPException):
+        return jsonify({"error": e.description}), e.code
     print(f"[Unhandled Error] {e}")
     resp = jsonify({"error": str(e)})
     resp.headers['Access-Control-Allow-Origin'] = '*'
@@ -120,34 +133,49 @@ class GeminiKeyManager:
                     self.keys.append(key.strip())
                 except Exception as e:
                     print(f"Aviso creando cliente Gemini: {e}")
-        self.status = [{'available': True, 'cooldown_until': 0} for _ in self.clients]
+        self.status = [{'available': True, 'cooldown_until': 0, 'permanently_disabled': False} for _ in self.clients]
         self.current_idx = 0
         self.lock = threading.Lock()
         print(f"[KeyManager] Total de {len(self.clients)} API keys de Gemini cargadas y activas.")
+
+    def get_active_keys_count(self):
+        with self.lock:
+            return sum(1 for s in self.status if not s.get('permanently_disabled', False))
 
     def get_client(self):
         with self.lock:
             now = time.time()
             if not self.clients:
                 return None, 60.0
+            active_indices = [i for i in range(len(self.clients)) if not self.status[i].get('permanently_disabled', False)]
+            if not active_indices:
+                return None, 60.0
+
             for _ in range(len(self.clients)):
                 idx = self.current_idx
                 self.current_idx = (self.current_idx + 1) % len(self.clients)
                 
+                if self.status[idx].get('permanently_disabled', False):
+                    continue
+
                 # Check if it's available or if cooldown has expired
                 if self.status[idx]['available'] or now >= self.status[idx]['cooldown_until']:
                     self.status[idx]['available'] = True
                     return idx, self.clients[idx]
             
             # If all are on cooldown, calculate exact minimum wait time needed
-            min_wait = min(max(0.5, self.status[i]['cooldown_until'] - now) for i in range(len(self.clients)))
+            min_wait = min(max(0.5, self.status[i]['cooldown_until'] - now) for i in active_indices)
             return None, min_wait
 
-    def mark_cooldown(self, idx, seconds=20):
+    def mark_cooldown(self, idx, seconds=20, permanent=False):
         with self.lock:
             self.status[idx]['available'] = False
             self.status[idx]['cooldown_until'] = time.time() + seconds
-            print(f"[KeyManager] Key {idx+1} en espera por {int(seconds)}s.")
+            if permanent:
+                self.status[idx]['permanently_disabled'] = True
+                print(f"[KeyManager] Key {idx+1} DESHABILITADA PERMANENTEMENTE (401/403).")
+            else:
+                print(f"[KeyManager] Key {idx+1} en espera por {int(seconds)}s.")
 
 key_manager = GeminiKeyManager(valid_keys)
 
@@ -239,7 +267,7 @@ def extract_retry_delay(error_str, default=20):
 gemini_dispatch_lock = threading.Lock()
 last_gemini_dispatch_time = 0.0
 
-def wait_for_gemini_slot(min_interval=0.25):
+def wait_for_gemini_slot(min_interval=0.8):
     global last_gemini_dispatch_time
     with gemini_dispatch_lock:
         now = time.time()
@@ -262,8 +290,8 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
         client = client_or_wait
         uploaded_files = []
         try:
-            # Control de ritmo ágil para permitir llamadas fluidas en paralelo entre múltiples llaves
-            wait_for_gemini_slot(0.25)
+            # Control de ritmo seguro (0.8s): reparte ~75 llamadas/minuto entre las llaves sin agotar cuota de 15 RPM
+            wait_for_gemini_slot(0.8)
             print(f"[Gemini] Intentando con Key {idx+1}...")
             
             contents = []
@@ -310,8 +338,11 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
                 cd = max(5, min(delay + 1, 45))
                 key_manager.mark_cooldown(idx, cd)
                 time.sleep(1.5) # Pausa preventiva antes de que este hilo intente la siguiente llave
-            elif "401" in error_str or "403" in error_str or "400" in error_str or "404" in error_str:
-                key_manager.mark_cooldown(idx, 86400) # Invalid key, cooldown for a day
+            elif "401" in error_str or "403" in error_str:
+                # Llave deshabilitada o proyecto borrado en Google Cloud
+                key_manager.mark_cooldown(idx, 86400, permanent=True)
+            elif "400" in error_str or "404" in error_str:
+                key_manager.mark_cooldown(idx, 86400, permanent=True)
             else:
                 key_manager.mark_cooldown(idx, 5)
                 time.sleep(1.0)
@@ -925,11 +956,11 @@ def process_single_catalog(idx, cat):
         with fitz.open(tmp_path) as doc_info:
             total_pages = len(doc_info)
             
-        # 10 trabajadores concurrentes sincronizados con las 20 API keys
-        # Procesa hasta 10 páginas simultáneamente manteniendo la memoria RAM protegida
-        num_keys = len(key_manager.clients)
-        max_workers = min(10, max(4, num_keys // 2))
-        print(f"[{title}] Extracción continua a máxima velocidad: {max_workers} páginas simultáneas con rotación de {num_keys} API keys para {total_pages} páginas...")
+        # Trabajadores concurrentes adaptados a las llaves activas y saludables
+        # Evita saturar cuotas de Google y mantiene la RAM por debajo de 150MB
+        healthy_keys = key_manager.get_active_keys_count()
+        max_workers = min(6, max(3, healthy_keys // 2))
+        print(f"[{title}] Extracción continua y fluida: {max_workers} trabajadores en paralelo con {healthy_keys} API keys saludables para {total_pages} páginas...")
         
         # Recuperar qué páginas ya fueron procesadas y guardadas previamente en Firebase
         already_processed_pages = set()
