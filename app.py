@@ -47,10 +47,16 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 @app.route('/', methods=['GET', 'HEAD'])
 @app.route('/health', methods=['GET', 'HEAD'])
 def health_check():
+    active_count = 0
+    try:
+        if 'key_manager' in globals() and key_manager:
+            active_count = key_manager.get_total_active_count()
+    except Exception:
+        pass
     return jsonify({
         "status": "online",
         "service": "tienda-catalogos-backend",
-        "keys_loaded": len(valid_keys)
+        "keys_loaded": active_count
     }), 200
 
 @app.after_request
@@ -175,10 +181,11 @@ class GeminiKeyManager:
             return sum(1 for item in self.primary_items + self.backup_items if not item.permanently_disabled)
 
     def get_client(self):
+        sleep_needed = 0.0
         with self.lock:
             now = time.time()
             
-            # --- PRIORIDAD 1: Buscar entre las 5 Principales (Tier 1) ---
+            # --- PRIORIDAD 1: Buscar entre las Principales (Tier 1) ---
             # Cada llave principal tiene su propia cuenta de Google, cuota 100% independiente
             for _ in range(len(self.primary_items)):
                 item = self.primary_items[self.primary_idx]
@@ -188,12 +195,11 @@ class GeminiKeyManager:
                     continue
                 if now >= item.cooldown_until:
                     item.available = True
-                    # Espaciar llamadas sobre la MISMA llave a mínimo 1.2s
                     elapsed = now - item.last_used
-                    if elapsed < 1.2:
-                        time.sleep(1.2 - elapsed)
-                    item.last_used = time.time()
-                    return item.name, item.client, item
+                    if elapsed < 1.0:
+                        sleep_needed = 1.0 - elapsed
+                    item.last_used = now + sleep_needed
+                    return item.name, item.client, item, sleep_needed
 
             # --- PRIORIDAD 2: Si todas las principales están en espera, usar Respaldo (Tier 2) ---
             if now >= self.backup_group_cooldown_until and self.backup_items:
@@ -206,10 +212,10 @@ class GeminiKeyManager:
                     if now >= item.cooldown_until:
                         item.available = True
                         elapsed = now - item.last_used
-                        if elapsed < 2.5:
-                            time.sleep(2.5 - elapsed)
-                        item.last_used = time.time()
-                        return item.name, item.client, item
+                        if elapsed < 2.0:
+                            sleep_needed = 2.0 - elapsed
+                        item.last_used = now + sleep_needed
+                        return item.name, item.client, item, sleep_needed
 
             # Si todas están en espera, calcular el tiempo mínimo exacto
             waits = []
@@ -219,7 +225,7 @@ class GeminiKeyManager:
             if self.backup_items and self.backup_group_cooldown_until > now:
                 waits.append(max(0.5, self.backup_group_cooldown_until - now))
             min_wait = min(waits) if waits else 5.0
-            return None, min_wait, None
+            return None, min_wait, None, 0.0
 
     def mark_cooldown(self, item, seconds=20, permanent=False):
         with self.lock:
@@ -348,12 +354,15 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
     max_quota_cycles = 60
 
     while actual_attempts < max_retries and quota_cooldown_cycles < max_quota_cycles:
-        key_name, client, key_item = key_manager.get_client()
+        key_name, client, key_item, pre_sleep = key_manager.get_client()
         if key_name is None:
             wait_time = min(max(1.0, client + 0.5), 20.0)
             print(f"[Gemini] Esperando disponibilidad de llaves ({wait_time:.1f}s)...")
             time.sleep(wait_time)
             continue
+            
+        if pre_sleep > 0:
+            time.sleep(pre_sleep)
             
         uploaded_files = []
         try:
@@ -371,24 +380,30 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
             if json_mode:
                 config_dict['response_mime_type'] = "application/json"
                 
-            # Intentar primero con gemini-3.5-flash-lite, con fallback a gemini-3.5-flash
-            active_model = model_name
-            try:
-                response = client.models.generate_content(
-                    model=active_model, 
-                    contents=contents,
-                    config=types.GenerateContentConfig(**config_dict) if config_dict else None
-                )
-            except Exception as model_err:
-                if "404" in str(model_err) or "not found" in str(model_err).lower():
-                    active_model = 'gemini-3.5-flash'
+            # Intentar con gemini-3.5-flash-lite, con fallback automático a gemini-2.5-flash y gemini-2.0-flash ante 503/404
+            models_to_try = [model_name, 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
+            response = None
+            last_err = None
+            for m_candidate in models_to_try:
+                try:
                     response = client.models.generate_content(
-                        model=active_model, 
+                        model=m_candidate, 
                         contents=contents,
                         config=types.GenerateContentConfig(**config_dict) if config_dict else None
                     )
-                else:
-                    raise model_err
+                    if response and response.text:
+                        break
+                except Exception as model_err:
+                    last_err = model_err
+                    err_str_candidate = str(model_err).lower()
+                    if any(w in err_str_candidate for w in ["404", "not found", "503", "unavailable", "high demand", "capacity"]):
+                        print(f"[Gemini] Modelo {m_candidate} con alta demanda o no disponible. Alternando a siguiente modelo de respaldo...")
+                        continue
+                    else:
+                        raise model_err
+            
+            if response is None and last_err:
+                raise last_err
             
             if response and response.text:
                 return response.text
