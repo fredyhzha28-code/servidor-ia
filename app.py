@@ -73,30 +73,40 @@ def handle_exception(e):
 # =====================================================================
 # INITIALIZATION
 # =====================================================================
+# INITIALIZATION & MULTI-ACCOUNT API KEYS
+# =====================================================================
 
-raw_keys = []
-# Clave principal (con o sin índice 1)
+# 1. Cargar llaves PRIMARIAS (Tier 1: Cuentas y proyectos independientes 11 a 15 de Render)
+primary_keys_loaded = []
+for i in range(11, 16):
+    val = os.environ.get(f"GEMINI_API_KEY_{i}")
+    if val and val.strip() and val.strip() not in primary_keys_loaded:
+        primary_keys_loaded.append(val.strip())
+
+# Soporte si se configuraron en una sola variable separadas por coma
+multi_primary = os.environ.get("GEMINI_PRIMARY_KEYS", "")
+if multi_primary:
+    for pk in multi_primary.split(","):
+        if pk.strip() and pk.strip() not in primary_keys_loaded:
+            primary_keys_loaded.append(pk.strip())
+
+# 2. Cargar llaves de RESPALDO (Tier 2: 1 a 10 de cuenta compartida)
+backup_keys_loaded = []
 for main_var in ["GEMINI_API_KEY", "GEMINI_API_KEY_1"]:
     val = os.environ.get(main_var)
-    if val and val.strip():
-        raw_keys.append(val.strip())
+    if val and val.strip() and val.strip() not in primary_keys_loaded and val.strip() not in backup_keys_loaded:
+        backup_keys_loaded.append(val.strip())
 
-# Claves numeradas del 2 al 50
-for i in range(2, 51):
-    key = os.environ.get(f"GEMINI_API_KEY_{i}")
-    if key and key.strip():
-        raw_keys.append(key.strip())
+for i in range(2, 11):
+    val = os.environ.get(f"GEMINI_API_KEY_{i}")
+    if val and val.strip() and val.strip() not in primary_keys_loaded and val.strip() not in backup_keys_loaded:
+        backup_keys_loaded.append(val.strip())
 
-# Eliminar duplicados preservando orden
-seen = set()
-valid_keys = []
-for k in raw_keys:
-    if k not in seen:
-        seen.add(k)
-        valid_keys.append(k)
-
-if not valid_keys:
-    valid_keys = ["DUMMY_KEY"]
+# También cualquier otra key extra
+for i in range(16, 51):
+    val = os.environ.get(f"GEMINI_API_KEY_{i}")
+    if val and val.strip() and val.strip() not in primary_keys_loaded and val.strip() not in backup_keys_loaded:
+        backup_keys_loaded.append(val.strip())
 
 # Inicializar Firebase
 firebase_db = None
@@ -118,83 +128,116 @@ else:
 memory_knowledge_cache = {}  # Cache en memoria RAM: cat_hash -> list(products)
 
 # =====================================================================
-# GEMINI KEY MANAGER
+# GEMINI KEY MANAGER (TIER 1: MULTICUENTA + TIER 2: RESPALDO)
 # =====================================================================
 
-class GeminiKeyManager:
-    def __init__(self, keys):
-        self.keys = []
-        self.clients = []
-        for key in keys:
-            if key and key.strip() and key != "DUMMY_KEY":
-                try:
-                    client = genai.Client(api_key=key.strip())
-                    self.clients.append(client)
-                    self.keys.append(key.strip())
-                except Exception as e:
-                    print(f"Aviso creando cliente Gemini: {e}")
-        self.status = [{'available': True, 'cooldown_until': 0, 'permanently_disabled': False} for _ in self.clients]
-        self.current_idx = 0
-        self.global_cooldown_until = 0.0
-        self.lock = threading.Lock()
-        print(f"[KeyManager] Total de {len(self.clients)} API keys de Gemini cargadas y activas.")
+class KeyItem:
+    def __init__(self, key, tier, name):
+        self.key = key
+        self.tier = tier  # 1 = Principal (Cuenta independiente), 2 = Respaldo (Compartida)
+        self.name = name
+        self.client = None
+        try:
+            self.client = genai.Client(api_key=key.strip())
+        except Exception as e:
+            print(f"Aviso creando cliente Gemini para {name}: {e}")
+        self.available = True
+        self.cooldown_until = 0.0
+        self.permanently_disabled = (self.client is None)
+        self.last_used = 0.0
 
-    def get_active_keys_count(self):
+class GeminiKeyManager:
+    def __init__(self, primary_keys, backup_keys):
+        self.primary_items = []
+        for i, k in enumerate(primary_keys):
+            if k and k.strip():
+                self.primary_items.append(KeyItem(k.strip(), tier=1, name=f"Principal-{i+1} (Multicuenta)"))
+                
+        self.backup_items = []
+        for i, k in enumerate(backup_keys):
+            if k and k.strip():
+                self.backup_items.append(KeyItem(k.strip(), tier=2, name=f"Respaldo-{i+1}"))
+                
+        self.primary_idx = 0
+        self.backup_idx = 0
+        self.backup_group_cooldown_until = 0.0  # El grupo de respaldo comparte proyecto
+        self.lock = threading.Lock()
+        
+        print(f"[KeyManager] Cargadas {len(self.primary_items)} API keys PRINCIPALES (Cuentas y Proyectos Independientes).")
+        print(f"[KeyManager] Cargadas {len(self.backup_items)} API keys de RESPALDO (Tier 2).")
+
+    def get_active_primary_count(self):
         with self.lock:
-            return sum(1 for s in self.status if not s.get('permanently_disabled', False))
+            return sum(1 for item in self.primary_items if not item.permanently_disabled)
+
+    def get_total_active_count(self):
+        with self.lock:
+            return sum(1 for item in self.primary_items + self.backup_items if not item.permanently_disabled)
 
     def get_client(self):
         with self.lock:
             now = time.time()
-            if not self.clients:
-                return None, 60.0
-            active_indices = [i for i in range(len(self.clients)) if not self.status[i].get('permanently_disabled', False)]
-            if not active_indices:
-                return None, 60.0
-
-            # Si el proyecto entero está en cooldown global ordenado por Google (429)
-            if now < self.global_cooldown_until:
-                return None, self.global_cooldown_until - now
-
-            for _ in range(len(self.clients)):
-                idx = self.current_idx
-                self.current_idx = (self.current_idx + 1) % len(self.clients)
-                
-                if self.status[idx].get('permanently_disabled', False):
-                    continue
-
-                # Chequear si está disponible o si su cooldown ya expiró
-                if self.status[idx]['available'] or now >= self.status[idx]['cooldown_until']:
-                    self.status[idx]['available'] = True
-                    return idx, self.clients[idx]
             
-            # Si todas las llaves están en espera, calcular el tiempo mínimo exacto
-            min_wait = min(max(0.5, self.status[i]['cooldown_until'] - now) for i in active_indices)
-            return None, min_wait
+            # --- PRIORIDAD 1: Buscar entre las 5 Principales (Tier 1) ---
+            # Cada llave principal tiene su propia cuenta de Google, cuota 100% independiente
+            for _ in range(len(self.primary_items)):
+                item = self.primary_items[self.primary_idx]
+                self.primary_idx = (self.primary_idx + 1) % len(self.primary_items)
+                
+                if item.permanently_disabled:
+                    continue
+                if now >= item.cooldown_until:
+                    item.available = True
+                    # Espaciar llamadas sobre la MISMA llave a mínimo 1.2s
+                    elapsed = now - item.last_used
+                    if elapsed < 1.2:
+                        time.sleep(1.2 - elapsed)
+                    item.last_used = time.time()
+                    return item.name, item.client, item
 
-    def mark_cooldown(self, idx, seconds=20, permanent=False):
-        with self.lock:
-            self.status[idx]['available'] = False
-            self.status[idx]['cooldown_until'] = time.time() + seconds
-            if permanent:
-                self.status[idx]['permanently_disabled'] = True
-                print(f"[KeyManager] Key {idx+1} DESHABILITADA PERMANENTEMENTE (401/403).")
-            else:
-                print(f"[KeyManager] Key {idx+1} en espera por {int(seconds)}s.")
+            # --- PRIORIDAD 2: Si todas las principales están en espera, usar Respaldo (Tier 2) ---
+            if now >= self.backup_group_cooldown_until and self.backup_items:
+                for _ in range(len(self.backup_items)):
+                    item = self.backup_items[self.backup_idx]
+                    self.backup_idx = (self.backup_idx + 1) % len(self.backup_items)
+                    
+                    if item.permanently_disabled:
+                        continue
+                    if now >= item.cooldown_until:
+                        item.available = True
+                        elapsed = now - item.last_used
+                        if elapsed < 2.5:
+                            time.sleep(2.5 - elapsed)
+                        item.last_used = time.time()
+                        return item.name, item.client, item
 
-    def mark_global_cooldown(self, seconds=20, reason="cuota temporal"):
+            # Si todas están en espera, calcular el tiempo mínimo exacto
+            waits = []
+            for item in self.primary_items:
+                if not item.permanently_disabled:
+                    waits.append(max(0.5, item.cooldown_until - now))
+            if self.backup_items and self.backup_group_cooldown_until > now:
+                waits.append(max(0.5, self.backup_group_cooldown_until - now))
+            min_wait = min(waits) if waits else 5.0
+            return None, min_wait, None
+
+    def mark_cooldown(self, item, seconds=20, permanent=False):
         with self.lock:
             now = time.time()
-            target = now + seconds
-            if target > self.global_cooldown_until:
-                self.global_cooldown_until = target
-                for s in self.status:
-                    if not s.get('permanently_disabled', False):
-                        s['available'] = False
-                        s['cooldown_until'] = max(s['cooldown_until'], target)
-                print(f"[KeyManager] Pausa coordinada de Gemini por {int(seconds)}s ({reason}). Todos los trabajadores esperarán juntos.")
+            item.available = False
+            item.cooldown_until = now + seconds
+            if permanent:
+                item.permanently_disabled = True
+                print(f"[KeyManager] {item.name} DESHABILITADA PERMANENTEMENTE (401/403).")
+            else:
+                print(f"[KeyManager] {item.name} en espera por {int(seconds)}s.")
+                # Si es de respaldo (Tier 2), pausar el grupo de respaldo completo porque comparten cuenta
+                if item.tier == 2:
+                    self.backup_group_cooldown_until = max(self.backup_group_cooldown_until, now + seconds)
+                    print(f"[KeyManager] Grupo de Respaldo pausado por {int(seconds)}s.")
+                # Si es Tier 1 (Principal), ¡NO pausa a las otras principales porque son cuentas independientes!
 
-key_manager = GeminiKeyManager(valid_keys)
+key_manager = GeminiKeyManager(primary_keys_loaded, backup_keys_loaded)
 
 # =====================================================================
 # HELPER FUNCTIONS
@@ -302,23 +345,19 @@ def wait_for_gemini_slot(min_interval=3.2):
 def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name='gemini-3.5-flash-lite', json_mode=True):
     actual_attempts = 0
     quota_cooldown_cycles = 0
-    max_quota_cycles = 50  # Permite esperar suficientes ciclos de cuota sin descartar páginas jamás
+    max_quota_cycles = 60
 
     while actual_attempts < max_retries and quota_cooldown_cycles < max_quota_cycles:
-        idx, client_or_wait = key_manager.get_client()
-        if idx is None:
-            wait_time = min(max(1.5, client_or_wait + 0.5), 25.0)
-            print(f"[Gemini] Esperando cuota de Gemini ({wait_time:.1f}s)...")
+        key_name, client, key_item = key_manager.get_client()
+        if key_name is None:
+            wait_time = min(max(1.0, client + 0.5), 20.0)
+            print(f"[Gemini] Esperando disponibilidad de llaves ({wait_time:.1f}s)...")
             time.sleep(wait_time)
-            # Esperar por cooldown de cuota NO es un fallo de llamada
             continue
             
-        client = client_or_wait
         uploaded_files = []
         try:
-            # Despacho controlado (3.2s) para no exceder las 15 RPM compartidas de Google AI Studio
-            wait_for_gemini_slot(3.2)
-            print(f"[Gemini] Intentando con Key {idx+1}...")
+            print(f"[Gemini] Despachando con {key_name}...")
             
             contents = []
             if files:
@@ -357,26 +396,24 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
             
         except Exception as e:
             error_str = str(e)
-            print(f"[Gemini] Aviso con Key {idx+1}: {error_str[:160]}...")
+            print(f"[Gemini] Aviso con {key_name}: {error_str[:160]}...")
             
             if "429" in error_str or "503" in error_str or "quota" in error_str.lower() or "resource_exhausted" in error_str.lower():
                 quota_cooldown_cycles += 1
                 delay = extract_retry_delay(error_str, default=21)
                 cd = max(10, min(delay + 1, 45))
-                key_manager.mark_cooldown(idx, cd)
-                # Pausar a todos los trabajadores durante el tiempo requerido por Google
-                key_manager.mark_global_cooldown(cd, reason=f"429 cuota temporal ({cd}s)")
-                # ¡IMPORTANTE!: Un 429 no consume reintentos de la página
-                time.sleep(2.0)
+                key_manager.mark_cooldown(key_item, cd)
+                # Un 429 no consume reintentos de la página
+                time.sleep(1.0)
             elif "401" in error_str or "403" in error_str:
                 actual_attempts += 1
-                key_manager.mark_cooldown(idx, 86400, permanent=True)
+                key_manager.mark_cooldown(key_item, 86400, permanent=True)
             elif "400" in error_str or "404" in error_str:
                 actual_attempts += 1
-                key_manager.mark_cooldown(idx, 86400, permanent=True)
+                key_manager.mark_cooldown(key_item, 86400, permanent=True)
             else:
                 actual_attempts += 1
-                key_manager.mark_cooldown(idx, 5)
+                key_manager.mark_cooldown(key_item, 5)
                 time.sleep(1.5)
         finally:
             for gf in uploaded_files:
@@ -988,11 +1025,12 @@ def process_single_catalog(idx, cat):
         with fitz.open(tmp_path) as doc_info:
             total_pages = len(doc_info)
             
-        # Trabajadores concurrentes equilibrados (3 trabajadores con paso de 3.2s)
-        # Protege al 100% la memoria RAM (<150MB en Render) y no satura las 15 RPM de Gemini
-        healthy_keys = key_manager.get_active_keys_count()
-        max_workers = min(3, max(2, healthy_keys // 3))
-        print(f"[{title}] Extracción continua y fluida: {max_workers} trabajadores en paralelo con {healthy_keys} API keys saludables para {total_pages} páginas...")
+        # Trabajadores concurrentes de 5 en 5 (1 por cada cuenta principal independiente)
+        # Protege al 100% la memoria RAM (<180MB en Render sobre los 500MB) mediante pdf_render_lock
+        primary_count = key_manager.get_active_primary_count()
+        total_keys = key_manager.get_total_active_count()
+        max_workers = 5 if primary_count >= 5 else min(5, max(3, total_keys))
+        print(f"[{title}] Extracción ultra-rápida: {max_workers} trabajadores en paralelo (5 en 5) con {primary_count} API keys principales multicuenta para {total_pages} páginas...")
         
         # Recuperar exhaustivamente qué páginas ya fueron procesadas y guardadas previamente en Firebase
         already_processed_pages = set()
