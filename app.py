@@ -738,6 +738,268 @@ def deduplicate_and_merge_page_products(products):
         
     return merged_products
 
+def enhance_and_enforce_page_promos(products, page_text="", facing_text="", page_num="", title=""):
+    """
+    Analiza a fondo si en la página o en el pliego abierto existe una promoción destacada:
+    - 'PAGA 1 LLEVA 2' / 'PAGA UNO Y LLEVA 2' / '2X1' / 'LLEVA 2 POR...'
+    - '3X2' / 'LLEVA 3 POR...'
+    - 'SEGUNDO A MITAD DE PRECIO / 50% DSCTO EN 2DA UNIDAD'
+    Asegura que:
+    1. A todos los tonos/variantes de la oferta se les prefije el nombre con '[PAGA 1 LLEVA 2] ' (o '[PROMO 2X1] ').
+    2. Se marque 'es_promo = True' y 'requisito_promo'.
+    3. Si hay 2 o más variantes/tonos combinables, se cree automáticamente el producto Combo
+       para que el cliente pueda pedir la promoción y escoger sus 2 productos.
+    """
+    if not products:
+        return products
+    
+    combined_ocr = f"{page_text} {facing_text}".lower()
+    
+    # Detectar si hay patrón de "paga 1 lleva 2" o "2x1"
+    is_paga_1_lleva_2 = bool(
+        re.search(r'paga\s*(?:1|uno)\s*(?:y\s*)?lleva\s*(?:2|dos)', combined_ocr) or 
+        re.search(r'\b2\s*x\s*1\b', combined_ocr) or 
+        re.search(r'lleva\s*2\s*(?:a\s*solo|por)\b', combined_ocr)
+    )
+    is_3x2 = bool(
+        re.search(r'\b3\s*x\s*2\b', combined_ocr) or 
+        re.search(r'lleva\s*3\s*(?:a\s*solo|por)\b', combined_ocr) or 
+        re.search(r'paga\s*(?:2|dos)\s*(?:y\s*)?lleva\s*(?:3|tres)', combined_ocr)
+    )
+    is_second_50 = bool(
+        re.search(r'(?:segundo|2da?)\s*(?:unidad\s*)?(?:a\s*mitad|con\s*50%|al\s*50%)', combined_ocr)
+    )
+    
+    # También verificar si en los propios productos devueltos por Gemini viene la mención
+    prods_text = " ".join([f"{p.get('nombre', '')} {p.get('descripcion_corta', '')} {p.get('requisito_promo', '')}" for p in products]).lower()
+    if not is_paga_1_lleva_2 and (re.search(r'paga\s*(?:1|uno)\s*(?:y\s*)?lleva\s*(?:2|dos)', prods_text) or re.search(r'\b2\s*x\s*1\b', prods_text) or re.search(r'lleva\s*2\s*(?:a\s*solo|por)\b', prods_text)):
+        is_paga_1_lleva_2 = True
+    if not is_3x2 and (re.search(r'\b3\s*x\s*2\b', prods_text) or re.search(r'3\s*x\s*2', prods_text)):
+        is_3x2 = True
+
+    # Detectar promociones condicionales por rango de páginas (ej: "por la compra de rostro pág 47 a 59")
+    cross_page_match = re.search(r'por\s+la\s+compra\s+de.*?(?:p[aá]gina|p[aá]g\.?)\s*(\d+)\s*a\s*(?:la\s*)?(\d+)', combined_ocr)
+    if not cross_page_match:
+        cross_page_match = re.search(r'por\s+la\s+compra\s+de.*?(?:p[aá]gina|p[aá]g\.?)\s*(\d+)\s*a\s*(?:la\s*)?(\d+)', prods_text)
+    
+    if cross_page_match:
+        p_start = int(cross_page_match.group(1))
+        p_end = int(cross_page_match.group(2))
+        
+        for p in products:
+            p_desc = str(p.get('descripcion_corta', '')).lower()
+            p_nom = str(p.get('nombre', ''))
+            
+            if 'por la compra' in p_desc or 'por la compra' in p_nom.lower() or p.get('es_promo'):
+                clean_n = re.sub(r'\[.*?\]', '', p_nom).strip()
+                p['nombre'] = f"[PROMO] {clean_n} (Por compra Pág. {p_start} a {p_end})"
+                p['es_promo'] = True
+                p['requisito_promo'] = f"Por la compra de cualquier producto de la página {p_start} a la {p_end}"
+                p['promo_tipo'] = 'condicional_compra'
+                p['promo_pag_inicio'] = p_start
+                p['promo_pag_fin'] = p_end
+            elif any(other != p and re.sub(r'\[.*?\]', '', other.get('nombre', '')).strip() == re.sub(r'\[.*?\]', '', p_nom).strip() for other in products):
+                clean_n = re.sub(r'\(.*?\)', '', p_nom).strip()
+                p['nombre'] = f"{clean_n} (Venta Individual)"
+                p['es_promo'] = False
+
+    if not (is_paga_1_lleva_2 or is_3x2 or is_second_50):
+        return products
+
+    # Extraer el precio de la promoción
+    promo_price = None
+    price_match = re.search(r'(?:paga\s*(?:1|uno)\s*(?:y\s*)?lleva\s*(?:2|dos)|a\s*solo|por)\s*[\$\s]*([0-9]{1,3}(?:[\.\,][0-9]{3})+)', combined_ocr)
+    if price_match:
+        promo_price = f"${price_match.group(1).replace(',', '.')}"
+    else:
+        prices = [p.get('precio', '') for p in products if re.search(r'\d', str(p.get('precio', ''))) and 'confirmar' not in str(p.get('precio', '')).lower()]
+        if prices:
+            promo_price = prices[0]
+
+    promo_tag = "[PAGA 1 LLEVA 2]" if is_paga_1_lleva_2 else ("[PROMO 3X2]" if is_3x2 else "[PROMO 2DA AL 50%]")
+    req_text = f"Paga 1 y lleva 2 a solo {promo_price or ''} (Escoge 2 productos/tonos iguales o combinados)".strip() if is_paga_1_lleva_2 else (
+        f"Lleva 3 por el precio de 2 a solo {promo_price or ''} (Elige 3 productos/tonos)" if is_3x2 else "Segunda unidad con 50% de descuento"
+    )
+
+    labeled_products = []
+    shades_or_items = []
+    has_combo_already = False
+
+    for p in products:
+        nom = p.get('nombre', '')
+        
+        if re.search(r'elige\s*2|escoge\s*2|combo|elige\s*3', nom, re.IGNORECASE):
+            has_combo_already = True
+            p['es_promo'] = True
+            p['requisito_promo'] = req_text
+            labeled_products.append(p)
+            continue
+            
+        # Si el producto no tiene el prefijo de la promo, agregárselo
+        if not re.search(r'\[promo|\[paga\s*1', nom, re.IGNORECASE):
+            p['nombre'] = f"{promo_tag} {nom}"
+        
+        p['es_promo'] = True
+        if not p.get('requisito_promo'):
+            p['requisito_promo'] = req_text
+        if promo_price and (not p.get('precio') or 'confirmar' in str(p.get('precio', '')).lower()):
+            p['precio'] = promo_price
+
+        clean_shade = re.sub(r'\[.*?\]', '', nom).strip()
+        shades_or_items.append(clean_shade)
+        labeled_products.append(p)
+
+    # Si hay 2 o más tonos/productos y aún no existe el producto combo, crearlo automáticamente
+    if len(shades_or_items) >= 2 and not has_combo_already:
+        words_lists = [set(s.split()) for s in shades_or_items]
+        common_words = set.intersection(*words_lists) if words_lists else set()
+        common_words = [w for w in common_words if len(w) > 2]
+        if len(common_words) >= 2:
+            base_collection = " ".join([w for w in shades_or_items[0].split() if w in common_words])
+        else:
+            first_parts = shades_or_items[0].split()
+            base_collection = " ".join(first_parts[:-1]) if len(first_parts) > 1 else shades_or_items[0]
+
+        combo_name = f"[PROMO 2X1] {base_collection} (Paga 1 Lleva 2 por {promo_price or ''} - Escoge 2 tonos)".strip()
+        combo_desc = f"🔥 Promoción {promo_tag} a solo {promo_price or ''}. El cliente puede escoger y combinar 2 unidades de la página. Opciones disponibles: {', '.join(shades_or_items)}."
+        
+        first_p = labeled_products[0]
+        combo_prod = {
+            "nombre": combo_name,
+            "precio": promo_price or first_p.get('precio', ''),
+            "descripcion_corta": combo_desc,
+            "categoria": first_p.get('categoria', 'Dama'),
+            "seccion": first_p.get('seccion', 'Belleza y perfumería'),
+            "subcategoria": first_p.get('subcategoria', 'Maquillaje y cuidado personal'),
+            "es_promo": True,
+            "requisito_promo": req_text,
+            "catalogo": title or first_p.get('catalogo', ''),
+            "pagina": str(page_num)
+        }
+        labeled_products.append(combo_prod)
+        print(f"[PromoEnforcer] Creado producto combo para Pág {page_num}: '{combo_name}'")
+
+    return labeled_products
+
+def consolidate_page_variants(products):
+    """
+    Consolida productos de una misma página que representan el MISMO artículo
+    pero en diferentes tonos, colores, aromas o acabados al mismo precio unitario.
+    Ejemplos:
+    - 4 tonos de "Studio Look Corrector Facial" a $17.990 -> 1 producto con variantes
+    - 6 tonos de "Studio Look Eyes To Go" a $30.990 -> 1 producto con variantes
+    - 3 tonos de "Studio Look Rubor Mousse" a $24.600 -> 1 producto con variantes
+    - 6 aromas de "Cyzone Colonias Refrescantes Taste" a $19.990 -> 1 producto con variantes
+    - 6 acabados de "Studio Look Multi Stick" a $24.990 -> 1 producto con variantes
+    """
+    if not products or len(products) <= 1:
+        return products
+
+    STOP_WORDS = {'de', 'la', 'el', 'en', 'y', 'con', 'para', 'un', 'una', 'c', 'u', 'al', 'del', 'los', 'las', 'por'}
+
+    groups = {}
+    non_grouped = []
+
+    for p in products:
+        if not isinstance(p, dict):
+            non_grouped.append(p)
+            continue
+
+        # Si el producto ya tiene variantes explícitas o es una promo especial o combo, no agrupar
+        if p.get('variantes') or re.search(r'\[promo 2x1\]|escoge\s*2|elige\s*2|combo', p.get('nombre', ''), re.IGNORECASE):
+            non_grouped.append(p)
+            continue
+
+        raw_name = str(p.get('nombre', '')).strip()
+        precio = str(p.get('precio', '')).strip()
+
+        # Si no tiene precio numérico válido, no agrupar como variante de precio
+        if not re.search(r'\d', precio) or 'confirmar' in precio.lower():
+            non_grouped.append(p)
+            continue
+
+        # Extraer código numérico de 5 dígitos de la descripción o nombre
+        code_match = re.search(r'(?:c[oó]d\.?\s*|c[oó]digo\s*:?\s*)?(\d{5})', f"{raw_name} {p.get('descripcion_corta', '')}", re.IGNORECASE)
+        cod = code_match.group(1) if code_match else ""
+
+        # Limpiar nombre de prefijos promocionales o números
+        clean_name = re.sub(r'\[.*?\]', '', raw_name).strip()
+        clean_name = re.sub(r'\b\d{5}\b', '', clean_name).strip()
+
+        tokens = clean_name.split()
+        if len(tokens) >= 3:
+            base_key = " ".join(tokens[:3]).lower()
+        else:
+            base_key = tokens[0].lower() if tokens else clean_name.lower()
+
+        group_id = f"{base_key}_{precio}"
+        if group_id not in groups:
+            groups[group_id] = {
+                'precio': precio,
+                'items': []
+            }
+        groups[group_id]['items'].append({
+            'prod': p,
+            'raw_name': raw_name,
+            'clean_name': clean_name,
+            'code': cod
+        })
+
+    consolidated = list(non_grouped)
+
+    for gid, gdata in groups.items():
+        items = gdata['items']
+        if len(items) >= 2:
+            # Detectar palabras comunes entre todos los nombres para el nombre padre
+            name_token_sets = [set(it['clean_name'].lower().split()) for it in items]
+            common_tokens = set.intersection(*name_token_sets) if name_token_sets else set()
+            common_tokens = [w for w in common_tokens if w not in STOP_WORDS]
+
+            first_clean = items[0]['clean_name']
+            if len(common_tokens) >= 2:
+                base_title_words = [w for w in first_clean.split() if w.lower() in common_tokens]
+                parent_title = " ".join(base_title_words)
+            else:
+                parent_title = " ".join(first_clean.split()[:3])
+
+            parent_title = parent_title.strip()
+            if not parent_title:
+                parent_title = items[0]['prod'].get('nombre', '')
+
+            # Determinar tipo de variante
+            all_text = " ".join([f"{it['raw_name']} {it['prod'].get('descripcion_corta', '')}" for it in items]).lower()
+            tipo_variante = "Aroma" if any(w in all_text for w in ['colonia', 'splash', 'fragancia', 'aroma', 'vainilla', 'frutal', 'cítrica', 'tentación']) else "Tono"
+
+            variants_list = []
+            for it in items:
+                shade_name = it['clean_name']
+                for pt_word in parent_title.split():
+                    shade_name = re.sub(rf'\b{re.escape(pt_word)}\b', '', shade_name, flags=re.IGNORECASE)
+                shade_name = re.sub(r'[^a-zA-Záéíóúüñ0-9\s\(\)]', ' ', shade_name).strip()
+                shade_name = " ".join(shade_name.split())
+                if not shade_name:
+                    shade_name = it['clean_name']
+
+                variants_list.append({
+                    "nombre": shade_name,
+                    "codigo": it['code']
+                })
+
+            parent_prod = dict(items[0]['prod'])
+            parent_prod['nombre'] = parent_title
+            parent_prod['precio'] = gdata['precio']
+            parent_prod['tipo_variante'] = tipo_variante
+            parent_prod['variantes'] = variants_list
+            parent_prod['descripcion_corta'] = re.sub(r'c[oó]d\.?\s*\d{5}\.?', '', parent_prod.get('descripcion_corta', ''), flags=re.IGNORECASE).strip()
+
+            consolidated.append(parent_prod)
+            print(f"[VariantsUnifier] Consolidado '{parent_title}' ({len(variants_list)} {tipo_variante}s): {[v['nombre'] for v in variants_list]}")
+        else:
+            for it in items:
+                consolidated.append(it['prod'])
+
+    return consolidated
+
 def clean_product_taxonomy(p):
     """
     Normaliza y unifica estrictamente la taxonomía (Categoría > Sección > Subcategoría) con alta precisión.
@@ -925,9 +1187,60 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
        - RECUERDA: En la lista JSON devuelve ÚNICAMENTE los productos que están ubicados físicamente en la Página {page_num} (los de la página {facing_page_num} se extraen por separado), pero APROVECHANDO los precios y condiciones de oferta visibles en la página compañera.
         """
 
+    promo_gold_rule = f"""
+    0.2 REGLA SUPREMA DE TÍTULOS DE OFERTA Y PROMOCIONES (PAGA 1 LLEVA 2, 2X1, 3X2, LLEVA 2 POR..., COMBOS):
+       - ¡MÁXIMA PRIORIDAD VISUAL EN LA PÁGINA Y EL LIBRO ABIERTO!:
+         Siempre que analices la página {page_num} (o su compañera {facing_page_num if facing_page_num else ''}), DEBES BUSCAR Y LEER PRIMERO LOS RECUADROS, SELLOS, BANNERS O TÍTULOS DESTACADOS DE PROMOCIÓN, tales como:
+         * "PAGA 1 LLEVA 2 A SOLO $XX.XXX" (o "Paga 1 y lleva 2", "Paga uno y lleva 2", "Paga uno lleva dos")
+         * "2X1" / "2 X 1" / "DOS POR UNO"
+         * "LLEVA 2 POR $XX.XXX" / "LLEVA 2 A SOLO $XX.XXX"
+         * "2DA UNIDAD CON 50% DSCTO" / "SEGUNDO A MITAD DE PRECIO"
+         * "3X2" / "LLEVA 3 POR..."
+       - ¡ESTÁ ESTRICTAMENTE PROHIBIDO CREAR LOS PRODUCTOS COMO INDIVIDUALES SIMPLES SI ESTÁN BAJO UN RECUADRO DE PROMOCIÓN MULTI-PRODUCTO!:
+         Si en la página o en el pliego abierto ves por ejemplo un recuadro de:
+         "PAGA 1 LLEVA 2 A SOLO $ 29,990 [GLOWY STAIN]":
+         1) PARA CADA TONO O VARIANTE INDIVIDUAL (ej: Caramel Latte, Hot Chocolate, Rose Spritz, etc.):
+            * En "nombre": OBLIGATORIO PREFIJAR la promoción en el título para que el cliente la identifique de inmediato:
+              "[PAGA 1 LLEVA 2] Studio Look Glowy Stain Caramel Latte" (o "[PROMO 2X1] Studio Look Glowy Stain Caramel Latte")
+            * En "precio": El valor del combo de la promo (ej: "$29.990").
+            * En "es_promo": true
+            * En "requisito_promo": "Paga 1 y lleva 2 a solo $29.990 (Escoge 2 tonos iguales o combinados)"
+            * En "descripcion_corta": "Cód. 12935. 🔥 Promoción Paga 1 Lleva 2 a solo $29.990. Brillo labial hidratante con tinta..."
+         2) Y CREA ADEMÁS EL PRODUCTO COMBO DE LA PROMOCIÓN para que el cliente pueda pedir el combo completo y escoger sus 2 productos:
+            * "nombre": "[PROMO 2X1] Studio Look Glowy Stain (Paga 1 Lleva 2 por $29.990 - Escoge 2 tonos)"
+            * "precio": "$29.990"
+            * "es_promo": true
+            * "requisito_promo": "Paga 1 y lleva 2 por $29.990. Puedes escoger y combinar 2 tonos de la página."
+            * "descripcion_corta": "🔥 Promoción Paga 1 Lleva 2 por $29.990. Tonos disponibles para elegir y combinar: Pink Lemonade, Caramel Latte, Hot Chocolate, Rose Spritz, Strawberry Shake, Grape Juice."
+            * "categoria": "Dama", "seccion": "Belleza y perfumería", "subcategoria": "Maquillaje y cuidado personal"
+
+    0.3 REGLA SUPREMA DE UNIFICACIÓN DE VARIANTES (TONOS, AROMAS, COLORES Y ACABADOS):
+       - En catálogos de cosmética, belleza y perfumería (ej: sombras retráctiles Eyes To Go, correctores faciales Studio Look, rubores Mousse Blush, barras Multi Stick, colonias refrescantes Taste, labiales, esmaltes):
+         A menudo se exhibe UN SOLO producto físico que se vende al MISMO precio unitario pero en múltiples tonos, colores o aromas (ej: Claro, Medio Claro, Medio, Moreno).
+       - ¡ESTÁ ESTRICTAMENTE PROHIBIDO CREAR 10 PRODUCTOS DUPLICADOS PARA CADA TONO O AROMA!:
+         Debes crear UN SOLO producto consolidado con el campo "tipo_variante" ("Tono", "Aroma" o "Color") y el array "variantes" conteniendo el nombre de cada opción y su código de 5 dígitos:
+         {{
+           "nombre": "Studio Look Corrector Facial de Alta Cobertura",
+           "precio": "$17.990",
+           "descripcion_corta": "Corrector facial de alta cobertura 4 g. Corrige manchas, ojeras y granitos.",
+           "tipo_variante": "Tono",
+           "variantes": [
+             {{"nombre": "Claro", "codigo": "15080"}},
+             {{"nombre": "Medio Claro", "codigo": "15081"}},
+             {{"nombre": "Medio", "codigo": "15082"}},
+             {{"nombre": "Moreno", "codigo": "17020"}}
+           ],
+           "categoria": "Dama",
+           "seccion": "Belleza y perfumería",
+           "subcategoria": "Maquillaje y cuidado personal"
+         }}
+       - Solo extrae productos por separado cuando sean artículos físicos totalmente distintos o con diferente precio.
+    """
+
     prompt = f"""
     Analiza con máxima atención esta página del catálogo de moda/belleza "{title}" (Página {page_num}).
     {spread_instruction}
+    {promo_gold_rule}
     Tu objetivo es extraer con precisión ÚNICAMENTE los productos reales a la venta, distinguiendo variantes, detectando promociones y calculando precios unitarios:
 
     0. REGLA DE ORO: EXCLUSIÓN DE PORTADAS Y FOTOS EDITORIALES/PUBLICITARIAS SIN PRODUCTO A LA VENTA:
@@ -970,12 +1283,54 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
          * En "es_promo": true
          * En "requisito_promo": "Por la compra del perfume Icon en venta individual y/o en set (Cód. 35356)"
          * En "descripcion_corta": "Cód. 35356. PROMOCIÓN CONDICIONAL: Aplica por la compra del perfume Icon en venta individual y/o en set. Material: Plástico..."
+       - EJEMPLO REAL 2 DE PROMOCIÓN POR COMPRA EN RANGO DE PÁGINAS (CRUCIAL):
+         En la página aparece el recuadro:
+         "PROMO! STUDIO LOOK DESMAQUILLADOR BIFÁSICO CON ÁCIDO HIALURÓNICO: Por la compra de cualquier producto de rostro de la página 47 a la 59 A SOLO $14,990* cód. 35351"
+         y abajo el producto individual:
+         "STUDIO LOOK Desmaquillador bifásico 120 ml cód. 09774 Precio regular $50.000 $32,990"
+         -> DEBES EXTRAER AMBOS PRODUCTOS CON NOMBRES DISTINTOS:
+         1) El Producto en Promoción:
+            * "nombre": "[PROMO] Studio Look Desmaquillador Bifásico (Por compra rostro Pág. 47 a 59)"
+            * "precio": "$14.990"
+            * "es_promo": true
+            * "requisito_promo": "Por la compra de cualquier producto de rostro de la página 47 a la 59"
+            * "descripcion_corta": "Cód. 35351. 🔥 Precio especial $14.990 por la compra de cualquier producto de rostro de la pág. 47 a 59 de Cyzone. Desmaquillador bifásico 120 ml."
+         2) El Producto en Venta Individual:
+            * "nombre": "Studio Look Desmaquillador Bifásico con Ácido Hialurónico (Venta Individual)"
+            * "precio": "$32.990"
+            * "es_promo": false
+            * "requisito_promo": ""
+            * "descripcion_corta": "Cód. 09774. Venta individual sin condición. Desmaquillador bifásico con ácido hialurónico 120 ml."
        - Si en la misma página ofrecen la versión individual ("Pídelo individualmente así..."):
          * En "nombre": "Parlante Beat Box (Venta Individual)"
          * En "precio": "$120.000"
          * En "es_promo": false
          * En "requisito_promo": ""
          * En "descripcion_corta": "Cód. 35348. Venta individual sin condición. ..."
+
+    3.1 PROMOCIONES MULTI-PRODUCTO ("PAGA 1 LLEVA 2", "2X1", "LLEVA 2 POR $XX.XXX", "PROMO 2X", "3X2"):
+       - ¡ATENCIÓN MÁXIMA!: Si en la página o en el pliego abierto ves un titular como:
+         * "PAGA 1 LLEVA 2 A SOLO $XX.XXX" (o "Paga uno y lleva 2")
+         * "2X1" / "2 X 1" / "DOS POR UNO"
+         * "LLEVA 2 POR $XX.XXX" o "LLEVA 2 A SOLO $XX.XXX"
+         * "PROMO 2X" / "PROMOCIÓN 2X"
+         * "3X2" / "LLEVA 3 POR..."
+       - ESTO SIGNIFICA QUE EL CLIENTE PUEDE ELEGIR Y COMBINAR MULTIPLES UNIDADES POR ESE PRECIO ESPECIAL:
+         1) Para CADA VARIANTE o TONO individual disponible bajo esa oferta (ej: 6 tonos de labial Glowy Stain):
+            * En "nombre", incluye obligatoriamente la promoción en el título:
+              "[PROMO 2X1] Studio Look Glowy Stain Caramel Latte (Paga 1 Lleva 2)"
+            * En "precio": Coloca el precio total del combo/promo (ej: "$29.990").
+            * En "es_promo": true
+            * En "requisito_promo": "Promoción 2x1: Paga 1 y lleva 2 a solo $29.990 (elige 2 tonos iguales o combinados)"
+            * En "descripcion_corta": "🔥 Promoción Paga 1 Lleva 2 por $29.990. Cód. 12935. Brillo labial hidratante con tinta de larga duración 3.6 ml..."
+         2) Y ADEMÁS, si hay tonos o variantes combinables en la página (ej: tonos de labial, tonos de delineador, fragancias combinables):
+            * EXTRAE TAMBIÉN UN PRODUCTO GENERAL DE LA PROMOCIÓN para que el cliente pueda pedir el combo completo y seleccionar sus 2 tonos:
+              - "nombre": "[PROMO 2X1] Studio Look Glowy Stain (Paga 1 Lleva 2 por $29.990 - Elige 2 tonos)"
+              - "precio": "$29.990"
+              - "es_promo": true
+              - "requisito_promo": "Paga 1 y lleva 2 por $29.990. Puedes escoger y combinar 2 tonos de la página."
+              - "descripcion_corta": "Promoción Paga 1 Lleva 2 por $29.990. Tonos disponibles para elegir y combinar: Pink Lemonade, Caramel Latte, Hot Chocolate, Rose Spritz, Strawberry Shake, Grape Juice."
+              - "categoria": "Dama", "seccion": "Belleza y perfumería", "subcategoria": "Maquillaje y cuidado personal"
 
     4. PROMOCIONES "A SOLO $ XX.XXX c/u" O "CUALQUIERA POR..." (PRECIO COMPARTIDO PARA VARIAS VARIANTES):
        - En catálogos de cosmética y cuidado personal, a menudo aparece un único precio promocional grande que dice "A SOLO $ 49,990 c/u" (donde 'c/u' significa 'cada uno').
@@ -1153,11 +1508,12 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
         if facing_img_path and os.path.exists(facing_img_path):
             try: os.remove(facing_img_path)
             except: pass
-    del page_text
-    
-    # 4. Deduplicar y consolidar inteligentemente (evitar separar título de subtítulo y guiar por precios)
+    # 4. Deduplicar, consolidar y enriquecer promociones de forma inteligente
     unique_products = deduplicate_and_merge_page_products(products)
+    unique_products = consolidate_page_variants(unique_products)
+    unique_products = enhance_and_enforce_page_promos(unique_products, page_text=page_text, facing_text=facing_text, page_num=page_num, title=title)
     unique_products = [clean_product_taxonomy(p) for p in unique_products]
+    del page_text
     print(f"[{title} | Pág {page_num}/{total_pages}] {used_key}: {len(products)} -> Consolidados y unificados: {len(unique_products)}")
     
     # 5. Guardar productos en Firebase inmediatamente
