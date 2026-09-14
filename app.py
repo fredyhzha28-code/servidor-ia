@@ -1000,6 +1000,91 @@ def consolidate_page_variants(products):
 
     return consolidated
 
+def consolidate_page_promos(products):
+    """
+    Unifica productos donde uno es la venta individual normal y otro es la oferta promocional condicional
+    del mismo artículo físico (ejemplo: 'Parlante Beat Box (Venta Individual) $120.000' y
+    '[PROMO] Parlante Beat Box (Por compra de Perfume Icon) $49.990').
+    En lugar de dejar 2 productos, crea UN SOLO producto con:
+      precio = precio individual normal ($120.000)
+      precio_promo = precio promocional ($49.990)
+      es_promo = True
+      requisito_promo = texto del requisito
+    """
+    if not products or len(products) < 2:
+        return products
+
+    used_indices = set()
+    consolidated = []
+
+    for i, p1 in enumerate(products):
+        if i in used_indices:
+            continue
+        
+        name1 = str(p1.get('nombre') or '').lower()
+        clean_name1 = re.sub(r'\[promo\]|\(venta individual\)|\(por compra[^)]*\)|promo!?', '', name1, flags=re.IGNORECASE).strip()
+        clean_words1 = set(w for w in re.findall(r'\b\w{4,}\b', clean_name1))
+
+        matched_j = None
+        for j, p2 in enumerate(products):
+            if i == j or j in used_indices:
+                continue
+            name2 = str(p2.get('nombre') or '').lower()
+            clean_name2 = re.sub(r'\[promo\]|\(venta individual\)|\(por compra[^)]*\)|promo!?', '', name2, flags=re.IGNORECASE).strip()
+            clean_words2 = set(w for w in re.findall(r'\b\w{4,}\b', clean_name2))
+
+            common = clean_words1.intersection(clean_words2)
+            if len(common) >= 2 or (len(common) >= 1 and ('parlante' in common or 'reloj' in common or 'audifono' in common or 'mochila' in common or 'maletin' in common or 'bolso' in common)):
+                p1_is_promo = p1.get('es_promo') or '[promo]' in name1 or bool(p1.get('requisito_promo'))
+                p2_is_promo = p2.get('es_promo') or '[promo]' in name2 or bool(p2.get('requisito_promo'))
+                
+                if p1_is_promo != p2_is_promo or (p1.get('precio') != p2.get('precio')):
+                    matched_j = j
+                    break
+
+        if matched_j is not None:
+            p2 = products[matched_j]
+            used_indices.add(i)
+            used_indices.add(matched_j)
+
+            def parse_num(pr):
+                digits = re.sub(r'[^0-9]', '', str(pr or ''))
+                return int(digits) if digits else 0
+
+            num1 = parse_num(p1.get('precio'))
+            num2 = parse_num(p2.get('precio'))
+
+            if num1 >= num2 and num1 > 0:
+                regular_p = dict(p1)
+                promo_p = p2
+            else:
+                regular_p = dict(p2)
+                promo_p = p1
+
+            unified_name = re.sub(r'\[promo\]|\(venta individual\)|\(por compra[^)]*\)', '', regular_p.get('nombre', ''), flags=re.IGNORECASE).strip()
+            unified_name = re.sub(r'\s{2,}', ' ', unified_name).strip()
+
+            promo_price = promo_p.get('precio_promo') or promo_p.get('precio')
+            req = promo_p.get('requisito_promo') or regular_p.get('requisito_promo') or "Por la compra del producto requerido en promoción"
+
+            regular_p['nombre'] = unified_name
+            regular_p['precio_promo'] = promo_price
+            regular_p['es_promo'] = True
+            regular_p['requisito_promo'] = req
+            
+            curr_desc = regular_p.get('descripcion_corta') or promo_p.get('descripcion_corta') or ''
+            if promo_price and req and str(promo_price) not in curr_desc:
+                curr_desc = f"{curr_desc} | ¡Precio especial en promoción: {promo_price} ({req})!".strip()
+            regular_p['descripcion_corta'] = curr_desc
+
+            consolidated.append(regular_p)
+            print(f"[PromoUnifier] Unificado '{unified_name}': Normal={regular_p.get('precio')} | Promo={promo_price} ({req})")
+        else:
+            consolidated.append(p1)
+            used_indices.add(i)
+
+    return consolidated
+
 def clean_product_taxonomy(p):
     """
     Normaliza y unifica estrictamente la taxonomía (Categoría > Sección > Subcategoría) con alta precisión.
@@ -1235,6 +1320,20 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
            "subcategoria": "Maquillaje y cuidado personal"
          }}
        - Solo extrae productos por separado cuando sean artículos físicos totalmente distintos o con diferente precio.
+
+    0.4 REGLA SUPREMA DE UNIFICACIÓN DE PRODUCTOS EN PROMOCIÓN CONDICIONAL:
+       - Cuando en una página aparece un producto en oferta especial condicionado a la compra de otro producto (ejemplo: "Parlante Beat Box a solo $49.990 por la compra del Perfume Icon", y en letra pequeña o en la misma página dice "Pedido individualmente sin condición de compra a $120.000"):
+       - ¡ESTÁ PROHIBIDO CREAR 2 PRODUCTOS DUPLICADOS (uno de $120.000 y otro de $49.990)!
+       - Debes crear UN SOLO producto unificado con:
+         * "nombre": "Parlante Beat Box"
+         * "precio": "$120.000" (el precio unitario individual normal)
+         * "precio_promo": "$49.990" (el precio con descuento de la promoción)
+         * "es_promo": true
+         * "requisito_promo": "Por la compra del perfume Icon en venta individual y/o en set (Cód. 35356)"
+         * "producto_requisito": "Perfume Icon"
+         * "codigo_requisito": "35356"
+         * "descripcion_corta": "Parlante Beat Box inalámbrico Bluetooth. Precio individual $120.000 (Cód. 35348). ¡O llévalo a solo $49.990 por la compra del perfume Icon en venta individual y/o en set!"
+       - De esta manera el catálogo muestra un único producto y el carrito le rebaja el precio automáticamente si el cliente compra el producto requerido.
     """
 
     prompt = f"""
@@ -1511,6 +1610,7 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
     # 4. Deduplicar, consolidar y enriquecer promociones de forma inteligente
     unique_products = deduplicate_and_merge_page_products(products)
     unique_products = consolidate_page_variants(unique_products)
+    unique_products = consolidate_page_promos(unique_products)
     unique_products = enhance_and_enforce_page_promos(unique_products, page_text=page_text, facing_text=facing_text, page_num=page_num, title=title)
     unique_products = [clean_product_taxonomy(p) for p in unique_products]
     del page_text
