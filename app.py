@@ -1945,6 +1945,7 @@ def process_single_catalog(idx, cat):
             # Reconciliación automática de libro abierto (sincroniza ofertas de pliegos 30-31, 32-33, etc.)
             try:
                 reconcile_spread_prices_for_catalog(cat_hash, appId=appId, title=title)
+                reconcile_spread_variants_for_catalog(cat_hash, appId=appId, title=title)
             except Exception as re_err:
                 print(f"Aviso reconciliando libro abierto: {re_err}")
 
@@ -2031,6 +2032,99 @@ def reconcile_spread_prices_for_catalog(cat_hash, appId='tienda-catalogos-app', 
     except Exception as e:
         print(f"Aviso en reconcile_spread_prices: {e}")
         return 0
+
+def reconcile_spread_variants_for_catalog(cat_hash, appId='tienda-catalogos-app', title=''):
+    """
+    Recorre los productos del catálogo por pliegos de libro abierto (Pág 2-3, 4-5, etc.).
+    Si un producto de variantes (tonos, aromas, colores) se dividió entre las dos páginas del pliego
+    (ej: parte de los tonos en la pág. izquierda y parte en la pág. derecha), los consolida automáticamente
+    en un único producto anclado en la página donde está visible el precio/oferta (o en la pág. derecha),
+    fusiona todos sus tonos y códigos únicos, y elimina el producto duplicado de la página compañera.
+    """
+    if not firebase_db:
+        return 0
+    try:
+        products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+        docs = list(products_col.where("catalogo_hash", "==", cat_hash).stream())
+        if not docs and title:
+            docs = list(products_col.where("catalogo", "==", title).stream())
+            
+        by_page = {}
+        for d in docs:
+            p = d.to_dict()
+            p['id'] = d.id
+            pag_val = p.get('pagina', '1')
+            if str(pag_val).isdigit():
+                by_page.setdefault(int(pag_val), []).append(p)
+                
+        max_p = max(by_page.keys()) if by_page else 0
+        merged_count = 0
+        
+        for left_p in range(2, max_p + 1, 2):
+            right_p = left_p + 1
+            prods_left = by_page.get(left_p, [])
+            prods_right = by_page.get(right_p, [])
+            
+            for lp in list(prods_left):
+                l_vars = lp.get('variantes') or []
+                l_name_clean = re.sub(r'\[.*?\]', '', lp.get('nombre', '')).strip().lower()
+                l_name_clean = re.sub(r'c[oó]d\.?\s*\d+', '', l_name_clean).strip()
+                l_words = [w for w in re.findall(r'\b\w{3,}\b', l_name_clean) if w not in ['con', 'para', 'del', 'los', 'las', 'una', 'uno', 'por', 'que']]
+                l_set = set(l_words)
+                
+                for rp in list(prods_right):
+                    r_vars = rp.get('variantes') or []
+                    r_name_clean = re.sub(r'\[.*?\]', '', rp.get('nombre', '')).strip().lower()
+                    r_name_clean = re.sub(r'c[oó]d\.?\s*\d+', '', r_name_clean).strip()
+                    r_words = [w for w in re.findall(r'\b\w{3,}\b', r_name_clean) if w not in ['con', 'para', 'del', 'los', 'las', 'una', 'uno', 'por', 'que']]
+                    r_set = set(r_words)
+                    
+                    is_match = False
+                    if (l_vars or r_vars):
+                        common = l_set.intersection(r_set)
+                        if len(common) >= 2 or (l_name_clean == r_name_clean) or (l_name_clean in r_name_clean) or (r_name_clean in l_name_clean):
+                            is_match = True
+                            
+                    if is_match:
+                        r_has_price = rp.get('precio') and bool(re.search(r'\d', str(rp.get('precio')))) and 'confirmar' not in str(rp.get('precio')).lower()
+                        l_has_price = lp.get('precio') and bool(re.search(r'\d', str(lp.get('precio')))) and 'confirmar' not in str(lp.get('precio')).lower()
+                        
+                        if r_has_price or not l_has_price:
+                            parent, child = rp, lp
+                        else:
+                            parent, child = lp, rp
+                            
+                        all_vars = []
+                        seen_keys = set()
+                        for v in (parent.get('variantes') or []) + (child.get('variantes') or []):
+                            v_key = str(v.get('codigo') or v.get('nombre') or '').strip().lower()
+                            if v_key and v_key not in seen_keys:
+                                seen_keys.add(v_key)
+                                all_vars.append(v)
+                                
+                        best_price = parent.get('precio')
+                        if not best_price or 'confirmar' in str(best_price).lower():
+                            best_price = child.get('precio')
+                            
+                        products_col.document(parent['id']).update({
+                            'variantes': all_vars,
+                            'tipo_variante': parent.get('tipo_variante') or child.get('tipo_variante') or 'Tono',
+                            'precio': best_price
+                        })
+                        products_col.document(child['id']).delete()
+                        
+                        if child in prods_left: prods_left.remove(child)
+                        if child in prods_right: prods_right.remove(child)
+                        
+                        merged_count += 1
+                        print(f"[{title or cat_hash}] Unificación de libro abierto (Págs {left_p}-{right_p}): '{parent.get('nombre')}' con {len(all_vars)} variantes consolidadas.")
+                        break
+                        
+        return merged_count
+    except Exception as e:
+        print(f"Aviso en reconcile_spread_variants: {e}")
+        return 0
+
 
 active_processing_hashes = set()
 active_processing_lock = threading.Lock()
@@ -2489,11 +2583,13 @@ def sync_spread_prices():
         if not catalog_hash and catalog_url:
             catalog_hash = get_single_catalog_hash(catalog_url, title)
             
-        updated = reconcile_spread_prices_for_catalog(catalog_hash, appId=appId, title=title)
+        updated_prices = reconcile_spread_prices_for_catalog(catalog_hash, appId=appId, title=title)
+        updated_variants = reconcile_spread_variants_for_catalog(catalog_hash, appId=appId, title=title)
         return jsonify({
             "success": True,
-            "updated_count": updated,
-            "message": f"Se sincronizaron {updated} precios de libro abierto con éxito."
+            "updated_prices_count": updated_prices,
+            "updated_variants_count": updated_variants,
+            "message": f"Sincronización completada: {updated_prices} precios y {updated_variants} colecciones de variantes unificadas en libro abierto."
         })
     except Exception as e:
         print(f"Error en sync_spread_prices: {e}")
