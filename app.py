@@ -239,7 +239,7 @@ def extract_retry_delay(error_str, default=20):
 gemini_dispatch_lock = threading.Lock()
 last_gemini_dispatch_time = 0.0
 
-def wait_for_gemini_slot(min_interval=2.0):
+def wait_for_gemini_slot(min_interval=0.25):
     global last_gemini_dispatch_time
     with gemini_dispatch_lock:
         now = time.time()
@@ -248,7 +248,7 @@ def wait_for_gemini_slot(min_interval=2.0):
             time.sleep(min_interval - elapsed)
         last_gemini_dispatch_time = time.time()
 
-def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name='gemini-3.6-flash', json_mode=True):
+def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name='gemini-3.5-flash-lite', json_mode=True):
     actual_attempts = 0
     while actual_attempts < max_retries:
         idx, client_or_wait = key_manager.get_client()
@@ -262,8 +262,8 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
         client = client_or_wait
         uploaded_files = []
         try:
-            # Control de ritmo global para evitar ráfagas simultáneas que saturen la cuota de Google
-            wait_for_gemini_slot(2.0)
+            # Control de ritmo ágil para permitir llamadas fluidas en paralelo entre múltiples llaves
+            wait_for_gemini_slot(0.25)
             print(f"[Gemini] Intentando con Key {idx+1}...")
             
             contents = []
@@ -278,11 +278,24 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
             if json_mode:
                 config_dict['response_mime_type'] = "application/json"
                 
-            response = client.models.generate_content(
-                model=model_name, 
-                contents=contents,
-                config=types.GenerateContentConfig(**config_dict) if config_dict else None
-            )
+            # Intentar primero con gemini-3.5-flash-lite, con fallback a gemini-3.5-flash
+            active_model = model_name
+            try:
+                response = client.models.generate_content(
+                    model=active_model, 
+                    contents=contents,
+                    config=types.GenerateContentConfig(**config_dict) if config_dict else None
+                )
+            except Exception as model_err:
+                if "404" in str(model_err) or "not found" in str(model_err).lower():
+                    active_model = 'gemini-3.5-flash'
+                    response = client.models.generate_content(
+                        model=active_model, 
+                        contents=contents,
+                        config=types.GenerateContentConfig(**config_dict) if config_dict else None
+                    )
+                else:
+                    raise model_err
             
             if response and response.text:
                 return response.text
@@ -912,11 +925,11 @@ def process_single_catalog(idx, cat):
         with fitz.open(tmp_path) as doc_info:
             total_pages = len(doc_info)
             
-        # 3 trabajadores concurrentes sincronizados con el despachador de 2.0s
-        # Garantiza saturación máxima de velocidad sin colisionar jamás en el límite de cuota de Google
+        # 10 trabajadores concurrentes sincronizados con las 20 API keys
+        # Procesa hasta 10 páginas simultáneamente manteniendo la memoria RAM protegida
         num_keys = len(key_manager.clients)
-        max_workers = 3
-        print(f"[{title}] Extracción continua a máxima velocidad: {max_workers} trabajadores con rotación de {num_keys} API keys para {total_pages} páginas...")
+        max_workers = min(10, max(4, num_keys // 2))
+        print(f"[{title}] Extracción continua a máxima velocidad: {max_workers} páginas simultáneas con rotación de {num_keys} API keys para {total_pages} páginas...")
         
         # Recuperar qué páginas ya fueron procesadas y guardadas previamente en Firebase
         already_processed_pages = set()
@@ -953,20 +966,56 @@ def process_single_catalog(idx, cat):
                     "updatedAt": firestore.SERVER_TIMESTAMP
                 }, merge=True)
             
-            def run_page_worker(p_num):
+            last_cancel_check = 0.0
+            catalog_alive = True
+            cancel_check_lock = threading.Lock()
+
+            def is_cancelled():
+                nonlocal last_cancel_check, catalog_alive
                 if stop_event.is_set():
+                    return True
+                now = time.time()
+                with cancel_check_lock:
+                    if now - last_cancel_check > 2.0:
+                        last_cancel_check = now
+                        try:
+                            # 1. Si el usuario borró el documento de status
+                            if status_collection:
+                                doc_s = status_collection.document(cat_hash).get()
+                                if not doc_s.exists:
+                                    print(f"[{title}] Estado de IA eliminado por el usuario. Cancelando lectura.")
+                                    catalog_alive = False
+                                    stop_event.set()
+                                    return True
+                            # 2. Si el usuario borró la revista de la colección de catálogos
+                            if catalogs_collection:
+                                clean_u = url.split('?')[0]
+                                cats = catalogs_collection.get()
+                                exists = any(
+                                    ((c.to_dict().get('pdfUrl') or c.to_dict().get('url') or '').split('?')[0] == clean_u or
+                                     (c.to_dict().get('title') and c.to_dict().get('title').strip() == title.strip()))
+                                    for c in cats
+                                )
+                                if not exists:
+                                    print(f"[{title}] Revista eliminada de Firebase catalogs. Cancelando lectura de inmediato.")
+                                    catalog_alive = False
+                                    stop_event.set()
+                                    return True
+                        except Exception:
+                            pass
+                return not catalog_alive
+
+            def run_page_worker(p_num):
+                if is_cancelled():
                     return
-                # Chequear si el catálogo fue eliminado por el usuario cada 10 páginas
-                if status_collection and p_num % 10 == 0:
-                    if not status_collection.document(cat_hash).get().exists:
-                        print(f"Catálogo {title} eliminado por el usuario. Deteniendo.")
-                        stop_event.set()
-                        return
                         
                 try:
                     # Micro-pausa de 50ms para alternar hilos sin sobrecargar CPU
                     time.sleep(0.05)
                     process_single_page(tmp_path, p_num, cat, total_pages)
+                    
+                    if is_cancelled():
+                        return
                     
                     with progress_lock:
                         nonlocal completed_count
@@ -992,12 +1041,17 @@ def process_single_catalog(idx, cat):
                     except Exception as err:
                         print(f"Error en hilo de procesamiento de páginas: {err}")
                         
-        # 4. Finalizado exitosamente
+        # 4. Finalizado exitosamente o Cancelado
         if os.path.exists(tmp_path):
             try: os.remove(tmp_path)
             except: pass
             
-        if status_collection and not stop_event.is_set():
+        if stop_event.is_set() or not catalog_alive:
+            print(f"[{title}] Proceso cancelado porque la revista fue eliminada.")
+            if status_collection:
+                try: status_collection.document(cat_hash).delete()
+                except: pass
+        elif status_collection:
             status_collection.document(cat_hash).set({
                 "status": "completed",
                 "title": title,
