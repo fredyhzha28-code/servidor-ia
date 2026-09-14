@@ -135,6 +135,7 @@ class GeminiKeyManager:
                     print(f"Aviso creando cliente Gemini: {e}")
         self.status = [{'available': True, 'cooldown_until': 0, 'permanently_disabled': False} for _ in self.clients]
         self.current_idx = 0
+        self.global_cooldown_until = 0.0
         self.lock = threading.Lock()
         print(f"[KeyManager] Total de {len(self.clients)} API keys de Gemini cargadas y activas.")
 
@@ -151,6 +152,10 @@ class GeminiKeyManager:
             if not active_indices:
                 return None, 60.0
 
+            # Si el proyecto entero está en cooldown global ordenado por Google (429)
+            if now < self.global_cooldown_until:
+                return None, self.global_cooldown_until - now
+
             for _ in range(len(self.clients)):
                 idx = self.current_idx
                 self.current_idx = (self.current_idx + 1) % len(self.clients)
@@ -158,12 +163,12 @@ class GeminiKeyManager:
                 if self.status[idx].get('permanently_disabled', False):
                     continue
 
-                # Check if it's available or if cooldown has expired
+                # Chequear si está disponible o si su cooldown ya expiró
                 if self.status[idx]['available'] or now >= self.status[idx]['cooldown_until']:
                     self.status[idx]['available'] = True
                     return idx, self.clients[idx]
             
-            # If all are on cooldown, calculate exact minimum wait time needed
+            # Si todas las llaves están en espera, calcular el tiempo mínimo exacto
             min_wait = min(max(0.5, self.status[i]['cooldown_until'] - now) for i in active_indices)
             return None, min_wait
 
@@ -176,6 +181,18 @@ class GeminiKeyManager:
                 print(f"[KeyManager] Key {idx+1} DESHABILITADA PERMANENTEMENTE (401/403).")
             else:
                 print(f"[KeyManager] Key {idx+1} en espera por {int(seconds)}s.")
+
+    def mark_global_cooldown(self, seconds=20, reason="cuota temporal"):
+        with self.lock:
+            now = time.time()
+            target = now + seconds
+            if target > self.global_cooldown_until:
+                self.global_cooldown_until = target
+                for s in self.status:
+                    if not s.get('permanently_disabled', False):
+                        s['available'] = False
+                        s['cooldown_until'] = max(s['cooldown_until'], target)
+                print(f"[KeyManager] Pausa coordinada de Gemini por {int(seconds)}s ({reason}). Todos los trabajadores esperarán juntos.")
 
 key_manager = GeminiKeyManager(valid_keys)
 
@@ -267,10 +284,16 @@ def extract_retry_delay(error_str, default=20):
 gemini_dispatch_lock = threading.Lock()
 last_gemini_dispatch_time = 0.0
 
-def wait_for_gemini_slot(min_interval=0.8):
+def wait_for_gemini_slot(min_interval=3.2):
     global last_gemini_dispatch_time
     with gemini_dispatch_lock:
         now = time.time()
+        # Si el gestor tiene una pausa global por cuota (429), esperar a que expire
+        if hasattr(key_manager, 'global_cooldown_until') and key_manager.global_cooldown_until > now:
+            sleep_time = key_manager.global_cooldown_until - now
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+                now = time.time()
         elapsed = now - last_gemini_dispatch_time
         if elapsed < min_interval:
             time.sleep(min_interval - elapsed)
@@ -278,20 +301,23 @@ def wait_for_gemini_slot(min_interval=0.8):
 
 def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name='gemini-3.5-flash-lite', json_mode=True):
     actual_attempts = 0
-    while actual_attempts < max_retries:
+    quota_cooldown_cycles = 0
+    max_quota_cycles = 50  # Permite esperar suficientes ciclos de cuota sin descartar páginas jamás
+
+    while actual_attempts < max_retries and quota_cooldown_cycles < max_quota_cycles:
         idx, client_or_wait = key_manager.get_client()
         if idx is None:
-            wait_time = min(max(1.0, client_or_wait + 0.5), 15.0)
-            print(f"[Gemini] Todas las llaves en cooldown temporal. Esperando {wait_time:.1f}s al próximo turno...")
+            wait_time = min(max(1.5, client_or_wait + 0.5), 25.0)
+            print(f"[Gemini] Esperando cuota de Gemini ({wait_time:.1f}s)...")
             time.sleep(wait_time)
-            # Esperar por cooldown NO es un fallo de llamada
+            # Esperar por cooldown de cuota NO es un fallo de llamada
             continue
             
         client = client_or_wait
         uploaded_files = []
         try:
-            # Control de ritmo seguro (0.8s): reparte ~75 llamadas/minuto entre las llaves sin agotar cuota de 15 RPM
-            wait_for_gemini_slot(0.8)
+            # Despacho controlado (3.2s) para no exceder las 15 RPM compartidas de Google AI Studio
+            wait_for_gemini_slot(3.2)
             print(f"[Gemini] Intentando con Key {idx+1}...")
             
             contents = []
@@ -330,22 +356,28 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
             raise Exception("Respuesta vacía de Gemini")
             
         except Exception as e:
-            actual_attempts += 1
             error_str = str(e)
-            print(f"[Gemini] Error con Key {idx+1}: {error_str[:160]}...")
+            print(f"[Gemini] Aviso con Key {idx+1}: {error_str[:160]}...")
+            
             if "429" in error_str or "503" in error_str or "quota" in error_str.lower() or "resource_exhausted" in error_str.lower():
-                delay = extract_retry_delay(error_str, default=20)
-                cd = max(5, min(delay + 1, 45))
+                quota_cooldown_cycles += 1
+                delay = extract_retry_delay(error_str, default=21)
+                cd = max(10, min(delay + 1, 45))
                 key_manager.mark_cooldown(idx, cd)
-                time.sleep(1.5) # Pausa preventiva antes de que este hilo intente la siguiente llave
+                # Pausar a todos los trabajadores durante el tiempo requerido por Google
+                key_manager.mark_global_cooldown(cd, reason=f"429 cuota temporal ({cd}s)")
+                # ¡IMPORTANTE!: Un 429 no consume reintentos de la página
+                time.sleep(2.0)
             elif "401" in error_str or "403" in error_str:
-                # Llave deshabilitada o proyecto borrado en Google Cloud
+                actual_attempts += 1
                 key_manager.mark_cooldown(idx, 86400, permanent=True)
             elif "400" in error_str or "404" in error_str:
+                actual_attempts += 1
                 key_manager.mark_cooldown(idx, 86400, permanent=True)
             else:
+                actual_attempts += 1
                 key_manager.mark_cooldown(idx, 5)
-                time.sleep(1.0)
+                time.sleep(1.5)
         finally:
             for gf in uploaded_files:
                 try:
@@ -353,7 +385,7 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
                 except Exception:
                     pass
                 
-    raise Exception(f"Gemini falló tras {max_retries} intentos reales.")
+    raise Exception(f"Gemini no pudo responder tras múltiples reintentos.")
 
 def clean_product_name(raw_name):
     if not raw_name:
@@ -956,15 +988,26 @@ def process_single_catalog(idx, cat):
         with fitz.open(tmp_path) as doc_info:
             total_pages = len(doc_info)
             
-        # Trabajadores concurrentes adaptados a las llaves activas y saludables
-        # Evita saturar cuotas de Google y mantiene la RAM por debajo de 150MB
+        # Trabajadores concurrentes equilibrados (3 trabajadores con paso de 3.2s)
+        # Protege al 100% la memoria RAM (<150MB en Render) y no satura las 15 RPM de Gemini
         healthy_keys = key_manager.get_active_keys_count()
-        max_workers = min(6, max(3, healthy_keys // 2))
+        max_workers = min(3, max(2, healthy_keys // 3))
         print(f"[{title}] Extracción continua y fluida: {max_workers} trabajadores en paralelo con {healthy_keys} API keys saludables para {total_pages} páginas...")
         
-        # Recuperar qué páginas ya fueron procesadas y guardadas previamente en Firebase
+        # Recuperar exhaustivamente qué páginas ya fueron procesadas y guardadas previamente en Firebase
         already_processed_pages = set()
         if firebase_db:
+            clean_url = url.split('?')[0]
+            # 1. Consultar páginas completadas en catalogs_progress
+            try:
+                cat_prog_pages = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("catalogs_progress").document(cat_hash).collection("pages").stream()
+                for pg_doc in cat_prog_pages:
+                    if pg_doc.id.isdigit():
+                        already_processed_pages.add(int(pg_doc.id))
+            except Exception as e:
+                print(f"Aviso consultando catalogs_progress: {e}")
+
+            # 2. Consultar productos existentes por catalogo_hash
             try:
                 products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
                 existing_docs = products_col.where("catalogo_hash", "==", cat_hash).stream()
@@ -973,7 +1016,17 @@ def process_single_catalog(idx, cat):
                     if p_val and str(p_val).isdigit():
                         already_processed_pages.add(int(p_val))
             except Exception as e:
-                print(f"Aviso consultando páginas ya procesadas: {e}")
+                print(f"Aviso consultando productos por hash: {e}")
+
+            # 3. Consultar productos existentes por URL limpia de catálogo
+            try:
+                existing_by_url = products_col.where("catalogo_url", "==", clean_url).stream()
+                for ep in existing_by_url:
+                    p_val = ep.to_dict().get("pagina")
+                    if p_val and str(p_val).isdigit():
+                        already_processed_pages.add(int(p_val))
+            except Exception as e:
+                print(f"Aviso consultando productos por url: {e}")
                 
         pages_to_process = [p for p in range(1, total_pages + 1) if p not in already_processed_pages]
         completed_count = len(already_processed_pages)
@@ -1039,30 +1092,39 @@ def process_single_catalog(idx, cat):
             def run_page_worker(p_num):
                 if is_cancelled():
                     return
-                        
-                try:
-                    # Micro-pausa de 50ms para alternar hilos sin sobrecargar CPU
-                    time.sleep(0.05)
-                    process_single_page(tmp_path, p_num, cat, total_pages)
-                    
+                
+                # Reintento robusto de página en caso de fallos transitorios
+                max_page_retries = 3
+                for attempt in range(1, max_page_retries + 1):
                     if is_cancelled():
                         return
+                    try:
+                        time.sleep(0.05)
+                        process_single_page(tmp_path, p_num, cat, total_pages)
+                        break
+                    except Exception as page_err:
+                        print(f"[Aviso] Reintento {attempt}/{max_page_retries} en página {p_num}: {page_err}")
+                        if attempt == max_page_retries:
+                            print(f"[Error] No se pudo procesar la página {p_num} tras {max_page_retries} intentos.")
+                            return
+                        time.sleep(2.0)
                     
-                    with progress_lock:
-                        nonlocal completed_count
-                        completed_count += 1
-                        pct = int((completed_count / total_pages) * 100)
-                        if status_collection and not stop_event.is_set():
-                            status_collection.document(cat_hash).set({
-                                "status": "processing",
-                                "title": title,
-                                "message": f"Memorizando con IA: {completed_count}/{total_pages} páginas ({pct}%)...",
-                                "progress": pct,
-                                "last_successful_page": completed_count,
-                                "updatedAt": firestore.SERVER_TIMESTAMP
-                            }, merge=True)
-                except Exception as page_err:
-                    print(f"[Aviso] Error en página {p_num}: {page_err}")
+                if is_cancelled():
+                    return
+                
+                with progress_lock:
+                    nonlocal completed_count
+                    completed_count += 1
+                    pct = int((completed_count / total_pages) * 100)
+                    if status_collection and not stop_event.is_set():
+                        status_collection.document(cat_hash).set({
+                            "status": "processing",
+                            "title": title,
+                            "message": f"Memorizando con IA: {completed_count}/{total_pages} páginas ({pct}%)...",
+                            "progress": pct,
+                            "last_successful_page": completed_count,
+                            "updatedAt": firestore.SERVER_TIMESTAMP
+                        }, merge=True)
             
             with ThreadPoolExecutor(max_workers=max_workers) as page_executor:
                 futures = [page_executor.submit(run_page_worker, p) for p in pages_to_process]
