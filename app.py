@@ -61,16 +61,27 @@ def handle_exception(e):
 # INITIALIZATION
 # =====================================================================
 
-api_keys = []
-if os.environ.get("GEMINI_API_KEY"):
-    api_keys.append(os.environ.get("GEMINI_API_KEY"))
+raw_keys = []
+# Clave principal (con o sin índice 1)
+for main_var in ["GEMINI_API_KEY", "GEMINI_API_KEY_1"]:
+    val = os.environ.get(main_var)
+    if val and val.strip():
+        raw_keys.append(val.strip())
 
-for i in range(2, 21):
+# Claves numeradas del 2 al 50
+for i in range(2, 51):
     key = os.environ.get(f"GEMINI_API_KEY_{i}")
-    if key:
-        api_keys.append(key)
-        
-valid_keys = [k for k in api_keys if k and k.strip()]
+    if key and key.strip():
+        raw_keys.append(key.strip())
+
+# Eliminar duplicados preservando orden
+seen = set()
+valid_keys = []
+for k in raw_keys:
+    if k not in seen:
+        seen.add(k)
+        valid_keys.append(k)
+
 if not valid_keys:
     valid_keys = ["DUMMY_KEY"]
 
@@ -102,16 +113,17 @@ class GeminiKeyManager:
         self.keys = []
         self.clients = []
         for key in keys:
-            if key and key.strip():
+            if key and key.strip() and key != "DUMMY_KEY":
                 try:
-                    client = genai.Client(api_key=key)
+                    client = genai.Client(api_key=key.strip())
                     self.clients.append(client)
-                    self.keys.append(key)
+                    self.keys.append(key.strip())
                 except Exception as e:
                     print(f"Aviso creando cliente Gemini: {e}")
         self.status = [{'available': True, 'cooldown_until': 0} for _ in self.clients]
         self.current_idx = 0
         self.lock = threading.Lock()
+        print(f"[KeyManager] Total de {len(self.clients)} API keys de Gemini cargadas y activas.")
 
     def get_client(self):
         with self.lock:
