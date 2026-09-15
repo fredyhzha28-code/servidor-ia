@@ -73,6 +73,17 @@ def health_check():
         "keys_loaded": active_count
     }), 200
 
+@app.route('/api/keys-diagnostics', methods=['GET'])
+def keys_diagnostics():
+    if 'key_manager' not in globals() or not key_manager:
+        return jsonify({"error": "KeyManager no inicializado", "summary": {"has_errors": False, "total_keys": 0}, "keys": []}), 200
+    try:
+        diag = key_manager.get_detailed_diagnostics()
+        return jsonify(diag), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
@@ -256,6 +267,80 @@ class GeminiKeyManager:
                 "primary_disabled": p_disabled,
                 "backup_active": b_active,
                 "total_keys": len(self.primary_items) + len(self.backup_items)
+            }
+
+    def get_detailed_diagnostics(self):
+        with self.lock:
+            now = time.time()
+            items = []
+            for i, k in enumerate(self.primary_items):
+                status = "active"
+                detail = "Operativa y respondiendo"
+                if k.permanently_disabled:
+                    status = "error_403"
+                    detail = "Error 403: Clave suspendida, sin permisos o inválida"
+                elif now < k.cooldown_until:
+                    status = "cooldown_429"
+                    rem = int(k.cooldown_until - now)
+                    detail = f"Pausa temporal por límite de cuota ({rem}s restantes)"
+                
+                masked = (k.key[:6] + "..." + k.key[-4:]) if len(k.key) > 10 else "***"
+                items.append({
+                    "id": f"primary_{i+1}",
+                    "name": k.name,
+                    "tier": 1,
+                    "tier_label": "Principal (Tier 1)",
+                    "env_var": f"GEMINI_API_KEY_{11+i}",
+                    "masked_key": masked,
+                    "status": status,
+                    "detail": detail,
+                    "cooldown_remaining": max(0, int(k.cooldown_until - now)) if status == "cooldown_429" else 0
+                })
+
+            for i, k in enumerate(self.backup_items):
+                status = "active"
+                detail = "En espera de respaldo"
+                if k.permanently_disabled:
+                    status = "error_403"
+                    detail = "Error 403: Clave suspendida o inválida"
+                elif now < k.cooldown_until:
+                    status = "cooldown_429"
+                    rem = int(k.cooldown_until - now)
+                    detail = f"Pausa temporal por cuota ({rem}s restantes)"
+                
+                masked = (k.key[:6] + "..." + k.key[-4:]) if len(k.key) > 10 else "***"
+                env_name = "GEMINI_API_KEY" if i == 0 else f"GEMINI_API_KEY_{i+1}"
+                items.append({
+                    "id": f"backup_{i+1}",
+                    "name": k.name,
+                    "tier": 2,
+                    "tier_label": "Respaldo (Tier 2)",
+                    "env_var": env_name,
+                    "masked_key": masked,
+                    "status": status,
+                    "detail": detail,
+                    "cooldown_remaining": max(0, int(k.cooldown_until - now)) if status == "cooldown_429" else 0
+                })
+
+            p_active = sum(1 for k in self.primary_items if not k.permanently_disabled and now >= k.cooldown_until)
+            p_wait = sum(1 for k in self.primary_items if not k.permanently_disabled and now < k.cooldown_until)
+            p_disabled = sum(1 for k in self.primary_items if k.permanently_disabled)
+            b_active = sum(1 for k in self.backup_items if not k.permanently_disabled and now >= k.cooldown_until)
+            b_disabled = sum(1 for k in self.backup_items if k.permanently_disabled)
+
+            return {
+                "summary": {
+                    "total_keys": len(self.primary_items) + len(self.backup_items),
+                    "primary_active": p_active,
+                    "primary_cooldown": p_wait,
+                    "primary_disabled": p_disabled,
+                    "backup_active": b_active,
+                    "backup_disabled": b_disabled,
+                    "has_errors": (p_disabled > 0 or b_disabled > 0)
+                },
+                "keys": items,
+                "recent_events": list(self.recent_events),
+                "active_workers": list(self.active_workers.values())
             }
 
     def get_client(self):
