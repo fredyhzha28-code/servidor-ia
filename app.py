@@ -1281,23 +1281,31 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
          * "LLEVA 2 POR $XX.XXX" / "LLEVA 2 A SOLO $XX.XXX"
          * "2DA UNIDAD CON 50% DSCTO" / "SEGUNDO A MITAD DE PRECIO"
          * "3X2" / "LLEVA 3 POR..."
-       - ¡ESTÁ ESTRICTAMENTE PROHIBIDO CREAR LOS PRODUCTOS COMO INDIVIDUALES SIMPLES SI ESTÁN BAJO UN RECUADRO DE PROMOCIÓN MULTI-PRODUCTO!:
-         Si en la página o en el pliego abierto ves por ejemplo un recuadro de:
-         "PAGA 1 LLEVA 2 A SOLO $ 29,990 [GLOWY STAIN]":
-         1) PARA CADA TONO O VARIANTE INDIVIDUAL (ej: Caramel Latte, Hot Chocolate, Rose Spritz, etc.):
-            * En "nombre": OBLIGATORIO PREFIJAR la promoción en el título para que el cliente la identifique de inmediato:
-              "[PAGA 1 LLEVA 2] Studio Look Glowy Stain Caramel Latte" (o "[PROMO 2X1] Studio Look Glowy Stain Caramel Latte")
-            * En "precio": El valor del combo de la promo (ej: "$29.990").
-            * En "es_promo": true
-            * En "requisito_promo": "Paga 1 y lleva 2 a solo $29.990 (Escoge 2 tonos iguales o combinados)"
-            * En "descripcion_corta": "Cód. 12935. 🔥 Promoción Paga 1 Lleva 2 a solo $29.990. Brillo labial hidratante con tinta..."
-         2) Y CREA ADEMÁS EL PRODUCTO COMBO DE LA PROMOCIÓN para que el cliente pueda pedir el combo completo y escoger sus 2 productos:
-            * "nombre": "[PROMO 2X1] Studio Look Glowy Stain (Paga 1 Lleva 2 por $29.990 - Escoge 2 tonos)"
-            * "precio": "$29.990"
-            * "es_promo": true
-            * "requisito_promo": "Paga 1 y lleva 2 por $29.990. Puedes escoger y combinar 2 tonos de la página."
-            * "descripcion_corta": "🔥 Promoción Paga 1 Lleva 2 por $29.990. Tonos disponibles para elegir y combinar: Pink Lemonade, Caramel Latte, Hot Chocolate, Rose Spritz, Strawberry Shake, Grape Juice."
-            * "categoria": "Dama", "seccion": "Belleza y perfumería", "subcategoria": "Maquillaje y cuidado personal"
+       - ¡ESTÁ ESTRICTAMENTE PROHIBIDO CREAR PRODUCTOS INDIVIDUALES SEPARADOS PARA CADA TONO CUANDO HAY UNA PROMOCIÓN 2X1 / PAGA 1 LLEVA 2!:
+          Si en la página o en el pliego abierto ves por ejemplo un recuadro de:
+          "PAGA 1 LLEVA 2 A SOLO $ 29,990 [GLOWY STAIN]":
+          DEBES CREAR UN SOLO Y ÚNICO PRODUCTO CONSOLIDADO con todas las variantes/tonos de las páginas:
+          {{
+            "nombre": "[PROMO 2X1] Studio Look Glowy Stain (Paga 1 Lleva 2 por $29.990)",
+            "precio": "$29.990",
+            "es_promo": true,
+            "promo_cantidad_requerida": 2,
+            "requisito_promo": "Paga 1 y lleva 2 por $29.990 (Escoge 2 tonos iguales o combinados)",
+            "tipo_variante": "Tono",
+            "variantes": [
+              {{"nombre": "Pink Lemonade", "codigo": "12936"}},
+              {{"nombre": "Caramel Latte", "codigo": "12935"}},
+              {{"nombre": "Hot Chocolate", "codigo": "12927"}},
+              {{"nombre": "Rose Spritz", "codigo": "12925"}},
+              {{"nombre": "Strawberry Shake", "codigo": "12932"}},
+              {{"nombre": "Grape Juice", "codigo": "12926"}}
+            ],
+            "descripcion_corta": "🔥 Promoción Paga 1 Lleva 2 por $29.990. Brillo labial hidratante con tinta de larga duración 24H con ácido hialurónico. Escoge 2 tonos para tu promoción.",
+            "categoria": "Dama",
+            "seccion": "Belleza y perfumería",
+            "subcategoria": "Maquillaje y cuidado personal"
+          }}
+          De esta forma el cliente selecciona sus 2 tonos en la tienda y el pedido va unificado y ordenado al carrito y a WhatsApp.
 
     0.3 REGLA SUPREMA DE UNIFICACIÓN DE VARIANTES (TONOS, AROMAS, COLORES Y ACABADOS):
        - En catálogos de cosmética, belleza y perfumería (ej: sombras retráctiles Eyes To Go, correctores faciales Studio Look, rubores Mousse Blush, barras Multi Stick, colonias refrescantes Taste, labiales, esmaltes):
@@ -2080,9 +2088,15 @@ def reconcile_spread_variants_for_catalog(cat_hash, appId='tienda-catalogos-app'
                     r_set = set(r_words)
                     
                     is_match = False
+                    is_promo_2x = bool(re.search(r'paga\s*1|2\s*x\s*1|2x1|lleva\s*2', l_name_clean + ' ' + r_name_clean))
+                    common = l_set.intersection(r_set)
+                    
                     if (l_vars or r_vars):
-                        common = l_set.intersection(r_set)
                         if len(common) >= 2 or (l_name_clean == r_name_clean) or (l_name_clean in r_name_clean) or (r_name_clean in l_name_clean):
+                            is_match = True
+                    elif is_promo_2x:
+                        # Si son productos de una promo 2x1 divididos en el pliego
+                        if len(common) >= 2 or (len(common) >= 1 and any(k in common for k in ['stain', 'glowy', 'juicy', 'lips', 'matte', 'velvet', 'balm', 'pop'])):
                             is_match = True
                             
                     if is_match:
@@ -2096,21 +2110,51 @@ def reconcile_spread_variants_for_catalog(cat_hash, appId='tienda-catalogos-app'
                             
                         all_vars = []
                         seen_keys = set()
-                        for v in (parent.get('variantes') or []) + (child.get('variantes') or []):
+                        
+                        # Recoger variantes existentes de parent
+                        for v in (parent.get('variantes') or []):
                             v_key = str(v.get('codigo') or v.get('nombre') or '').strip().lower()
                             if v_key and v_key not in seen_keys:
                                 seen_keys.add(v_key)
                                 all_vars.append(v)
                                 
+                        # Recoger variantes o nombre de child
+                        child_vars = child.get('variantes') or []
+                        if child_vars:
+                            for v in child_vars:
+                                v_key = str(v.get('codigo') or v.get('nombre') or '').strip().lower()
+                                if v_key and v_key not in seen_keys:
+                                    seen_keys.add(v_key)
+                                    all_vars.append(v)
+                        else:
+                            # Extraer tono del nombre del child si era producto individual
+                            c_code = ''
+                            code_m = re.search(r'c[oó]d\.?\s*(\d{4,6})', child.get('descripcion_corta', '') + ' ' + child.get('nombre', ''))
+                            if code_m: c_code = code_m.group(1)
+                            
+                            c_name = re.sub(r'\[.*?\]', '', child.get('nombre', '')).strip()
+                            c_name = re.sub(r'^(cyzone|studio\s*look|gloss|\+|\btinta\b|24h|brillo)\s*', '', c_name, flags=re.IGNORECASE).strip()
+                            v_key = c_code or c_name.lower()
+                            if v_key and v_key not in seen_keys:
+                                seen_keys.add(v_key)
+                                all_vars.append({"nombre": c_name or child.get('nombre'), "codigo": c_code})
+                                
                         best_price = parent.get('precio')
                         if not best_price or 'confirmar' in str(best_price).lower():
                             best_price = child.get('precio')
                             
-                        products_col.document(parent['id']).update({
+                        updates = {
                             'variantes': all_vars,
                             'tipo_variante': parent.get('tipo_variante') or child.get('tipo_variante') or 'Tono',
                             'precio': best_price
-                        })
+                        }
+                        if is_promo_2x:
+                            updates['es_promo'] = True
+                            updates['promo_cantidad_requerida'] = 2
+                            if not parent.get('requisito_promo'):
+                                updates['requisito_promo'] = f"Paga 1 y lleva 2 por {best_price} (Escoge 2 tonos iguales o combinados)"
+                            
+                        products_col.document(parent['id']).update(updates)
                         products_col.document(child['id']).delete()
                         
                         if child in prods_left: prods_left.remove(child)
@@ -2119,6 +2163,7 @@ def reconcile_spread_variants_for_catalog(cat_hash, appId='tienda-catalogos-app'
                         merged_count += 1
                         print(f"[{title or cat_hash}] Unificación de libro abierto (Págs {left_p}-{right_p}): '{parent.get('nombre')}' con {len(all_vars)} variantes consolidadas.")
                         break
+
                         
         return merged_count
     except Exception as e:
