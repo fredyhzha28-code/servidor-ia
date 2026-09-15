@@ -1307,6 +1307,32 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
           }}
           De esta forma el cliente selecciona sus 2 tonos en la tienda y el pedido va unificado y ordenado al carrito y a WhatsApp.
 
+    0.2.1 REGLA SUPREMA DE ESCALAS DE VOLUMEN / PRECIOS ESCALONADOS (1X $XX.XXX | 2X $XX.XXX):
+       - ¡ATENCIÓN MÁXIMA A OFERTAS DE ESCALA 1X / 2X!:
+         Cuando en la página veas un recuadro o banner de precio por volumen como:
+         "1X $ 15,990 | 2X $ 24,990" (o "1 x ... 2 x ...", "1 por ... 2 por ..."):
+       - ¡ESTÁ TOTALMENTE PROHIBIDO CREAR 2 PRODUCTOS SEPARADOS O PRODUCTOS INDIVIDUALES POR CADA TONO!:
+       - Debes crear UN SOLO producto unificado que contenga el precio de 1 unidad y el precio especial de la promo 2X, junto con todas las variantes/tonos:
+         {{
+           "nombre": "Studio Look Lip Balm Hidratante con Color",
+           "precio": "$15.990",
+           "precio_promo_2x": "$24.990",
+           "es_promo": true,
+           "tipo_promo": "escala_2x",
+           "requisito_promo": "1x $15.990 o 2x $24.990 (Escoge 2 tonos iguales o combinados)",
+           "tipo_variante": "Tono",
+           "variantes": [
+             {{"nombre": "Magic Red", "codigo": "03406"}},
+             {{"nombre": "Natural Rose", "codigo": "03380"}},
+             {{"nombre": "Caramel Blend", "codigo": "03407"}},
+             {{"nombre": "Pink Illusion", "codigo": "03396"}}
+           ],
+           "descripcion_corta": "Bálsamo labial hidratante que se adapta al tono de tus labios. 1x $15.990 o 2x $24.990.",
+           "categoria": "Dama",
+           "seccion": "Belleza y perfumería",
+           "subcategoria": "Maquillaje y cuidado personal"
+         }}
+
     0.3 REGLA SUPREMA DE UNIFICACIÓN DE VARIANTES (TONOS, AROMAS, COLORES Y ACABADOS):
        - En catálogos de cosmética, belleza y perfumería (ej: sombras retráctiles Eyes To Go, correctores faciales Studio Look, rubores Mousse Blush, barras Multi Stick, colonias refrescantes Taste, labiales, esmaltes):
          A menudo se exhibe UN SOLO producto físico que se vende al MISMO precio unitario pero en múltiples tonos, colores o aromas (ej: Claro, Medio Claro, Medio, Moreno).
@@ -2453,7 +2479,8 @@ INSTRUCCIONES DE RESPUESTA:
 
         try:
             print(f"[Search] Consultando a Gemini para responder la búsqueda: '{query}'...")
-            ai_text = call_gemini_with_key_manager(prompt, json_mode=False)
+            ai_text_res = call_gemini_with_key_manager(prompt, json_mode=False)
+            ai_text = ai_text_res[0] if isinstance(ai_text_res, tuple) else ai_text_res
             if ai_text:
                 ai_text = re.sub(r'```html\s*', '', ai_text)
                 ai_text = re.sub(r'```\s*$', '', ai_text)
@@ -2556,6 +2583,15 @@ def extract_missing_product():
         
         Examina con cuidado la imagen y el texto de la página y extrae los datos de ESE producto específico.
         REGLAS:
+        - Si en la página o en el producto ves una escala de precios por volumen (ej: '1X $ 15,990 | 2X $ 24,990'):
+          * En 'precio': Pon el precio individual de 1 unidad (ej: '$15.990').
+          * En 'precio_promo_2x': Pon el precio de la oferta de 2 unidades (ej: '$24.990').
+          * En 'es_promo': true.
+          * En 'tipo_promo': 'escala_2x'.
+          * En 'requisito_promo': '1x $15.990 o 2x $24.990 (Escoge 2 tonos iguales o combinados)'.
+        - Si el producto tiene múltiples tonos, colores o aromas (ej: Magic Red #03406, Natural Rose #03380, etc.):
+          * En 'tipo_variante': 'Tono', 'Aroma' o 'Color'.
+          * En 'variantes': Array de objetos [{{"nombre": "Tono", "codigo": "12345"}}].
         - Si el precio está por unidad de medida (ej: '100 ml ... ml a $1.249,90'), calcula el precio multiplicando: 100 * 1249.90 = '$124.990'.
         - Si la página indica una oferta compartida como 'A SOLO $ 49,990 c/u' (cada uno), asigna ese precio ('$49.990') al producto.
         - Si el producto NO tiene precio pero SÍ tiene código (ej: 'Cód. 09583'), en precio pon exactamente: 'Confirmar con Erika'.
@@ -2569,7 +2605,15 @@ def extract_missing_product():
         Devuelve exclusivamente un JSON con un único objeto (o array de 1 objeto):
         {{
           "nombre": "Nombre comercial completo limpio",
-          "precio": "Precio calculado con signo peso (ej: $124.990) o 'Confirmar con Erika'",
+          "precio": "Precio calculado con signo peso (ej: $15.990) o 'Confirmar con Erika'",
+          "precio_promo_2x": "Precio especial 2X si aplica (ej: $24.990) o null",
+          "es_promo": true,
+          "tipo_promo": "escala_2x",
+          "requisito_promo": "1x $15.990 o 2x $24.990 (Escoge 2 tonos iguales o combinados)",
+          "tipo_variante": "Tono",
+          "variantes": [
+            {{"nombre": "Tono 1", "codigo": "12345"}}
+          ],
           "descripcion_corta": "Cód. XXXXX. Subtítulo, notas olfativas o detalles",
           "categoria": "Categoría principal (Dama, Caballero, Niños, Niñas, Hogar)",
           "seccion": "Sección general (Ropa, Zapatos, Belleza y Perfumería, Cuidado Personal, Accesorios, Varios)",
@@ -2579,11 +2623,12 @@ def extract_missing_product():
         }}
         """
         
-        text_resp = call_gemini_with_key_manager(prompt, files=[tmp_img_path])
+        raw_res = call_gemini_with_key_manager(prompt, files=[tmp_img_path])
         if os.path.exists(tmp_img_path):
             os.remove(tmp_img_path)
             
-        clean_text = text_resp.strip()
+        text_resp = raw_res[0] if isinstance(raw_res, tuple) else raw_res
+        clean_text = str(text_resp or '').strip()
         if clean_text.startswith('```json'): clean_text = clean_text.replace('```json', '', 1)
         if clean_text.endswith('```'): clean_text = clean_text[:-3]
         clean_text = clean_text.strip()
@@ -2614,6 +2659,333 @@ def extract_missing_product():
         
     except Exception as e:
         print(f"Error en extract_missing_product: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/audit_spread_ai', methods=['POST'])
+def audit_spread_ai():
+    try:
+        data = request.json or {}
+        catalog_url = data.get('catalog_url', '')
+        title = data.get('title', 'Revista')
+        page_number = int(data.get('page_number', 1))
+        facing_page = data.get('facing_page')
+        if facing_page is not None and str(facing_page).strip() != '' and str(facing_page).lower() != 'null':
+            try:
+                facing_page = int(facing_page)
+            except Exception:
+                facing_page = None
+        else:
+            facing_page = None
+
+        instruction = data.get('instruction', '').strip()
+        current_products = data.get('current_products', [])
+        thumb_urls = data.get('thumb_urls', {})
+        appId = data.get('appId', 'tienda-catalogos-app')
+
+        if not instruction:
+            instruction = "Auto-auditar pliego: unifica variantes de la misma línea sin mezclar productos diferentes, fusiona productos individuales con sus promociones condicionales en una sola ficha, y depura fantasmas o duplicados."
+
+        # Buscar catalog_url si viene vacía
+        if not catalog_url or catalog_url == 'undefined' or not str(catalog_url).startswith('http'):
+            if firebase_db:
+                catalogs_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("catalogs")
+                for c in catalogs_col.get():
+                    c_data = c.to_dict()
+                    if c_data.get('title') == title:
+                        catalog_url = c_data.get('pdfUrl') or c_data.get('url', '')
+                        break
+
+        cat_hash = get_single_catalog_hash(catalog_url, title) if catalog_url else ""
+
+        pages_to_audit = [page_number]
+        if facing_page and facing_page not in pages_to_audit:
+            pages_to_audit.append(facing_page)
+        pages_to_audit.sort()
+
+        temp_img_paths = []
+        page_texts = {}
+
+        # 1. Intentar descargar miniaturas JPG directamente desde R2 / thumb_urls para máxima velocidad y protección de RAM
+        downloaded_all_thumbs = True
+        for p in pages_to_audit:
+            p_url = thumb_urls.get(str(p)) or thumb_urls.get(p)
+            if not p_url and cat_hash:
+                p_url = f"{R2_PUBLIC_URL}/thumbnails/{cat_hash}/page_{p}.jpg"
+
+            got_thumb = False
+            if p_url and str(p_url).startswith('http'):
+                try:
+                    r = requests.get(p_url, timeout=12)
+                    if r.status_code == 200 and len(r.content) > 1000:
+                        fd, tmp_p = tempfile.mkstemp(suffix=f"_page_{p}.jpg")
+                        os.close(fd)
+                        with open(tmp_p, 'wb') as f:
+                            f.write(r.content)
+                        temp_img_paths.append(tmp_p)
+                        got_thumb = True
+                except Exception as e_thumb:
+                    print(f"Aviso descargando miniatura de pág {p}: {e_thumb}")
+
+            if not got_thumb:
+                downloaded_all_thumbs = False
+                break
+
+        # 2. Si no se pudieron descargar las miniaturas JPG, extraer del PDF
+        if not downloaded_all_thumbs:
+            for tp in temp_img_paths:
+                try: os.remove(tp)
+                except: pass
+            temp_img_paths = []
+
+            if not catalog_url or not str(catalog_url).startswith('http'):
+                return jsonify({"error": f"No se encontró URL válida del catálogo para extraer páginas {pages_to_audit}"}), 400
+
+            resp = requests.get(catalog_url, stream=True, timeout=60)
+            if resp.status_code != 200:
+                return jsonify({"error": f"No se pudo descargar el PDF del catálogo: {resp.status_code}"}), 400
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+                for chunk in resp.iter_content(chunk_size=16384):
+                    if chunk: tmp_pdf.write(chunk)
+                tmp_pdf_path = tmp_pdf.name
+
+            with pdf_render_lock:
+                doc = fitz.open(tmp_pdf_path)
+                try:
+                    for p in pages_to_audit:
+                        if 1 <= p <= len(doc):
+                            page_obj = doc.load_page(p - 1)
+                            page_texts[p] = page_obj.get_text()
+                            pix = page_obj.get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
+                            fd, tmp_p = tempfile.mkstemp(suffix=f"_page_{p}.jpg")
+                            os.close(fd)
+                            pix.save(tmp_p)
+                            temp_img_paths.append(tmp_p)
+                            del page_obj
+                            del pix
+                finally:
+                    doc.close()
+
+            if os.path.exists(tmp_pdf_path):
+                try: os.remove(tmp_pdf_path)
+                except: pass
+
+        if not temp_img_paths:
+            return jsonify({"error": f"No se pudieron cargar las imágenes de las páginas {pages_to_audit}"}), 400
+
+        # Preparar resumen de productos actuales para el prompt
+        simplified_prods = []
+        for pr in current_products:
+            simplified_prods.append({
+                "id": pr.get("id"),
+                "nombre": pr.get("nombre"),
+                "precio": pr.get("precio"),
+                "precio_promo": pr.get("precio_promo"),
+                "es_promo": pr.get("es_promo"),
+                "tipo_promo": pr.get("tipo_promo"),
+                "subtitulo_promo": pr.get("subtitulo_promo"),
+                "requisito_promo": pr.get("requisito_promo"),
+                "tipo_variante": pr.get("tipo_variante"),
+                "variantes": pr.get("variantes", []),
+                "pagina": str(pr.get("pagina", "")),
+                "descripcion_corta": pr.get("descripcion_corta", "")
+            })
+
+        ocr_summary = "\n".join([f"--- TEXTO OCR PÁGINA {k} ---\n{v}" for k, v in page_texts.items()])
+
+        prompt = f"""
+Eres un Auditor de Inteligencia Artificial experto en catálogos de belleza y moda (Cyzone, Esika, L'Bel).
+Estás auditando el pliego de catálogo correspondiente a las páginas {pages_to_audit} de la revista "{title}".
+
+INSTRUCCIÓN DEL ADMINISTRADOR:
+"{instruction}"
+
+PRODUCTOS REGISTRADOS ACTUALMENTE EN LA BASE DE DATOS PARA ESTE PLIEGO ({len(simplified_prods)} productos):
+{json.dumps(simplified_prods, ensure_ascii=False, indent=2)}
+
+{ocr_summary}
+
+REGLAS DE AUDITORÍA Y UNIFICACIÓN INTELIGENTE:
+
+1. DISTINCIÓN DE PRODUCTOS (NO MEZCLAR PRODUCTOS DISTINTOS):
+- Si en la página o pliego conviven productos de diferente tipo o línea (ej: Base Multifuncional Illumina vs Desmaquillador Bifásico Studio Look, o Labial vs Delineador), NO los fusiones. Cada producto diferente DEBE mantener su propia identidad.
+
+2. UNIFICACIÓN DE TONOS / VARIANTES DEL MISMO PRODUCTO:
+- Si un producto tiene varios tonos, colores o aromas a lo largo del pliego (ej: Base Illumina con tonos Moreno #06166, Medio #06160, Medio Claro #06158, Claro #06157):
+  * Deben consolidarse en UNA SOLA ficha principal.
+  * Define 'tipo_variante' ('Tono', 'Aroma' o 'Color').
+  * En 'variantes': [{{"nombre": "Nombre Tono", "codigo": "12345"}}].
+  * Todos los demás registros en la base de datos que representaban tonos sueltos deben incluirse en 'products_to_delete'.
+
+3. FUSIÓN DE VENTA INDIVIDUAL + PROMOCIÓN CONDICIONAL EN UN SOLO PRODUCTO:
+- Caso crítico: Cuando un producto se vende de forma individual Y además tiene una oferta especial vinculada o condicional (ej: "Studio Look Desmaquillador Bifásico" venta individual a $32.990 y en oferta a $14.990 por la compra de producto de rostro pág. 47 a 59):
+  * ¡NO DEBEN EXISTIR DOS PRODUCTOS SEPARADOS!
+  * Deben consolidarse en UN SOLO producto en 'products_to_update' con:
+    - 'nombre': "Studio Look Desmaquillador Bifásico con Ácido Hialurónico" (nombre comercial limpio)
+    - 'precio': "$32.990" (precio regular individual)
+    - 'precio_promo': "$14.990" (precio de oferta condicional)
+    - 'es_promo': true
+    - 'tipo_promo': "condicional"
+    - 'subtitulo_promo': "[PROMO] A solo $14.990 por compra rostro Pág. 47 a 59"
+    - 'requisito_promo': "Por la compra de cualquier producto de rostro de la página 47 a la 59 de Cyzone"
+    - 'promo_categoria_filtro': "CYZONE:47-59"
+  * Si existía un segundo producto creado para la promo o duplicado, agrégalo a 'products_to_delete'.
+
+4. PROMOCIÓN 2X1 / PAGA 1 LLEVA 2:
+- Si la oferta es "Paga 1 Lleva 2 por $XX" o "1x $A / 2x $B":
+  * 'es_promo': true
+  * 'tipo_promo': 'escala_2x'
+  * 'promo_cantidad_requerida': 2
+  * 'requisito_promo': 'Paga 1 y lleva 2 (Escoge 2 tonos iguales o combinados)'
+  * En 'variantes': lista completa de tonos disponibles para que el cliente escoja 2.
+
+5. PRECIOS VINCULADOS DE PÁGINA OPUESTA (LIBRO ABIERTO):
+- Si un producto de la página izquierda no tiene precio impreso y su precio está en la página derecha del pliego (o viceversa), asígnale el precio correspondiente.
+
+6. DEPURACIÓN DE FANTASMAS Y DUPLICADOS:
+- Agrega a 'products_to_delete' cualquier producto que carezca de precio y código, o que sea un duplicado redundante.
+
+7. CUMPLIMIENTO ESTRICTO DE LA INSTRUCCIÓN:
+- Si el administrador solicitó algo específico (ej: "elimina tal producto", "agrega tal tono", "cambia el precio a $X"), ejecútalo con la máxima prioridad.
+
+FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
+{{
+  "summary": "Explicación clara y detallada en español de lo que hiciste (ej: 'Se unificaron los 4 tonos de la Base Illumina en una sola ficha, se consolidó el Desmaquillador individual ($32.990) con su promo ($14.990) en 1 solo producto, y se eliminaron los registros duplicados').",
+  "products_to_update": [
+    {{
+      "id": "ID_DEL_PRODUCTO_EXISTENTE",
+      "nombre": "Nombre comercial completo",
+      "precio": "Precio individual regular (ej: $32.990)",
+      "precio_promo": "Precio oferta (ej: $14.990) o null",
+      "es_promo": true,
+      "tipo_promo": "condicional" / "escala_2x" / null,
+      "subtitulo_promo": "Subtítulo de la promo o null",
+      "requisito_promo": "Condición explicada o null",
+      "promo_categoria_filtro": "CYZONE:47-59" o null,
+      "tipo_variante": "Tono" / "Aroma" / null,
+      "variantes": [ {{"nombre": "Tono 1", "codigo": "12345"}} ],
+      "descripcion_corta": "Cód. XXXXX. Detalles, beneficios...",
+      "pagina": "{page_number}"
+    }}
+  ],
+  "products_to_create": [
+    {{
+      "nombre": "...",
+      "precio": "...",
+      "precio_promo": null,
+      "es_promo": false,
+      "tipo_promo": null,
+      "subtitulo_promo": null,
+      "requisito_promo": null,
+      "promo_categoria_filtro": null,
+      "tipo_variante": "Tono",
+      "variantes": [],
+      "descripcion_corta": "...",
+      "categoria": "...",
+      "subcategoria": "...",
+      "pagina": "{page_number}"
+    }}
+  ],
+  "products_to_delete": [
+    "ID_PRODUCTO_A_BORRAR"
+  ]
+}}
+"""
+
+        raw_res = call_gemini_with_key_manager(prompt, files=temp_img_paths, model_name='gemini-2.5-flash')
+        for tp in temp_img_paths:
+            try: os.remove(tp)
+            except: pass
+
+        text_resp = raw_res[0] if isinstance(raw_res, tuple) else raw_res
+        clean_text = str(text_resp or '').strip()
+        if clean_text.startswith('```json'): clean_text = clean_text.replace('```json', '', 1)
+        if clean_text.endswith('```'): clean_text = clean_text[:-3]
+        clean_text = clean_text.strip()
+
+        result_ai = json.loads(clean_text)
+        summary = result_ai.get('summary', 'Auditoría con IA ejecutada exitosamente.')
+        products_to_update = result_ai.get('products_to_update', [])
+        products_to_create = result_ai.get('products_to_create', [])
+        products_to_delete = result_ai.get('products_to_delete', [])
+
+        # Aplicar cambios en Firestore
+        updated_count = 0
+        created_count = 0
+        deleted_count = 0
+
+        if firebase_db:
+            products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+            batch = firebase_db.batch()
+            batch_ops = 0
+
+            # 1. Eliminar
+            for del_id in products_to_delete:
+                if del_id:
+                    doc_ref = products_col.document(str(del_id))
+                    batch.delete(doc_ref)
+                    batch_ops += 1
+                    deleted_count += 1
+                    if batch_ops >= 400:
+                        batch.commit()
+                        batch = firebase_db.batch()
+                        batch_ops = 0
+
+            # 2. Actualizar
+            for up in products_to_update:
+                u_id = up.get('id')
+                if u_id:
+                    clean_up = {k: v for k, v in up.items() if k != 'id' and v is not None}
+                    if 'nombre' in clean_up:
+                        _, c_name = clean_product_name(clean_up['nombre'])
+                        if c_name: clean_up['nombre'] = c_name
+                    doc_ref = products_col.document(str(u_id))
+                    batch.set(doc_ref, clean_up, merge=True)
+                    batch_ops += 1
+                    updated_count += 1
+                    if batch_ops >= 400:
+                        batch.commit()
+                        batch = firebase_db.batch()
+                        batch_ops = 0
+
+            # 3. Crear
+            for cr in products_to_create:
+                if cr.get('nombre'):
+                    _, c_name = clean_product_name(cr.get('nombre'))
+                    cr['nombre'] = c_name if c_name else cr.get('nombre')
+                    cr = clean_product_taxonomy(cr)
+                    c_page = str(cr.get('pagina') or page_number)
+                    new_id = get_single_catalog_hash(f"{cat_hash}_{cr.get('nombre')}_{cr.get('precio', '')}_{c_page}_{time.time()}")
+                    cr['id'] = new_id
+                    cr['catalogo'] = title
+                    cr['catalogo_url'] = catalog_url.split('?')[0] if catalog_url else ''
+                    cr['catalogo_hash'] = cat_hash
+                    cr['pagina'] = c_page
+                    if not cr.get('imagen'):
+                        cr['imagen'] = f"{R2_PUBLIC_URL}/thumbnails/{cat_hash}/page_{c_page}.jpg"
+
+                    doc_ref = products_col.document(new_id)
+                    batch.set(doc_ref, cr)
+                    batch_ops += 1
+                    created_count += 1
+                    if batch_ops >= 400:
+                        batch.commit()
+                        batch = firebase_db.batch()
+                        batch_ops = 0
+
+            if batch_ops > 0:
+                batch.commit()
+
+        return jsonify({
+            "success": True,
+            "summary": summary,
+            "updated_count": updated_count,
+            "created_count": created_count,
+            "deleted_count": deleted_count
+        })
+
+    except Exception as e:
+        print(f"Error en audit_spread_ai: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/sync_spread_prices', methods=['POST'])
