@@ -426,7 +426,7 @@ def wait_for_gemini_slot(min_interval=3.2):
             time.sleep(min_interval - elapsed)
         last_gemini_dispatch_time = time.time()
 
-def call_gemini_with_key_manager(prompt, files=None, max_retries=15, model_name='gemini-2.0-flash', json_mode=True, page_num=None):
+def call_gemini_with_key_manager(prompt, files=None, max_retries=15, model_name='gemini-3.6-flash', json_mode=True, page_num=None):
     actual_attempts = 0
     quota_cooldown_cycles = 0
     max_quota_cycles = 40
@@ -484,12 +484,17 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=15, model_name=
             if json_mode:
                 config_dict['response_mime_type'] = "application/json"
                 
-            # Modelos oficiales disponibles en google-genai
-            # 'gemini-2.0-flash' es el modelo multimodal estándar y ultra rápido
-            # 'gemini-2.0-flash-lite' es el respaldo oficial de alta velocidad
-            primary_model = model_name if model_name in ['gemini-2.0-flash', 'gemini-2.0-flash-lite'] else 'gemini-2.0-flash'
-            fallback_model = 'gemini-2.0-flash-lite' if primary_model == 'gemini-2.0-flash' else 'gemini-2.0-flash'
-            models_to_try = [primary_model, fallback_model]
+            # Modelos oficiales actuales de Gemini API (según especifica Google API):
+            # 1. 'gemini-3.6-flash': Modelo recomendado por Google API para generateContent multimodal
+            # 2. 'gemini-3.5-flash-lite': Modelo rápido y ligero recomendado
+            # 3. 'gemini-2.0-flash': Modelo legacy por compatibilidad
+            candidate_models = []
+            if model_name:
+                candidate_models.append(model_name)
+            for m in ['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.0-flash-lite']:
+                if m not in candidate_models:
+                    candidate_models.append(m)
+            models_to_try = candidate_models
             
             response = None
             last_err = None
@@ -2923,7 +2928,7 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
 }}
 """
 
-        raw_res = call_gemini_with_key_manager(prompt, files=temp_img_paths, model_name='gemini-2.0-flash')
+        raw_res = call_gemini_with_key_manager(prompt, files=temp_img_paths, model_name='gemini-3.6-flash')
         for tp in temp_img_paths:
             try: os.remove(tp)
             except: pass
