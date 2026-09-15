@@ -426,44 +426,71 @@ def wait_for_gemini_slot(min_interval=3.2):
             time.sleep(min_interval - elapsed)
         last_gemini_dispatch_time = time.time()
 
-def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name='gemini-3.5-flash-lite', json_mode=True, page_num=None):
+def call_gemini_with_key_manager(prompt, files=None, max_retries=15, model_name='gemini-2.0-flash', json_mode=True, page_num=None):
     actual_attempts = 0
     quota_cooldown_cycles = 0
-    max_quota_cycles = 60
+    max_quota_cycles = 40
+    total_wait_time = 0.0
+    max_total_wait = 35.0  # Evita que el worker de Gunicorn caiga por timeout (120s)
+
+    # Pre-cargar imágenes en memoria como Parts de genai para no depender de client.files.upload
+    # ni sufrir latencia de subida a la nube en cada reintento
+    image_parts = []
+    if files:
+        for fpath in files:
+            if fpath and os.path.exists(fpath):
+                try:
+                    with open(fpath, "rb") as img_f:
+                        img_bytes = img_f.read()
+                        if img_bytes:
+                            # Detectar mime_type según extensión
+                            mime = "image/png" if fpath.lower().endswith(".png") else "image/jpeg"
+                            image_parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime))
+                except Exception as read_err:
+                    print(f"[Gemini] Error leyendo imagen local {fpath}: {read_err}")
 
     while actual_attempts < max_retries and quota_cooldown_cycles < max_quota_cycles:
+        if total_wait_time >= max_total_wait:
+            print(f"[Gemini] Límite de espera acumulada ({total_wait_time:.1f}s) alcanzado para evitar worker timeout.")
+            break
+
         key_name, client, key_item, pre_sleep = key_manager.get_client()
         if key_name is None:
-            wait_time = min(max(1.0, client + 0.5), 20.0)
+            wait_time = min(max(1.0, client + 0.5), 10.0)
+            if total_wait_time + wait_time > max_total_wait:
+                wait_time = max(0.5, max_total_wait - total_wait_time)
             print(f"[Gemini] Esperando disponibilidad de llaves ({wait_time:.1f}s)...")
             time.sleep(wait_time)
+            total_wait_time += wait_time
             continue
             
         if pre_sleep > 0:
             time.sleep(pre_sleep)
+            total_wait_time += pre_sleep
             
         thread_id = threading.get_ident()
         if page_num:
             key_manager.register_worker_key(thread_id, page_num, key_name)
             
-        uploaded_files = []
         try:
             print(f"[Gemini] Despachando con {key_name}...")
             
             contents = []
-            if files:
-                for fpath in files:
-                    gf = client.files.upload(file=fpath)
-                    uploaded_files.append(gf)
-                contents.extend(uploaded_files)
+            if image_parts:
+                contents.extend(image_parts)
             contents.append(prompt)
             
             config_dict = {}
             if json_mode:
                 config_dict['response_mime_type'] = "application/json"
                 
-            # Intentar con gemini-3.5-flash-lite, con fallback automático a gemini-2.5-flash y gemini-2.0-flash ante 503/404
-            models_to_try = [model_name, 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
+            # Modelos oficiales disponibles en google-genai
+            # 'gemini-2.0-flash' es el modelo multimodal estándar y ultra rápido
+            # 'gemini-2.0-flash-lite' es el respaldo oficial de alta velocidad
+            primary_model = model_name if model_name in ['gemini-2.0-flash', 'gemini-2.0-flash-lite'] else 'gemini-2.0-flash'
+            fallback_model = 'gemini-2.0-flash-lite' if primary_model == 'gemini-2.0-flash' else 'gemini-2.0-flash'
+            models_to_try = [primary_model, fallback_model]
+            
             response = None
             last_err = None
             for m_candidate in models_to_try:
@@ -479,7 +506,7 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
                     last_err = model_err
                     err_str_candidate = str(model_err).lower()
                     if any(w in err_str_candidate for w in ["404", "not found", "503", "unavailable", "high demand", "capacity"]):
-                        print(f"[Gemini] Modelo {m_candidate} con alta demanda o no disponible. Alternando a siguiente modelo de respaldo...")
+                        print(f"[Gemini] Modelo {m_candidate} no disponible temporalmente ({model_err}). Alternando a siguiente modelo de respaldo...")
                         continue
                     else:
                         raise model_err
@@ -497,36 +524,40 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=20, model_name=
             
             if "429" in error_str or "quota" in error_str.lower() or "resource_exhausted" in error_str.lower():
                 quota_cooldown_cycles += 1
-                delay = extract_retry_delay(error_str, default=21)
-                cd = max(10, min(delay + 1, 45))
+                delay = extract_retry_delay(error_str, default=15)
+                cd = max(8, min(delay + 1, 35))
                 key_manager.mark_cooldown(key_item, cd)
                 key_manager.register_key_alert(key_name, "429", cd)
-                time.sleep(1.0)
+                time.sleep(0.5)
+                total_wait_time += 0.5
             elif "503" in error_str or "unavailable" in error_str.lower() or "demand" in error_str.lower():
                 quota_cooldown_cycles += 1
-                key_manager.mark_cooldown(key_item, 20)
+                key_manager.mark_cooldown(key_item, 10)
                 key_manager.register_key_alert(key_name, "503")
-                time.sleep(1.0)
+                time.sleep(0.5)
+                total_wait_time += 0.5
             elif "401" in error_str or "403" in error_str:
                 actual_attempts += 1
                 key_manager.mark_cooldown(key_item, 86400, permanent=True)
                 key_manager.register_key_alert(key_name, "403")
-            elif "400" in error_str or "404" in error_str:
+            elif "404" in error_str:
+                # 404 es problema del recurso o modelo, NUNCA debe inhabilitar la API key permanentemente
                 actual_attempts += 1
-                key_manager.mark_cooldown(key_item, 86400, permanent=True)
-                key_manager.register_key_alert(key_name, "404")
+                key_manager.mark_cooldown(key_item, 3, permanent=False)
+                time.sleep(0.5)
+                total_wait_time += 0.5
+            elif "400" in error_str:
+                actual_attempts += 1
+                key_manager.mark_cooldown(key_item, 5, permanent=False)
+                time.sleep(0.5)
+                total_wait_time += 0.5
             else:
                 actual_attempts += 1
-                key_manager.mark_cooldown(key_item, 5)
-                time.sleep(1.5)
-        finally:
-            for gf in uploaded_files:
-                try:
-                    client.files.delete(name=gf.name)
-                except Exception:
-                    pass
+                key_manager.mark_cooldown(key_item, 5, permanent=False)
+                time.sleep(1.0)
+                total_wait_time += 1.0
                 
-    raise Exception(f"Gemini no pudo responder tras múltiples reintentos.")
+    raise Exception("Gemini no pudo responder tras múltiples reintentos o el tiempo límite de espera expiró.")
 
 def clean_product_name(raw_name):
     if not raw_name:
@@ -2892,7 +2923,7 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
 }}
 """
 
-        raw_res = call_gemini_with_key_manager(prompt, files=temp_img_paths, model_name='gemini-2.5-flash')
+        raw_res = call_gemini_with_key_manager(prompt, files=temp_img_paths, model_name='gemini-2.0-flash')
         for tp in temp_img_paths:
             try: os.remove(tp)
             except: pass
