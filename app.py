@@ -1851,31 +1851,11 @@ def process_single_catalog(idx, cat):
         doc_snap = status_collection.document(cat_hash).get()
         if doc_snap.exists:
             data = doc_snap.to_dict()
-            if data.get('status') == 'completed' and data.get('progress', 0) >= 100:
-                print(f"Catálogo {title} ya estaba procesado completamente al 100%. Abortando re-lectura.")
+            total_pg = int(data.get('total_pages', 0) or 0)
+            comp_pg = int(data.get('completed_pages', 0) or 0)
+            if data.get('status') == 'completed' and data.get('progress', 0) >= 100 and total_pg > 0 and comp_pg >= total_pg:
+                print(f"Catálogo {title} ya estaba procesado completamente al 100% ({comp_pg}/{total_pg} págs). Abortando re-lectura.")
                 return
-
-    # 1.1 Si la base de datos ya tiene los productos de esta revista registrados, marcar completado y no re-leer
-    if firebase_db:
-        try:
-            clean_url = url.split('?')[0]
-            products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
-            existing_count = len(list(products_col.where("catalogo_hash", "==", cat_hash).limit(10).stream()))
-            if existing_count == 0:
-                existing_count = len(list(products_col.where("catalogo_url", "==", clean_url).limit(10).stream()))
-            if existing_count >= 5:
-                print(f"[{title}] Ya cuenta con productos registrados en Firebase. Marcando completado al 100% sin re-descargar.")
-                if status_collection:
-                    status_collection.document(cat_hash).set({
-                        "status": "completed",
-                        "title": title,
-                        "message": "¡Revista memorizada con éxito!",
-                        "progress": 100,
-                        "updatedAt": firestore.SERVER_TIMESTAMP
-                    }, merge=True)
-                return
-        except Exception as e:
-            print(f"Aviso comprobando productos existentes: {e}")
 
     if status_collection and (not doc_snap or not doc_snap.exists):
         status_collection.document(cat_hash).set({
@@ -2110,6 +2090,9 @@ def process_single_catalog(idx, cat):
                 "title": title,
                 "message": "¡Revista memorizada con éxito!",
                 "progress": 100,
+                "completed_pages": total_pages,
+                "total_pages": total_pages,
+                "last_successful_page": total_pages,
                 "updatedAt": firestore.SERVER_TIMESTAMP
             })
             print(f"[{title}] ¡Proceso completado al 100% exitosamente!")
@@ -2376,16 +2359,10 @@ def auto_resume_unfinished_catalogs():
             s_doc = status_col.document(cat_hash).get()
             if s_doc.exists:
                 s_data = s_doc.to_dict()
-                # Si ya está marcado como completado al 100%, omitir
-                if s_data.get('status') == 'completed' and s_data.get('progress', 0) >= 100:
-                    continue
-                # Si el estado es processing o < 100%, verificar si ya tiene sus productos
-                clean_url = url.split('?')[0]
-                products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
-                has_prods = len(list(products_col.where("catalogo_hash", "==", cat_hash).limit(5).stream())) > 0 or \
-                            len(list(products_col.where("catalogo_url", "==", clean_url).limit(5).stream())) > 0
-                if has_prods and s_data.get('status') != 'processing':
-                    status_col.document(cat_hash).set({"status": "completed", "progress": 100, "message": "¡Revista memorizada con éxito!"}, merge=True)
+                tot_p = int(s_data.get('total_pages', 0) or 0)
+                comp_p = int(s_data.get('completed_pages', 0) or 0)
+                # Solo omitir si realmente está completado al 100% con todas las páginas memorizadas
+                if s_data.get('status') == 'completed' and s_data.get('progress', 0) >= 100 and tot_p > 0 and comp_p >= tot_p:
                     continue
 
                 c_data['url'] = url
@@ -2394,15 +2371,7 @@ def auto_resume_unfinished_catalogs():
                 c_data['appId'] = appId
                 to_resume.append(c_data)
             else:
-                # No tiene doc de status aún: verificar si ya tiene productos
-                clean_url = url.split('?')[0]
-                products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
-                has_prods = len(list(products_col.where("catalogo_hash", "==", cat_hash).limit(5).stream())) > 0 or \
-                            len(list(products_col.where("catalogo_url", "==", clean_url).limit(5).stream())) > 0
-                if has_prods:
-                    status_col.document(cat_hash).set({"status": "completed", "progress": 100, "message": "¡Revista memorizada con éxito!", "title": title}, merge=True)
-                    continue
-
+                # No tiene doc de status aún: encolar para procesar
                 c_data['url'] = url
                 c_data['title'] = title
                 c_data['hash'] = cat_hash
@@ -2499,24 +2468,12 @@ def search_products():
                     status_doc = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status").document(cat_hash).get()
                     if status_doc.exists:
                         s_data = status_doc.to_dict()
-                        if s_data.get('status') == 'completed' and s_data.get('progress', 0) >= 100:
+                        tot_p = int(s_data.get('total_pages', 0) or 0)
+                        comp_p = int(s_data.get('completed_pages', 0) or 0)
+                        if s_data.get('status') == 'completed' and s_data.get('progress', 0) >= 100 and tot_p > 0 and comp_p >= tot_p:
                             is_completed = True
                 except Exception:
                     pass
-
-            if prods and len(prods) >= 10:
-                is_completed = True
-                if firebase_db:
-                    try:
-                        firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status").document(cat_hash).set({
-                            "status": "completed",
-                            "title": title,
-                            "message": "¡Revista memorizada con éxito!",
-                            "progress": 100,
-                            "updatedAt": firestore.SERVER_TIMESTAMP
-                        }, merge=True)
-                    except Exception:
-                        pass
 
             if prods:
                 combined_items.extend(prods)
@@ -2525,12 +2482,45 @@ def search_products():
             if not is_completed:
                 missing_catalogs.append(cat)
 
-        # Si se solicitó sincronización forzada ("ignorar") desde el panel de admin
-        if query == "ignorar":
-            if missing_catalogs:
-                thread = threading.Thread(target=background_extract_and_save, args=(missing_catalogs,), daemon=True)
+        # Si se solicitó sincronización forzada ("ignorar", "sync", "sincronizar") desde el panel de admin
+        if query in ["ignorar", "sync", "sincronizar"]:
+            # Recorrer todos los catálogos enviados para reanudar los que no estén 100% terminados en páginas
+            catalogs_to_run = []
+            for cat in catalogs:
+                c_url = cat.get('pdfUrl') or cat.get('url')
+                c_title = cat.get('title', 'Revista')
+                if not c_url:
+                    continue
+                c_hash = get_single_catalog_hash(c_url, c_title)
+                c_data = dict(cat)
+                c_data['url'] = c_url
+                c_data['title'] = c_title
+                c_data['hash'] = c_hash
+                c_data['appId'] = appId
+                
+                truly_completed = False
+                if firebase_db:
+                    try:
+                        s_snap = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status").document(c_hash).get()
+                        if s_snap.exists:
+                            sd = s_snap.to_dict()
+                            tot = int(sd.get('total_pages', 0) or 0)
+                            cmp = int(sd.get('completed_pages', 0) or 0)
+                            if sd.get('status') == 'completed' and sd.get('progress', 0) >= 100 and tot > 0 and cmp >= tot:
+                                truly_completed = True
+                    except Exception:
+                        pass
+                
+                if not truly_completed:
+                    catalogs_to_run.append(c_data)
+                    
+            if catalogs_to_run:
+                print(f"[Sync] Iniciando lectura de {len(catalogs_to_run)} catálogo(s) incompletos/pendientes en segundo plano...")
+                thread = threading.Thread(target=background_extract_and_save, args=(catalogs_to_run,), daemon=True)
                 thread.start()
-            return jsonify({"response": "Proceso de sincronización iniciado."})
+                return jsonify({"response": f"Sincronización iniciada: procesando {len(catalogs_to_run)} revista(s) con páginas pendientes.", "processing": len(catalogs_to_run)})
+            else:
+                return jsonify({"response": "Todas las revistas ya están al 100% con todas sus páginas memorizadas.", "processing": 0})
 
         # Si no hay productos en caché todavía y faltan catálogos por procesar
         if missing_catalogs and not combined_items:
