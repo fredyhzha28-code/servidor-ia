@@ -74,6 +74,7 @@ def health_check():
     }), 200
 
 @app.route('/api/keys-diagnostics', methods=['GET'])
+@app.route('/api/search/api/keys-diagnostics', methods=['GET'])
 def keys_diagnostics():
     if 'key_manager' not in globals() or not key_manager:
         return jsonify({"error": "KeyManager no inicializado", "summary": {"has_errors": False, "total_keys": 0}, "keys": []}), 200
