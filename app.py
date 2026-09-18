@@ -634,7 +634,8 @@ class GeminiKeyManager:
                     return item.name, item.client, item, sleep_needed
 
             # --- PRIORIDAD 2: Si todas las principales están en espera, usar Respaldo (Tier 2) ---
-            if now >= self.backup_group_cooldown_until and self.backup_items:
+            # Las llaves de respaldo están en proyectos independientes, por lo que rotan individualmente
+            if self.backup_items:
                 for _ in range(len(self.backup_items)):
                     item = self.backup_items[self.backup_idx]
                     self.backup_idx = (self.backup_idx + 1) % len(self.backup_items)
@@ -644,18 +645,16 @@ class GeminiKeyManager:
                     if now >= item.cooldown_until:
                         item.available = True
                         elapsed = now - item.last_used
-                        if elapsed < 2.0:
-                            sleep_needed = 2.0 - elapsed
+                        if elapsed < 1.0:
+                            sleep_needed = 1.0 - elapsed
                         item.last_used = now + sleep_needed
                         return item.name, item.client, item, sleep_needed
 
             # Si todas están en espera, calcular el tiempo mínimo exacto
             waits = []
-            for item in self.primary_items:
+            for item in (self.primary_items + self.backup_items):
                 if not item.permanently_disabled:
                     waits.append(max(0.5, item.cooldown_until - now))
-            if self.backup_items and self.backup_group_cooldown_until > now:
-                waits.append(max(0.5, self.backup_group_cooldown_until - now))
             min_wait = min(waits) if waits else 5.0
             return None, min_wait, None, 0.0
 
@@ -672,11 +671,6 @@ class GeminiKeyManager:
                 threading.Thread(target=self.save_keys_state_to_firestore, daemon=True).start()
             else:
                 print(f"[KeyManager] {item.name} en espera por {int(seconds)}s.")
-                # Si es de respaldo (Tier 2), pausar el grupo de respaldo completo porque comparten cuenta
-                if item.tier == 2:
-                    self.backup_group_cooldown_until = max(self.backup_group_cooldown_until, now + seconds)
-                    print(f"[KeyManager] Grupo de Respaldo pausado por {int(seconds)}s.")
-                # Si es Tier 1 (Principal), ¡NO pausa a las otras principales porque son cuentas independientes!
 
 key_manager = GeminiKeyManager(primary_keys_loaded, backup_keys_loaded)
 
