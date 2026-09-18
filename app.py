@@ -9,6 +9,9 @@ import gc
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
 import ctypes
 
 try:
@@ -237,6 +240,48 @@ if firebase_creds_b64:
         print(f"Error inicializando Firebase: {e}")
 else:
     print("No se encontró FIREBASE_CREDENTIALS_B64. Funcionando sin caché en Firebase.")
+
+# =====================================================================
+# SUPABASE REST API INTEGRATION (ILIMITADO, SIN CUOTAS DIARIAS)
+# =====================================================================
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://qlpuuieqoyxksuxeoycd.supabase.co")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", os.environ.get("SUPABASE_SECRET_KEY", "sb_secret_jX_WWCQ-dKVgvP6YZpI1_A_WIP2MGrN"))
+
+def supabase_post(table, data):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return False
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/{table}"
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates"
+        }
+        body = json.dumps(data).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return resp.status in (200, 201)
+    except Exception as e:
+        print(f"[Supabase] Aviso guardando en '{table}': {e}")
+        return False
+
+def supabase_get(table, query=""):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return []
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/{table}{query}"
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            content = resp.read().decode("utf-8")
+            return json.loads(content) if content else []
+    except Exception as e:
+        print(f"[Supabase] Aviso consultando '{table}': {e}")
+        return []
 
 # Registro global de salud y cuota de Firebase Firestore
 firestore_health = {
@@ -2146,38 +2191,67 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
     del page_text
     print(f"[{title} | Pág {page_num}/{total_pages}] {used_key}: {len(products)} -> Consolidados y unificados: {len(unique_products)}")
     
-    # 5. Guardar productos en Firebase inmediatamente
-    if firebase_db:
-        products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
-        batch = firebase_db.batch()
-        count = 0
-        
-        for p in unique_products:
-            p_id = p.get('id', get_single_catalog_hash(f"{cat_hash}_{p.get('nombre')}_{p.get('precio', '')}_{page_num}"))
-            p['imagen'] = img_url
-            p['catalogo_url'] = url.split('?')[0]
-            p['catalogo_hash'] = cat_hash
-            p['pagina'] = str(page_num)
-            
-            doc_ref = products_col.document(p_id)
-            batch.set(doc_ref, p)
-            count += 1
-            if count >= 400:
-                batch.commit()
-                batch = firebase_db.batch()
-                count = 0
-                
-        if count > 0:
-            batch.commit()
-            
-        # 6. Actualizar progreso de la página individual
-        page_ref = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("catalogs_progress").document(cat_hash).collection("pages").document(str(page_num))
-        page_ref.set({
-            "status": "completed",
-            "products_count": len(unique_products),
-            "image_url": img_url,
-            "processed_at": firestore.SERVER_TIMESTAMP
+    # 5. Guardar productos en Supabase (Ilimitado y permanente)
+    supa_products = []
+    for p in unique_products:
+        supa_products.append({
+            "nombre": p.get("nombre") or "Producto",
+            "descripcion_corta": p.get("descripcion_corta") or "",
+            "precio": str(p.get("precio") or "$0"),
+            "precio_promo": str(p.get("precio_promo") or ""),
+            "codigo": str(p.get("codigo") or ""),
+            "pagina": int(page_num),
+            "categoria": p.get("categoria") or "Dama",
+            "seccion": p.get("seccion") or "General",
+            "subcategoria": p.get("subcategoria") or "General",
+            "catalogo": title,
+            "catalogo_url": url.split('?')[0],
+            "catalogo_hash": cat_hash,
+            "imagen_recorte": p.get("imagen_recorte") or img_url,
+            "es_promo": bool(p.get("es_promo", False)),
+            "tipo_promo": p.get("tipo_promo") or "",
+            "requisito_promo": p.get("requisito_promo") or "",
+            "coords": p.get("coords") if isinstance(p.get("coords"), dict) else {}
         })
+    if supa_products:
+        supabase_post("products", supa_products)
+
+    # 6. Guardar productos en Firebase Firestore como respaldo
+    if firebase_db:
+        try:
+            products_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("products")
+            batch = firebase_db.batch()
+            count = 0
+            
+            for p in unique_products:
+                p_id = p.get('id', get_single_catalog_hash(f"{cat_hash}_{p.get('nombre')}_{p.get('precio', '')}_{page_num}"))
+                p['imagen'] = img_url
+                p['catalogo_url'] = url.split('?')[0]
+                p['catalogo_hash'] = cat_hash
+                p['pagina'] = str(page_num)
+                
+                doc_ref = products_col.document(p_id)
+                batch.set(doc_ref, p)
+                count += 1
+                if count >= 400:
+                    batch.commit()
+                    batch = firebase_db.batch()
+                    count = 0
+                    
+            if count > 0:
+                batch.commit()
+                
+            page_ref = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("catalogs_progress").document(cat_hash).collection("pages").document(str(page_num))
+            page_ref.set({
+                "status": "completed",
+                "products_count": len(unique_products),
+                "image_url": img_url,
+                "processed_at": firestore.SERVER_TIMESTAMP
+            })
+            record_firestore_success()
+        except Exception as fe:
+            print(f"[{title} | Pág {page_num}] Aviso guardando en Firestore: {fe}")
+            record_firestore_error(fe)
         
     key_manager.register_worker_finish(thread_id, page_num, used_key, len(unique_products))
     
@@ -2200,31 +2274,50 @@ def process_single_catalog(idx, cat):
     status_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status") if firebase_db else None
     catalogs_collection = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("catalogs") if firebase_db else None
     
-    # 0. Verificación de que el catálogo existe en la base de datos
-    if catalogs_collection:
-        clean_url = url.split('?')[0]
+    # 0. Verificación de que el catálogo existe en la base de datos (Supabase o Firebase)
+    clean_url = url.split('?')[0]
+    exists_in_db = False
+
+    # 0a. Primero verificar en Supabase
+    try:
+        supa_cats = supabase_get("catalogs")
+        for sc in supa_cats:
+            s_url = (sc.get('pdf_url') or sc.get('pdfUrl') or '').split('?')[0]
+            s_title = (sc.get('title') or '').strip().lower()
+            if s_url == clean_url or s_title == title.strip().lower():
+                exists_in_db = True
+                break
+    except Exception as se:
+        print(f"[{title}] Aviso verificando catálogo en Supabase: {se}")
+
+    # 0b. Si no se encontró en Supabase, verificar en Firebase
+    if not exists_in_db and catalogs_collection:
         try:
             all_cats = catalogs_collection.get()
-            exists_in_db = False
             for c in all_cats:
                 c_data = c.to_dict()
                 db_url = (c_data.get('pdfUrl') or c_data.get('url') or '').split('?')[0]
                 if db_url == clean_url or (c_data.get('title') and c_data.get('title').strip() == title.strip()):
                     exists_in_db = True
                     break
-                    
-            if not exists_in_db:
-                print(f"[{title}] Catálogo no encontrado en Firebase 'catalogs'. Abortando.")
-                if status_collection:
-                    try: status_collection.document(cat_hash).delete()
-                    except: pass
-                return
         except Exception as fe:
             print(f"[{title}] Aviso verificando catálogo en Firestore: {fe}")
             record_firestore_error(fe)
-            # Si Firestore falló con 429 Quota Exceeded, no abortar la lectura del catálogo que el usuario solicitó
             
     # 1. Recuperar estado de procesamiento
+    # 1a. Verificar en Supabase si ya estaba procesado completamente
+    try:
+        supa_st = supabase_get("ai_extraction_status", f"?id=eq.{cat_hash}")
+        if supa_st and len(supa_st) > 0:
+            s_data = supa_st[0]
+            total_pg = int(s_data.get('total_pages', 0) or 0)
+            comp_pg = int(s_data.get('completed_pages', 0) or 0)
+            if s_data.get('status') == 'completed' and s_data.get('progress', 0) >= 100 and total_pg > 0 and comp_pg >= total_pg:
+                print(f"Catálogo {title} ya estaba procesado completamente en Supabase ({comp_pg}/{total_pg} págs). Abortando re-lectura.")
+                return
+    except Exception as se:
+        print(f"[{title}] Aviso leyendo estado de catálogo en Supabase: {se}")
+
     doc_snap = None
     if status_collection:
         try:
@@ -2239,6 +2332,18 @@ def process_single_catalog(idx, cat):
         except Exception as fe:
             print(f"[{title}] Aviso leyendo estado de catálogo en Firestore: {fe}")
             record_firestore_error(fe)
+
+    # Guardar estado inicial en Supabase
+    supabase_post("ai_extraction_status", {
+        "id": cat_hash,
+        "title": title,
+        "status": "processing",
+        "message": "Descargando PDF...",
+        "progress": 1,
+        "completed_pages": 0,
+        "total_pages": 0,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    })
 
     if status_collection and (not doc_snap or not doc_snap.exists):
         try:
@@ -2361,12 +2466,12 @@ def process_single_catalog(idx, cat):
                 "updatedAt": firestore.SERVER_TIMESTAMP
             }, merge=True)
             
-            # Latido constante en tiempo real a Firestore (cada 6s)
+            # Latido constante en tiempo real a Supabase y Firestore (cada 6s)
             # Garantiza que el usuario vea en su página web todos los eventos sin saturar cuota de Firebase
             def run_heartbeat():
                 while not stop_event.is_set():
                     time.sleep(6.0)
-                    if stop_event.is_set() or not catalog_alive or not status_collection:
+                    if stop_event.is_set() or not catalog_alive:
                         break
                     try:
                         with progress_lock:
@@ -2382,27 +2487,48 @@ def process_single_catalog(idx, cat):
                         else:
                             msg_now = f"Memorizando con IA: {c_now}/{total_pages} páginas ({pct_now}%)..."
                             
-                        status_collection.document(cat_hash).set({
-                            "status": "processing",
+                        # Actualizar en Supabase (Ilimitado y libre de cuotas)
+                        supabase_post("ai_extraction_status", {
+                            "id": cat_hash,
                             "title": title,
+                            "status": "processing",
                             "message": msg_now,
                             "progress": pct_now,
                             "completed_pages": c_now,
                             "total_pages": total_pages,
-                            "last_successful_page": c_now,
                             "active_workers": act_workers,
-                            "recent_events": telem.get("recent_events", []),
+                            "recent_events": telem.get("recent_events", [])[:10],
                             "keys_summary": {
-                                "primary_active": telem["primary_active"],
-                                "primary_cooldown": telem["primary_cooldown"],
-                                "primary_disabled": telem["primary_disabled"],
-                                "backup_active": telem["backup_active"]
+                                "primary_active": telem.get("primary_active", 0),
+                                "primary_cooldown": telem.get("primary_cooldown", 0),
+                                "primary_disabled": telem.get("primary_disabled", 0),
+                                "backup_active": telem.get("backup_active", 0)
                             },
-                            "disabled_keys": telem.get("disabled_keys", []),
-                            "keys_detail": telem.get("keys_detail", []),
-                            "updatedAt": firestore.SERVER_TIMESTAMP
-                        }, merge=True)
-                        record_firestore_success()
+                            "updated_at": datetime.now(timezone.utc).isoformat()
+                        })
+
+                        if status_collection:
+                            status_collection.document(cat_hash).set({
+                                "status": "processing",
+                                "title": title,
+                                "message": msg_now,
+                                "progress": pct_now,
+                                "completed_pages": c_now,
+                                "total_pages": total_pages,
+                                "last_successful_page": c_now,
+                                "active_workers": act_workers,
+                                "recent_events": telem.get("recent_events", []),
+                                "keys_summary": {
+                                    "primary_active": telem["primary_active"],
+                                    "primary_cooldown": telem["primary_cooldown"],
+                                    "primary_disabled": telem["primary_disabled"],
+                                    "backup_active": telem["backup_active"]
+                                },
+                                "disabled_keys": telem.get("disabled_keys", []),
+                                "keys_detail": telem.get("keys_detail", []),
+                                "updatedAt": firestore.SERVER_TIMESTAMP
+                            }, merge=True)
+                            record_firestore_success()
                     except Exception as e:
                         pass
             threading.Thread(target=run_heartbeat, daemon=True).start()
@@ -2498,10 +2624,17 @@ def process_single_catalog(idx, cat):
         stop_event.set()
         if not catalog_alive:
             print(f"[{title}] Proceso cancelado porque la revista fue eliminada.")
+            try:
+                url_del = f"{SUPABASE_URL}/rest/v1/ai_extraction_status?id=eq.{cat_hash}"
+                headers = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+                req_d = urllib.request.Request(url_del, headers=headers, method="DELETE")
+                urllib.request.urlopen(req_d, timeout=5)
+            except Exception:
+                pass
             if status_collection:
                 try: status_collection.document(cat_hash).delete()
                 except: pass
-        elif status_collection:
+        else:
             with progress_lock:
                 final_completed = completed_count
             
@@ -2513,35 +2646,79 @@ def process_single_catalog(idx, cat):
                 except Exception as re_err:
                     print(f"Aviso reconciliando libro abierto: {re_err}")
 
-                status_collection.document(cat_hash).set({
-                    "status": "completed",
+                # Guardar completado en Supabase
+                supabase_post("ai_extraction_status", {
+                    "id": cat_hash,
                     "title": title,
+                    "status": "completed",
                     "message": "¡Revista memorizada con éxito!",
                     "progress": 100,
                     "completed_pages": total_pages,
                     "total_pages": total_pages,
-                    "last_successful_page": total_pages,
-                    "updatedAt": firestore.SERVER_TIMESTAMP
+                    "updated_at": datetime.now(timezone.utc).isoformat()
                 })
+
+                if status_collection:
+                    try:
+                        status_collection.document(cat_hash).set({
+                            "status": "completed",
+                            "title": title,
+                            "message": "¡Revista memorizada con éxito!",
+                            "progress": 100,
+                            "completed_pages": total_pages,
+                            "total_pages": total_pages,
+                            "last_successful_page": total_pages,
+                            "updatedAt": firestore.SERVER_TIMESTAMP
+                        })
+                    except Exception as fe:
+                        record_firestore_error(fe)
                 print(f"[{title}] ¡Proceso completado al 100% exitosamente!")
             else:
                 pct_f = int((final_completed / total_pages) * 100) if total_pages > 0 else 0
-                status_collection.document(cat_hash).set({
-                    "status": "paused",
+                
+                # Guardar pausa en Supabase
+                supabase_post("ai_extraction_status", {
+                    "id": cat_hash,
                     "title": title,
+                    "status": "paused",
                     "message": f"Lectura pausada en pág {final_completed}/{total_pages} ({pct_f}%). Puedes continuar cuando gustes.",
                     "progress": pct_f,
                     "completed_pages": final_completed,
                     "total_pages": total_pages,
-                    "last_successful_page": final_completed,
-                    "updatedAt": firestore.SERVER_TIMESTAMP
-                }, merge=True)
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                })
+
+                if status_collection:
+                    try:
+                        status_collection.document(cat_hash).set({
+                            "status": "paused",
+                            "title": title,
+                            "message": f"Lectura pausada en pág {final_completed}/{total_pages} ({pct_f}%). Puedes continuar cuando gustes.",
+                            "progress": pct_f,
+                            "completed_pages": final_completed,
+                            "total_pages": total_pages,
+                            "last_successful_page": final_completed,
+                            "updatedAt": firestore.SERVER_TIMESTAMP
+                        }, merge=True)
+                    except Exception as fe:
+                        record_firestore_error(fe)
                 print(f"[{title}] Proceso pausado en {final_completed}/{total_pages} páginas.")
             
     except Exception as e:
         print(f"Error procesando PDF: {e}")
+        supabase_post("ai_extraction_status", {
+            "id": cat_hash,
+            "title": title,
+            "status": "error",
+            "message": f"Error leyendo PDF: {e}",
+            "progress": 0,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
         if status_collection:
-            status_collection.document(cat_hash).update({"message": "Error leyendo PDF", "status": "error"})
+            try:
+                status_collection.document(cat_hash).update({"message": "Error leyendo PDF", "status": "error"})
+            except Exception:
+                pass
         if os.path.exists(tmp_path):
             try: os.remove(tmp_path)
             except: pass
