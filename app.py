@@ -126,26 +126,68 @@ def handle_exception(e):
 # INITIALIZATION & MULTI-ACCOUNT API KEYS
 # =====================================================================
 
-# 1. Cargar llaves PRIMARIAS (Tier 1: Cuentas y proyectos independientes 11 a 15 de Render)
+# 1. Cargar llaves PRIMARIAS (Tier 1: Cuentas y proyectos independientes)
 primary_keys_loaded = []
-for i in range(11, 16):
+
+# A. Nombres explícitos modernos GEMINI_PRIMARY_KEY_1 a 50
+for i in range(1, 51):
+    for prefix in [f"GEMINI_PRIMARY_KEY_{i}", f"GEMINI_PRIMARY_{i}"]:
+        val = os.environ.get(prefix)
+        if val and val.strip():
+            k_str = val.strip()
+            if not any(item["key"] == k_str for item in primary_keys_loaded):
+                primary_keys_loaded.append({
+                    "key": k_str,
+                    "env_var": prefix,
+                    "id": f"primary_{len(primary_keys_loaded)+1}",
+                    "name": f"Principal-{len(primary_keys_loaded)+1} (Multicuenta)"
+                })
+
+# B. Nombres tradicionales GEMINI_API_KEY_11 a 50
+for i in range(11, 51):
     var_name = f"GEMINI_API_KEY_{i}"
     val = os.environ.get(var_name)
     if val and val.strip():
         k_str = val.strip()
         if not any(item["key"] == k_str for item in primary_keys_loaded):
-            primary_keys_loaded.append({"key": k_str, "env_var": var_name, "id": f"primary_{i-10}", "name": f"Principal-{i-10} (Multicuenta)"})
+            primary_keys_loaded.append({
+                "key": k_str,
+                "env_var": var_name,
+                "id": f"primary_{len(primary_keys_loaded)+1}",
+                "name": f"Principal-{len(primary_keys_loaded)+1} (Multicuenta)"
+            })
 
-# Soporte si se configuraron en una sola variable separadas por coma
+# C. Soporte si se configuraron en una sola variable separadas por coma
 multi_primary = os.environ.get("GEMINI_PRIMARY_KEYS", "")
 if multi_primary:
     for idx, pk in enumerate(multi_primary.split(",")):
         k_str = pk.strip()
         if k_str and not any(item["key"] == k_str for item in primary_keys_loaded):
-            primary_keys_loaded.append({"key": k_str, "env_var": "GEMINI_PRIMARY_KEYS", "id": f"primary_{len(primary_keys_loaded)+1}", "name": f"Principal-{len(primary_keys_loaded)+1} (Multicuenta)"})
+            primary_keys_loaded.append({
+                "key": k_str,
+                "env_var": "GEMINI_PRIMARY_KEYS",
+                "id": f"primary_{len(primary_keys_loaded)+1}",
+                "name": f"Principal-{len(primary_keys_loaded)+1} (Multicuenta)"
+            })
 
-# 2. Cargar llaves de RESPALDO (Tier 2: 1 a 10 de cuenta compartida)
+# 2. Cargar llaves de RESPALDO (Tier 2: Cuenta compartida o respaldo)
 backup_keys_loaded = []
+
+# A. Nombres explícitos modernos GEMINI_BACKUP_KEY_1 a 50
+for i in range(1, 51):
+    for prefix in [f"GEMINI_BACKUP_KEY_{i}", f"GEMINI_BACKUP_{i}"]:
+        val = os.environ.get(prefix)
+        if val and val.strip():
+            k_str = val.strip()
+            if not any(item["key"] == k_str for item in primary_keys_loaded) and not any(item["key"] == k_str for item in backup_keys_loaded):
+                backup_keys_loaded.append({
+                    "key": k_str,
+                    "env_var": prefix,
+                    "id": f"backup_{len(backup_keys_loaded)+1}",
+                    "name": f"Respaldo-{len(backup_keys_loaded)+1}"
+                })
+
+# B. Nombres tradicionales GEMINI_API_KEY, GEMINI_API_KEY_1 a 10
 for main_var in ["GEMINI_API_KEY", "GEMINI_API_KEY_1"]:
     val = os.environ.get(main_var)
     if val and val.strip():
@@ -159,16 +201,25 @@ for i in range(2, 11):
     if val and val.strip():
         k_str = val.strip()
         if not any(item["key"] == k_str for item in primary_keys_loaded) and not any(item["key"] == k_str for item in backup_keys_loaded):
-            backup_keys_loaded.append({"key": k_str, "env_var": var_name, "id": f"backup_{i}", "name": f"Respaldo-{i}"})
+            backup_keys_loaded.append({
+                "key": k_str,
+                "env_var": var_name,
+                "id": f"backup_{len(backup_keys_loaded)+1}",
+                "name": f"Respaldo-{len(backup_keys_loaded)+1}"
+            })
 
-# También cualquier otra key extra (16 a 50)
-for i in range(16, 51):
-    var_name = f"GEMINI_API_KEY_{i}"
-    val = os.environ.get(var_name)
-    if val and val.strip():
-        k_str = val.strip()
-        if not any(item["key"] == k_str for item in primary_keys_loaded) and not any(item["key"] == k_str for item in backup_keys_loaded):
-            backup_keys_loaded.append({"key": k_str, "env_var": var_name, "id": f"backup_{len(backup_keys_loaded)+1}", "name": f"Respaldo-{len(backup_keys_loaded)+1}"})
+# C. Soporte si se configuraron en GEMINI_BACKUP_KEYS separadas por coma
+multi_backup = os.environ.get("GEMINI_BACKUP_KEYS", "")
+if multi_backup:
+    for idx, bk in enumerate(multi_backup.split(",")):
+        k_str = bk.strip()
+        if k_str and not any(item["key"] == k_str for item in primary_keys_loaded) and not any(item["key"] == k_str for item in backup_keys_loaded):
+            backup_keys_loaded.append({
+                "key": k_str,
+                "env_var": "GEMINI_BACKUP_KEYS",
+                "id": f"backup_{len(backup_keys_loaded)+1}",
+                "name": f"Respaldo-{len(backup_keys_loaded)+1}"
+            })
 
 # Inicializar Firebase
 firebase_db = None
