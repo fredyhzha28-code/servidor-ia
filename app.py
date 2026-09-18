@@ -255,6 +255,11 @@ def record_firestore_error(err):
         firestore_health["last_error_time"] = time.time()
         print(f"[FirestoreHealth] 🚨 Alerta: Límite diario de Firestore excedido (429 Quota Exceeded): {err_str[:120]}")
 
+def record_firestore_success():
+    firestore_health["quota_exceeded"] = False
+    firestore_health["last_error"] = None
+    firestore_health["last_error_time"] = 0
+
 memory_knowledge_cache = {}  # Cache en memoria RAM: cat_hash -> list(products)
 
 # =====================================================================
@@ -585,11 +590,11 @@ class GeminiKeyManager:
                 "recent_events": list(self.recent_events),
                 "active_workers": list(self.active_workers.values()),
                 "database_status": {
-                    "quota_exceeded": firestore_health["quota_exceeded"],
-                    "last_error": firestore_health["last_error"],
+                    "quota_exceeded": bool(firestore_health["quota_exceeded"] and (now - firestore_health.get("last_error_time", 0) < 60)),
+                    "last_error": firestore_health["last_error"] if (now - firestore_health.get("last_error_time", 0) < 60) else None,
                     "last_error_time": firestore_health["last_error_time"],
                     "provider": "Firebase Firestore (Google Cloud)",
-                    "message": "Límite diario gratuito de 50.000 lecturas de Firebase Firestore excedido (Error 429 Quota exceeded). Google ha bloqueado temporalmente las consultas y guardado a la base de datos." if firestore_health["quota_exceeded"] else "Operativa"
+                    "message": "Límite diario gratuito de 50.000 lecturas de Firebase Firestore excedido (Error 429 Quota exceeded)." if (firestore_health["quota_exceeded"] and (now - firestore_health.get("last_error_time", 0) < 60)) else "Operativa"
                 }
             }
 
@@ -2397,6 +2402,7 @@ def process_single_catalog(idx, cat):
                             "keys_detail": telem.get("keys_detail", []),
                             "updatedAt": firestore.SERVER_TIMESTAMP
                         }, merge=True)
+                        record_firestore_success()
                     except Exception as e:
                         pass
             threading.Thread(target=run_heartbeat, daemon=True).start()
