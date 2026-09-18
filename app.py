@@ -852,7 +852,7 @@ def wait_for_gemini_slot(min_interval=3.2):
             time.sleep(min_interval - elapsed)
         last_gemini_dispatch_time = time.time()
 
-def call_gemini_with_key_manager(prompt, files=None, max_retries=15, model_name='gemini-3.6-flash', json_mode=True, page_num=None):
+def call_gemini_with_key_manager(prompt, files=None, max_retries=15, model_name='gemini-2.0-flash', json_mode=True, page_num=None):
     actual_attempts = 0
     quota_cooldown_cycles = 0
     max_quota_cycles = 40
@@ -910,14 +910,14 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=15, model_name=
             if json_mode:
                 config_dict['response_mime_type'] = "application/json"
                 
-            # Modelos oficiales actuales de Gemini API (según especifica Google API):
-            # 1. 'gemini-3.6-flash': Modelo recomendado por Google API para generateContent multimodal
-            # 2. 'gemini-3.5-flash-lite': Modelo rápido y ligero recomendado
-            # 3. 'gemini-2.0-flash': Modelo legacy por compatibilidad
+            # Modelos oficiales de Gemini con alta cuota diaria (1.500 req/día en Free Tier):
+            # 1. 'gemini-2.0-flash': Principal, máxima capacidad y estabilidad
+            # 2. 'gemini-2.0-flash-lite': Muy rápido y ligero
+            # 3. 'gemini-1.5-flash': Respaldo clásico con alta cuota
             candidate_models = []
             if model_name:
                 candidate_models.append(model_name)
-            for m in ['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.0-flash-lite']:
+            for m in ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash']:
                 if m not in candidate_models:
                     candidate_models.append(m)
             models_to_try = candidate_models
@@ -936,8 +936,8 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=15, model_name=
                 except Exception as model_err:
                     last_err = model_err
                     err_str_candidate = str(model_err).lower()
-                    if any(w in err_str_candidate for w in ["404", "not found", "503", "unavailable", "high demand", "capacity"]):
-                        print(f"[Gemini] Modelo {m_candidate} no disponible temporalmente ({model_err}). Alternando a siguiente modelo de respaldo...")
+                    if any(w in err_str_candidate for w in ["404", "not found", "503", "unavailable", "high demand", "capacity", "generative_content_free_tier_requests", "limit: 20", "quota exceeded for metric"]):
+                        print(f"[Gemini] Modelo {m_candidate} con límite específico ({model_err}). Alternando a siguiente modelo de respaldo...")
                         continue
                     else:
                         raise model_err
@@ -2962,51 +2962,85 @@ def auto_resume_unfinished_catalogs():
     a medias (ej. tras un reinicio de Render o corte) y las reanuda en segundo plano
     sin esperar a que el usuario presione ningún botón.
     """
-    time.sleep(12)  # Dar margen a que Gunicorn termine de enlazar el puerto y Firebase conecte
-    if not firebase_db:
-        return
-    try:
-        appId = 'tienda-catalogos-app'
-        catalogs_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("catalogs")
-        status_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status")
-        
-        cats = list(catalogs_col.stream())
-        to_resume = []
-        for c in cats:
-            c_data = c.to_dict()
-            url = c_data.get('pdfUrl') or c_data.get('url')
-            title = c_data.get('title', 'Revista')
-            if not url:
-                continue
-            cat_hash = get_single_catalog_hash(url, title)
-            s_doc = status_col.document(cat_hash).get()
-            if s_doc.exists:
-                s_data = s_doc.to_dict()
+    time.sleep(12)  # Dar margen a que Gunicorn termine de enlazar el puerto
+    appId = 'tienda-catalogos-app'
+    to_resume = []
+    seen_hashes = set()
+
+    # 1. Consultar primero en Supabase (Base de datos ilimitada sin cuotas)
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            supa_cats = supabase_get("catalogs") or []
+            supa_status = supabase_get("ai_extraction_status") or []
+            status_by_id = {str(s.get('id')): s for s in supa_status if s.get('id')}
+            
+            for c in supa_cats:
+                url = c.get('pdf_url') or c.get('pdfUrl') or c.get('url')
+                title = c.get('title', 'Revista')
+                if not url: continue
+                cat_hash = get_single_catalog_hash(url, title)
+                seen_hashes.add(cat_hash)
+                
+                s_data = status_by_id.get(cat_hash, {})
                 tot_p = int(s_data.get('total_pages', 0) or 0)
                 comp_p = int(s_data.get('completed_pages', 0) or 0)
-                # Solo omitir si realmente está completado al 100% con todas las páginas memorizadas
                 if s_data.get('status') == 'completed' and s_data.get('progress', 0) >= 100 and tot_p > 0 and comp_p >= tot_p:
                     continue
+                to_resume.append({
+                    'url': url,
+                    'title': title,
+                    'hash': cat_hash,
+                    'appId': appId
+                })
+            if to_resume:
+                print(f"[AutoResume Supabase] Detectadas {len(to_resume)} revista(s) pendientes en Supabase.")
+        except Exception as se:
+            print(f"[AutoResume Supabase Aviso]: {se}")
 
-                c_data['url'] = url
-                c_data['title'] = title
-                c_data['hash'] = cat_hash
-                c_data['appId'] = appId
-                to_resume.append(c_data)
-            else:
-                # No tiene doc de status aún: encolar para procesar
-                c_data['url'] = url
-                c_data['title'] = title
-                c_data['hash'] = cat_hash
-                c_data['appId'] = appId
-                to_resume.append(c_data)
+    # 2. Como respaldo, consultar Firestore si no hay error de cuota
+    if firebase_db:
+        try:
+            catalogs_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("catalogs")
+            status_col = firebase_db.collection("artifacts").document(appId).collection("public").document("data").collection("ai_extraction_status")
+            
+            cats = list(catalogs_col.stream())
+            for c in cats:
+                c_data = c.to_dict()
+                url = c_data.get('pdfUrl') or c_data.get('url')
+                title = c_data.get('title', 'Revista')
+                if not url:
+                    continue
+                cat_hash = get_single_catalog_hash(url, title)
+                if cat_hash in seen_hashes:
+                    continue
+                seen_hashes.add(cat_hash)
                 
-        if to_resume:
-            print(f"[AutoResume] Se detectaron {len(to_resume)} revista(s) incompletas/pendientes. Reanudando lectura automáticamente en segundo plano...")
-            background_extract_and_save(to_resume)
-    except Exception as e:
-        print(f"[AutoResume] Aviso en verificación de revistas pendientes: {e}")
-        record_firestore_error(e)
+                s_doc = status_col.document(cat_hash).get()
+                if s_doc.exists:
+                    s_data = s_doc.to_dict()
+                    tot_p = int(s_data.get('total_pages', 0) or 0)
+                    comp_p = int(s_data.get('completed_pages', 0) or 0)
+                    if s_data.get('status') == 'completed' and s_data.get('progress', 0) >= 100 and tot_p > 0 and comp_p >= tot_p:
+                        continue
+
+                    c_data['url'] = url
+                    c_data['title'] = title
+                    c_data['hash'] = cat_hash
+                    c_data['appId'] = appId
+                    to_resume.append(c_data)
+                else:
+                    c_data['url'] = url
+                    c_data['title'] = title
+                    c_data['hash'] = cat_hash
+                    c_data['appId'] = appId
+                    to_resume.append(c_data)
+        except Exception as e:
+            print(f"[AutoResume Firestore Aviso]: {e}")
+            record_firestore_error(e)
+
+    if to_resume:
+        print(f"[AutoResume] Se detectaron {len(to_resume)} revista(s) incompletas/pendientes. Reanudando lectura automáticamente en segundo plano...")
+        background_extract_and_save(to_resume)
 
 # Iniciar auto-reanudación en segundo plano al arrancar
 threading.Thread(target=auto_resume_unfinished_catalogs, daemon=True).start()
@@ -3629,7 +3663,7 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
 }}
 """
 
-        raw_res = call_gemini_with_key_manager(prompt, files=temp_img_paths, model_name='gemini-3.6-flash')
+        raw_res = call_gemini_with_key_manager(prompt, files=temp_img_paths, model_name='gemini-2.0-flash')
         for tp in temp_img_paths:
             try: os.remove(tp)
             except: pass
