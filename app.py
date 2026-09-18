@@ -1209,174 +1209,235 @@ def consolidate_page_promos(products):
 
 def clean_product_taxonomy(p):
     """
-    Normaliza y unifica estrictamente la taxonomía (Categoría > Sección > Subcategoría) con alta precisión.
+    Normaliza y unifica estrictamente la taxonomía (Categoría > Sección > Subcategoría) con máxima precisión (100% canónico):
     - 'Perfumes y fragancias': EXCLUSIVAMENTE perfumes, colonias, lociones, splash, mist y sets de perfumería.
-    - 'Maquillaje y cuidado personal': Agrupa bases, polvos, primers, labiales, máscaras/pestañinas, delineadores,
-      sombras, esmaltes, cremas faciales/corporales, sérums antiedad, limpiadoras, shampoo, desodorantes, bloqueadores solares.
-    - 'Ropa', 'Zapatos', 'Accesorios' se clasifican con sus subcategorías específicas.
+    - 'Accesorios': Joyería y bisutería (aretes, collares, pulseras, anillos), bolsos, carteras, relojes, gafas, etc.
+    - 'Cuidado personal': Desodorantes y antitranspirantes (roll-on, aerosol), espumas de afeitar, cremas faciales/corporales, sérums (Nocturne), cuidado capilar, protección solar.
+    - 'Maquillaje': Labiales, máscaras/pestañinas, sombras, bases, polvos, esmaltes.
+    - 'Ropa', 'Zapatos', 'Hogar' con sus respectivas subcategorías.
     """
     if not isinstance(p, dict):
         return p
         
     nombre = str(p.get('nombre') or '').strip()
-    desc = str(p.get('descripcion_corta') or '').strip()
-    prod_text = f"{nombre} {desc}".lower()
+    raw_desc = str(p.get('descripcion_corta') or '').strip()
+
+    # Limpiar textos de condiciones de promoción que confunden a la IA (ej: "Por la compra de cualquier producto de Maquillaje, Fragancias o Cuidado Personal lleva este set...")
+    desc_clean = re.sub(r'por\s+la\s+compra\s+de[^.\n;]*', '', raw_desc, flags=re.I)
+    desc_clean = re.sub(r'por\s+cada[^.\n;]*?(que\s+compres|lleva)[^.\n;]*', '', desc_clean, flags=re.I)
+    desc_clean = re.sub(r'aplica\s+(con|por|en)[^.\n;]*', '', desc_clean, flags=re.I)
+    desc_clean = re.sub(r'condici[oó]n\s+de\s+promoci[oó]n[^.\n;]*', '', desc_clean, flags=re.I)
+    desc_clean = re.sub(r'v[aá]lido\s+por[^.\n;]*', '', desc_clean, flags=re.I)
+
+    name_lower = nombre.lower()
+    desc_lower = desc_clean.lower()
+    full_text = f"{name_lower} {desc_lower}"
 
     # 1. Categoría Principal: Caballero, Dama, Niños, Niñas, Hogar
     raw_cat = str(p.get('categoria') or '').lower()
-    if any(w in raw_cat for w in ['caballer', 'hombre', 'masculin']):
-        cat = 'Caballero'
-    elif any(w in raw_cat for w in ['dama', 'mujer', 'femenin']):
-        cat = 'Dama'
-    elif 'niñ' in raw_cat:
-        cat = 'Niñas' if 'niña' in raw_cat else 'Niños'
-    elif 'hogar' in raw_cat:
+    cat = 'Dama'
+
+    is_men_line = bool(re.search(r'\b(magnat|d\'?orsay|kalos|devos|pulso|cardigan|fist victory|urban way|nitro|bleu intense|bleu glacial|bleu supreme|brava|winner|trax|homme|for men|steve)\b', name_lower, re.I))
+    is_women_line = bool(re.search(r'\b(mithyka|liasson|ch[eé]rie|mon l\'?bel|satin rouge|fiamme|sweet black|vibranza|impredecible|m[ií]a|girlink|prints|grazzia|plaisir|leyenda|femme|women|dama)\b', name_lower, re.I))
+
+    is_men_explicit = is_men_line or bool(re.search(r'\b(caballero|caballeros|hombre|hombres|masculino|masculina|homme|men|para hombre|para él|para el hombre|steve)\b', name_lower, re.I) or
+                          re.search(r'\b(para él|para hombre|para el hombre|hombre|caballero)\b', desc_lower, re.I) or
+                          re.search(r'caballer|hombre|masculin', raw_cat, re.I))
+
+    is_kids_explicit = bool(re.search(r'\b(niño|niña|niños|niñas|infantil|bebé|bebe|kids|baby)\b', name_lower, re.I) or
+                           re.search(r'niñ|infantil|bebe', raw_cat, re.I))
+
+    is_home_explicit = bool(re.search(r'\b(cama|sábana|sabana|edredón|edredon|toalla|olla|sartén|sarten|vajilla|hogar|cocina)\b', name_lower, re.I) or
+                           re.search(r'hogar|casa', raw_cat, re.I))
+
+    if is_home_explicit and not is_men_explicit and not is_kids_explicit:
         cat = 'Hogar'
+    elif is_kids_explicit:
+        cat = 'Niñas' if (re.search(r'\b(niña|niñas)\b', name_lower, re.I) or 'niña' in raw_cat) else 'Niños'
+    elif is_men_explicit and not is_women_line:
+        cat = 'Caballero'
     else:
-        if any(w in prod_text for w in ['para hombre', 'para el hombre', 'homme', 'masculino', 'caballero', 'men ']):
-            cat = 'Caballero'
-        elif any(w in prod_text for w in ['para mujer', 'para ella', 'femme', 'femenino', 'dama', 'women']):
-            cat = 'Dama'
-        else:
-            cat = 'Dama'
+        cat = 'Dama'
 
-    # 2. DETECCIÓN DE PERFUMES Y FRAGANCIAS (MÁXIMA PRIORIDAD)
-    # Perfumes como "Live Polo", sets como "Set Bleu Intense" o "Set L'Attraction" que incluyan "+ bolsa"
-    # DEBEN clasificarse siempre como perfumes y NO como ropa ni accesorios.
-    is_fragrance = any(re.search(r'\b' + re.escape(w) + r'\b', prod_text) for w in [
-        'parfum', 'perfume', 'perfumes', 'miniperfume', 'miniperfumes', 'fragancia', 'fragancias',
-        'colonia', 'colonias', 'eau de parfum', 'eau de toilette', 'eau de cologne', 'edp', 'edt',
-        'splash', 'mist', 'fragrance mist', 'locion', 'loción', 'alta perfumeria', 'alta perfumería'
-    ]) or any(w in prod_text for w in [
-        'set bleu', 'bleu intense', 'bleu glacial', 'bleu acqua', 'bleu supreme', 'l\'attraction', 'l attraction',
-        'mon l\'bel', 'mon lbel', 'satin rouge', 'live polo', 'live frontier', 'live adventure',
-        'mithyka', 'liasson', 'magnat', 'dorsay', 'd\'orsay', 'fiamme', 'kalos', 'devos', 'pulso',
-        'cardigan perfume', 'herbal aromático', 'herbal aromatico', 'concentración muy alta', 'concentracion muy alta',
-        'notas olfativas', 'familia olfativa'
-    ])
+    # 2. JOYERÍA Y BISUTERÍA (Alta prioridad para sets de aretes, collares, etc.)
+    # Un "Set de Aretes" o "Set de Joyas" va a Accesorios > Joyería, NO a combos de perfumería
+    is_jewelry = bool(re.search(r'\b(arete|aretes|arracada|arracadas|candonga|candongas|topo|topos|pendiente|pendientes|zarcillo|zarcillos|collar|collares|gargantilla|choker|cadena|cadenas|dije|dijes|medalla|medallas|pulsera|pulseras|brazalete|brazaletes|manilla|manillas|esclava|esclavas|tobillera|tobilleras|anillo|anillos|sortija|sortijas|joya|joyas|joyeria|joyería|bisuteria|bisutería|baño de oro|baño de plata|chapa de oro|perla|perlas)\b', name_lower, re.I) or
+                      re.search(r'\b(set de aretes|set de collares|set de pulseras|baño de oro de 24k|con 4 capas de oro)\b', full_text, re.I))
 
-    # Si es predominantemente una crema corporal o sérum con perfume en notas secundarias, NO es perfume
-    is_cream_dominant = any(re.search(r'\b' + re.escape(w) + r'\b', prod_text) for w in ['crema corporal', 'crema facial', 'crema para manos', 'suero', 'sérum', 'serum'])
-    if is_cream_dominant and not any(w in prod_text for w in ['set ', 'miniperfume', 'eau de', 'parfum', 'perfume']):
-        is_fragrance = False
+    if is_jewelry:
+        p['categoria'] = cat
+        p['seccion'] = 'Accesorios'
+        p['subcategoria'] = 'Joyería y bisutería'
+        return p
 
-    # 3. CUIDADO PERSONAL Y AFEITADO (ALTA PRIORIDAD)
-    # Nota: "Nocturne Ojos" (reductor de bolsas en los ojos) va aquí y NUNCA en accesorios.
-    is_care = any(re.search(r'\b' + re.escape(w) + r'\b', prod_text) for w in [
-        'espuma de afeitar', 'gel de afeitar', 'crema de afeitar', 'afeitar', 'afeitado', 'after shave', 'barba',
-        'nocturne', 'suero', 'sérum', 'serum', 'antiedad', 'anti-edad', 'antiarrugas', 'anti-arrugas', 'arrugas',
-        'contorno de ojos', 'ojos pm', 'ojos am', 'ojeras', 'limpiadora', 'limpiador', 'gel limpiador',
-        'agua micelar', 'micelar', 'tónico', 'tonico', 'mascarilla', 'exfoliante',
-        'crema', 'cremas', 'hidratante', 'humectante', 'corporal', 'body expert', 'firmeza', 'nutrición', 'nutricion',
-        'reparación', 'reparacion', 'luminosidad', 'antimanchas', 'bloqueador', 'bloqueadores', 'protector solar',
-        'solar', 'fps', 'spf', 'shampoo', 'champu', 'acondicionador', 'desodorante', 'desodorantes',
-        'antitranspirante', 'jabón', 'jabon', 'jabones', 'gel de ducha'
-    ]) or any(w in prod_text for w in ['homme expert', 'reductor de apariencia de bolsas', 'menos bolsas y arrugas', 'nocturne ojos'])
+    # 3. SECCIÓN PROMOCIONES: SETS, COMBOS, DUOS, PACKS Y OFERTAS 2X1
+    # Agrupa sets multi-producto (ej: Set Magnat Select con perfume + mini perfume + desodorante + bolsa),
+    # combos, 2x1, 'paga 1 lleva 2' y ofertas especiales multi-producto
+    is_2x1 = bool(re.search(r'\b(2x1|2\s*x\s*1|paga\s*1\s*lleva\s*2|pague\s*1\s*lleva\s*2|lleva\s*2\s*por|lleva\s*3\s*por|promo\s*2x|3x2)\b', full_text, re.I) or
+                  re.search(r'\[promo\s*2x1\]', name_lower, re.I))
 
-    # 4. MAQUILLAJE
-    is_makeup = any(re.search(r'\b' + re.escape(w) + r'\b', prod_text) for w in [
-        'labial', 'labiales', 'lip', 'lipstick', 'gloss', 'brillo labial', 'tinta de labios', 'bálsamo labial', 'balsamo labial',
-        'pestañina', 'pestañinas', 'pestañin', 'máscara de pestañas', 'mascara de pestañas', 'mascara', 'máscara', 'rimel', 'rímel',
-        'base', 'matte', 'corrector', 'correctores', 'polvo', 'polvos', 'primer', 'compacto',
-        'delineador', 'delineadores', 'cejas', 'sombra', 'sombras', 'rubor', 'blush',
-        'iluminador', 'iluminadores', 'esmalte', 'esmaltes', 'uñas', 'brocha', 'brochas', 'esponja', 'maquillaje'
-    ])
+    has_set_keyword = bool(re.search(r'\b(set|combo|pack|kit|duo|dúo|trio|trío|estuche de regalo|colección de regalo)\b', name_lower, re.I))
+    has_plus_combo = bool('+' in nombre and re.search(r'\b(perfume|parfum|fragancia|colonia|desodorante|roll-on|locion|loción|crema|labial|shampoo|bolsa)\b', name_lower, re.I))
+    is_multi_set = has_set_keyword or has_plus_combo
 
-    # 5. CALZADO (ZAPATOS)
-    is_zapatos = (not is_fragrance) and any(re.search(r'\b' + re.escape(w) + r'\b', prod_text) for w in [
-        'zapato', 'zapatos', 'calzado', 'sandalia', 'sandalias', 'tacon', 'tacón', 'tacones',
-        'plataformas', 'tenis', 'sneakers', 'deportivos', 'bota', 'botas', 'botin', 'botín', 'botines',
-        'mocasines', 'pantuflas', 'baletas', 'flats'
-    ])
+    is_promo_flag = bool(p.get('es_promo')) or bool(re.search(r'\[promo\]|\[oferta\]', name_lower, re.I))
 
-    # 6. ROPA
-    # No puede ser fragancia (ej: "Live Polo" es perfume, NO ropa) ni cuidado personal
-    is_ropa = (not is_fragrance) and (not is_zapatos) and (not is_care) and (
-        any(re.search(r'\b' + re.escape(w) + r'\b', prod_text) for w in [
-            'vestido', 'vestidos', 'enterizo', 'enterizos', 'falda', 'faldas', 'blusa', 'blusas',
-            'camisa', 'camisas', 'camiseta', 'camisetas', 'pantalon', 'pantalón', 'pantalones',
-            'jean', 'jeans', 'legging', 'leggings', 'short', 'shorts', 'bermuda', 'bermudas', 'jogger', 'joggers',
-            'chaqueta', 'chaquetas', 'blazer', 'blazers', 'buzo', 'buzos', 'sueter', 'suéter', 'sueteres', 'saco', 'sacos',
-            'abrigo', 'abrigos', 'chaleco', 'chalecos', 'brasier', 'brasieres', 'panty', 'panties', 'boxer', 'bóxer', 'bóxers',
-            'pijama', 'pijamas', 'ropa interior', 'bata', 'batas'
-        ]) or (re.search(r'\b(polo|top)\b', prod_text) and not any(w in prod_text for w in ['parfum', 'perfume', 'fragancia', 'colonia', 'eau de', 'ml', 'fl. oz']))
-    )
+    if is_2x1:
+        p['categoria'] = cat
+        p['seccion'] = 'Promociones'
+        p['subcategoria'] = 'Ofertas 2x1'
+        return p
 
-    # 7. ACCESORIOS (Bolsas físicas, correas, aretes, collares, etc.)
-    # No puede ser un set de perfume (que traiga bolsa de regalo) ni un producto de ojos (reductor de bolsas)
-    is_eye_bags = any(w in prod_text for w in ['ojos', 'suero', 'sérum', 'serum', 'arrugas', 'nocturne'])
-    is_accessory_item = any(re.search(r'\b' + re.escape(w) + r'\b', prod_text) for w in [
-        'bolsa', 'bolsas', 'bolso', 'bolsos', 'cartera', 'carteras', 'billetera', 'billeteras',
-        'monedero', 'monederos', 'tarjetero', 'tarjeteros', 'neceser', 'neceseres', 'cosmetiquera', 'cosmetiqueras',
-        'mochila', 'mochilas', 'morral', 'morrales', 'maletin', 'maletines', 'maletín', 'maleta', 'maletas',
-        'cartuchera', 'cartucheras', 'organizador', 'tote', 'crossbody', 'clutch', 'tula', 'tulas',
-        'correa', 'correas', 'cinturon', 'cinturón', 'cinturones',
-        'collar', 'collares', 'gargantilla', 'cadena', 'cadenas', 'dije', 'dijes', 'medalla', 'medallas',
-        'aretes', 'arete', 'arracadas', 'candongas', 'topos', 'pendientes', 'zarcillos',
-        'pulsera', 'pulseras', 'brazalete', 'brazaletes', 'manilla', 'manillas', 'tobillera', 'tobilleras',
-        'anillo', 'anillos', 'sortija', 'sortijas', 'reloj', 'relojes', 'smartwatch',
-        'joya', 'joyas', 'joyeria', 'joyería', 'bisuteria', 'bisutería',
-        'gafas', 'lentes de sol', 'anteojos', 'sombrero', 'sombreros', 'gorra', 'gorras', 'boina', 'boinas',
-        'pashmina', 'pashminas', 'bufanda', 'bufandas', 'pañuelo', 'pañuelos', 'diadema', 'diademas',
-        'vincha', 'vinchas', 'hebilla', 'hebillas', 'gancho', 'ganchos', 'paraguas', 'sombrilla', 'sombrillas', 'llavero', 'llaveros'
-    ])
-    is_accesorios = (not is_fragrance) and (not is_eye_bags) and is_accessory_item
+    if is_multi_set:
+        p['categoria'] = cat
+        p['seccion'] = 'Promociones'
+        p['subcategoria'] = 'Sets y combos'
+        return p
 
-    # 8. HOGAR
-    is_hogar = (not is_fragrance) and (not is_zapatos) and (not is_ropa) and (not is_accesorios) and any(re.search(r'\b' + re.escape(w) + r'\b', prod_text) for w in [
-        'cama', 'edredon', 'edredón', 'sabana', 'sábana', 'almohada', 'almohadas', 'cubrecama', 'toalla', 'toallas', 'sarten', 'sartén', 'olla', 'ollas', 'recipiente', 'termo', 'botilito', 'botella', 'pocillo', 'taza', 'vajilla', 'cubiertos', 'manta', 'cobija', 'cortina'
-    ])
+    if is_promo_flag and not any(w in name_lower for w in ['labial', 'perfume', 'parfum', 'crema', 'desodorante']):
+        p['categoria'] = cat
+        p['seccion'] = 'Promociones'
+        p['subcategoria'] = 'Promociones especiales'
+        return p
 
-    seccion = 'Belleza y perfumería'
-    sub = 'Cuidado personal'
+    # 4. ACCESORIOS (Bolsos individuales, mochilas, carteras, relojes, gafas)
+    # Nota: Si venía "+ bolsa" en un set/combo, ya fue clasificado arriba en Promociones > Sets y combos
+    is_bags = bool(re.search(r'\b(bolso|bolsos|cartera|carteras|billetera|billeteras|monedero|monederos|tarjetero|tarjeteros|mochila|mochilas|morral|morrales|maletin|maletines|maletín|maleta|maletas|cartuchera|cartucheras|neceser|neceseres|cosmetiquera|cosmetiqueras|organizador|tote|crossbody|clutch|tula|tulas)\b', name_lower, re.I) or
+                   (re.search(r'\b(bolsa|bolsas)\b', name_lower, re.I) and not re.search(r'\b(bolsa de regalo|\+\s*bolsa|bolsa en los ojos|menos bolsas|reductor de bolsas)\b', name_lower, re.I)))
+
+    is_other_accessories = bool(re.search(r'\b(reloj|relojes|smartwatch|gafas|lentes de sol|anteojos|correa|correas|cinturon|cinturón|cinturones|sombrero|sombreros|gorra|gorras|pashmina|pashminas|bufanda|bufandas|pañuelo|pañuelos|diadema|diademas|vincha|vinchas|hebilla|hebillas|gancho|ganchos|paraguas|sombrilla|sombrillas|llavero|llaveros)\b', name_lower, re.I))
+
+    if is_bags or is_other_accessories:
+        subcat = 'Bolsos y carteras' if is_bags else 'Relojes y accesorios'
+        p['categoria'] = cat
+        p['seccion'] = 'Accesorios'
+        p['subcategoria'] = subcat
+        return p
+
+    # 3. DESODORANTES Y ANTITRANSPIRANTES (NUNCA SON PERFUMES AUNQUE LLEVEN MARCAS COMO MAGNAT O BLEU)
+    is_deodorant = bool(re.search(r'\b(desodorante|desodorantes|antitranspirante|antitranspirantes|roll-on|roll on|rollon|spray desodorante|desodorante en aerosol|barra desodorante)\b', name_lower, re.I) or
+                        (re.search(r'\b(desodorante|antitranspirante)\b', full_text, re.I) and not re.search(r'\b(parfum|perfume|eau de parfum|eau de toilette)\b', name_lower, re.I)))
+
+    if is_deodorant:
+        p['categoria'] = cat
+        p['seccion'] = 'Cuidado personal'
+        p['subcategoria'] = 'Desodorantes y antitranspirantes'
+        return p
+
+    # 4. AFEITADO Y BARBA
+    is_shaving = bool(re.search(r'\b(espuma de afeitar|gel de afeitar|crema de afeitar|after shave|aftershave|afeitado|afeitar|locion para despues de afeitar|barba|cuidado de barba)\b', name_lower, re.I) or
+                      re.search(r'\b(espuma de afeitar|gel de afeitar|after shave)\b', full_text, re.I))
+    if is_shaving:
+        p['categoria'] = cat
+        p['seccion'] = 'Cuidado personal'
+        p['subcategoria'] = 'Afeitado y barba'
+        return p
+
+    # 5. MAQUILLAJE
+    is_makeup_lips = bool(re.search(r'\b(labial|labiales|lip|lipstick|gloss|brillo labial|tinta de labios|balsamo labial|bálsamo labial|crayón labial)\b', name_lower, re.I))
+    is_makeup_eyes = bool(re.search(r'\b(pestañina|pestañinas|máscara de pestañas|mascara de pestañas|mascara|máscara|rimel|rímel|delineador|delineadores|cejas|sombra|sombras|paleta de sombras|eyeliner)\b', name_lower, re.I))
+    is_makeup_face = bool(re.search(r'\b(base|base liquida|base líquida|corrector|correctores|polvo|polvos|polvo compacto|polvo suelto|polvo traslúcido|polvo traslucido|primer facial|primer|rubor|blush|iluminador|iluminadores|fijador de maquillaje|bb cream|cc cream)\b', name_lower, re.I))
+    is_makeup_nails = bool(re.search(r'\b(esmalte|esmaltes|esmalte de uñas|uñas|quitaesmalte)\b', name_lower, re.I))
+    is_makeup_tools = bool(re.search(r'\b(brocha|brochas|esponja|esponjas|beauty blender|encrespador|sacapuntas)\b', name_lower, re.I))
+
+    if is_makeup_lips or is_makeup_eyes or is_makeup_face or is_makeup_nails or is_makeup_tools:
+        subcat = 'Maquillaje'
+        if is_makeup_lips: subcat = 'Labiales'
+        elif is_makeup_eyes: subcat = 'Ojos y cejas'
+        elif is_makeup_face: subcat = 'Rostro y polvos'
+        elif is_makeup_nails: subcat = 'Esmaltes y uñas'
+        elif is_makeup_tools: subcat = 'Accesorios de maquillaje'
+        p['categoria'] = cat
+        p['seccion'] = 'Maquillaje'
+        p['subcategoria'] = subcat
+        return p
+
+    # 6. CUIDADO PERSONAL (FACIAL, CORPORAL, CAPILAR, SOLAR, HIGIENE)
+    is_facial_care = bool(re.search(r'\b(nocturne|suero|sérum|serum|antiedad|anti-edad|antiarrugas|anti-arrugas|arrugas|contorno de ojos|ojos pm|ojos am|ojeras|limpiadora|limpiador|gel limpiador|agua micelar|micelar|tónico|tonico|mascarilla|exfoliante|crema facial|crema de día|crema de noche|concentrado facial|hidratante facial|desmaquillador|desmaquillante)\b', name_lower, re.I) or
+                         re.search(r'\b(nocturne|suero|sérum|serum|antiedad|contorno de ojos|desmaquillador)\b', full_text, re.I))
+
+    is_body_care = bool(re.search(r'\b(crema corporal|loción corporal|locion corporal|crema para manos|hidratante corporal|body expert|crema hidratante|exfoliante corporal|aceite corporal|gel corporal)\b', name_lower, re.I) or
+                       re.search(r'\b(crema corporal|loción corporal|crema para manos|hidratante corporal)\b', full_text, re.I))
+
+    is_hair_care = bool(re.search(r'\b(shampoo|champu|champú|acondicionador|mascarilla capilar|tratamiento capilar|óleo capilar|oleo capilar|cuidado capilar)\b', name_lower, re.I) or
+                       re.search(r'\b(shampoo|champú|acondicionador)\b', full_text, re.I))
+
+    is_sun_care = bool(re.search(r'\b(bloqueador|bloqueadores|protector solar|defensa solar|fps|spf|solar)\b', name_lower, re.I) or
+                      re.search(r'\b(bloqueador solar|protector solar)\b', full_text, re.I))
+
+    is_bath_care = bool(re.search(r'\b(jabón|jabon|jabones|gel de ducha|jabón líquido|jabon liquido|intimate|higiene íntima|higiene intima)\b', name_lower, re.I))
+
+    if is_facial_care or is_body_care or is_hair_care or is_sun_care or is_bath_care:
+        subcat = 'Cuidado personal'
+        if is_facial_care: subcat = 'Cuidado facial y antiedad'
+        elif is_body_care: subcat = 'Cuidado corporal'
+        elif is_hair_care: subcat = 'Cuidado capilar'
+        elif is_sun_care: subcat = 'Protección solar'
+        elif is_bath_care: subcat = 'Higiene y baño'
+        p['categoria'] = cat
+        p['seccion'] = 'Cuidado personal'
+        p['subcategoria'] = subcat
+        return p
+
+    # 7. CALZADO (ZAPATOS)
+    is_shoes = bool(re.search(r'\b(zapato|zapatos|calzado|sandalia|sandalias|tacon|tacón|tacones|plataforma|plataformas|tenis|sneakers|deportivos|bota|botas|botin|botín|botines|mocasines|pantuflas|baletas|flats)\b', name_lower, re.I))
+    if is_shoes:
+        subcat = 'Calzado casual'
+        if re.search(r'sandalia', name_lower, re.I): subcat = 'Sandalias'
+        elif re.search(r'tacon|tacón|tacones|plataforma', name_lower, re.I): subcat = 'Tacones'
+        elif re.search(r'tenis|sneakers|deportiv', name_lower, re.I): subcat = 'Tenis y deportivos'
+        elif re.search(r'bota|botin|botín|botines', name_lower, re.I): subcat = 'Botas y botines'
+        p['categoria'] = cat
+        p['seccion'] = 'Zapatos'
+        p['subcategoria'] = subcat
+        return p
+
+    # 8. ROPA
+    is_clothes = bool(re.search(r'\b(vestido|vestidos|enterizo|enterizos|falda|faldas|blusa|blusas|camisa|camisas|camiseta|camisetas|pantalon|pantalón|pantalones|jean|jeans|legging|leggings|short|shorts|bermuda|bermudas|jogger|joggers|chaqueta|chaquetas|blazer|blazers|buzo|buzos|sueter|suéter|sueteres|saco|sacos|abrigo|abrigos|chaleco|chalecos|brasier|brasieres|panty|panties|boxer|bóxer|bóxers|pijama|pijamas|ropa interior|bata|batas)\b', name_lower, re.I) or
+                      (re.search(r'\b(polo|top)\b', name_lower, re.I) and not re.search(r'\b(parfum|perfume|eau de|ml|fl\.?\s*oz)\b', name_lower, re.I)))
+    if is_clothes:
+        subcat = 'Prendas varias'
+        if re.search(r'camisa|camiseta|polo|blusa|top', name_lower, re.I): subcat = 'Camisas y blusas'
+        elif re.search(r'pantalon|pantalón|jean|jeans|short|bermuda|jogger|legging', name_lower, re.I): subcat = 'Pantalones y jeans'
+        elif re.search(r'vestido|enterizo|falda', name_lower, re.I): subcat = 'Vestidos y faldas'
+        elif re.search(r'chaqueta|blazer|buzo|sueter|suéter|abrigo|chaleco|saco', name_lower, re.I): subcat = 'Chaquetas y abrigos'
+        elif re.search(r'interior|boxer|bóxer|brasier|panty|pijama|bata', name_lower, re.I): subcat = 'Ropa interior y pijamas'
+        p['categoria'] = cat
+        p['seccion'] = 'Ropa'
+        p['subcategoria'] = subcat
+        return p
+
+    # 9. HOGAR
+    is_home = bool(re.search(r'\b(cama|edredon|edredón|sabana|sábana|almohada|almohadas|cubrecama|toalla|toallas|sarten|sartén|olla|ollas|recipiente|termo|botilito|botella|pocillo|taza|vajilla|cubiertos|manta|cobija|cortina)\b', name_lower, re.I))
+    if is_home:
+        p['categoria'] = 'Hogar'
+        p['seccion'] = 'Hogar y decoración'
+        p['subcategoria'] = 'Cocina y mesa' if re.search(r'olla|sartén|recipiente|vajilla|cubierto|termo', name_lower, re.I) else 'Dormitorio y baño'
+        return p
+
+    # 10. PERFUMES Y FRAGANCIAS (EXCLUSIVAMENTE PERFUMES Y FRAGANCIAS)
+    is_fragrance = bool(re.search(r'\b(parfum|perfume|perfumes|miniperfume|miniperfumes|fragancia|fragancias|eau de parfum|eau de toilette|eau de cologne|edp|edt|splash|body mist|fragrance mist|locion de perfume|alta perfumeria|alta perfumería)\b', name_lower, re.I) or
+                        (re.search(r'\b(colonia|colonias)\b', name_lower, re.I) and not re.search(r'\b(desodorante|antitranspirante)\b', name_lower, re.I)) or
+                        (re.search(r'\b(locion|loción)\b', name_lower, re.I) and not re.search(r'\b(corporal|limpiadora|hidratante|desmaquillante|astringente|tonica)\b', name_lower, re.I)) or
+                        re.search(r'\b(set bleu|bleu intense|bleu glacial|bleu supreme|mithyka|liasson|chérie|cherie|satin rouge|fiamme|mon l\'bel|mon lbel|dorsay|d\'orsay|kalos|devos|pulso|cardigan|fist victory|urban way|nitro|sweet black|pura deslumbrante|grazzia|leyenda|plaisir|vibranza|impredecible|mía|girlink|prints)\b', name_lower, re.I) or
+                        (re.search(r'\b(concentración muy alta|concentracion muy alta|notas olfativas|familia olfativa|herbal aromático|herbal aromatico)\b', desc_lower, re.I) and not re.search(r'\b(desodorante|crema|aretes|labial)\b', name_lower, re.I)))
 
     if is_fragrance:
-        seccion = 'Belleza y perfumería'
-        sub = 'Perfumes y fragancias'
-    elif is_care:
-        seccion = 'Belleza y perfumería'
-        sub = 'Cuidado personal'
-    elif is_makeup:
-        seccion = 'Belleza y perfumería'
-        sub = 'Maquillaje'
-    elif is_accesorios:
-        seccion = 'Accesorios'
-        sub = 'Varios'
-    elif is_zapatos:
-        seccion = 'Zapatos'
-        if any(w in prod_text for w in ['sandalia', 'sandalias']): sub = 'Sandalias'
-        elif any(w in prod_text for w in ['tacon', 'tacón', 'tacones', 'plataforma']): sub = 'Tacones'
-        elif any(w in prod_text for w in ['tenis', 'sneakers', 'deportiv']): sub = 'Tenis y deportivos'
-        elif any(w in prod_text for w in ['bota', 'botas', 'botin', 'botín', 'botines']): sub = 'Botas y botines'
-        else: sub = 'Calzado casual'
-    elif is_ropa:
-        seccion = 'Ropa'
-        if any(w in prod_text for w in ['camisa', 'camiseta', 'polo', 'blusa', 'top']):
-            sub = 'Camisas y blusas'
-        elif any(w in prod_text for w in ['pantalon', 'pantalón', 'jean', 'jeans', 'short', 'bermuda', 'jogger', 'legging']):
-            sub = 'Pantalones y jeans'
-        elif any(w in prod_text for w in ['vestido', 'enterizo', 'falda']):
-            sub = 'Vestidos y faldas'
-        elif any(w in prod_text for w in ['chaqueta', 'blazer', 'buzo', 'sueter', 'suéter', 'abrigo', 'chaleco', 'saco']):
-            sub = 'Chaquetas y buzos'
-        elif any(w in prod_text for w in ['interior', 'boxer', 'bóxer', 'brasier', 'panty', 'pijama', 'bata']):
-            sub = 'Ropa interior y pijamas'
-        else:
-            sub = 'Prendas varias'
-    elif is_hogar:
-        seccion = 'Hogar'
-        sub = 'Hogar y decoración'
-    else:
-        if any(w in prod_text for w in ['pack', 'caja', 'regalo', 'kit', 'empaque']):
-            seccion = 'Accesorios'
-            sub = 'Varios'
-        else:
-            seccion = 'Belleza y perfumería'
-            sub = 'Cuidado personal'
+        p['categoria'] = cat
+        p['seccion'] = 'Perfumes y fragancias'
+        p['subcategoria'] = 'Perfumes masculinos' if cat == 'Caballero' else 'Perfumes femeninos'
+        return p
+
+    # 11. Preservar sección personalizada válida si el producto ya la traía
+    if p.get('seccion') and not re.search(r'belleza y perfumer', str(p.get('seccion')), re.I):
+        p['categoria'] = cat
+        p['seccion'] = str(p.get('seccion'))
+        p['subcategoria'] = str(p.get('subcategoria') or 'General')
+        return p
 
     p['categoria'] = cat
-    p['seccion'] = seccion
-    p['subcategoria'] = sub
+    p['seccion'] = 'Cuidado personal'
+    p['subcategoria'] = 'Cuidado corporal'
     return p
 
 def extract_products_from_page(page_text, image_path, title, page_num, is_audit=False, facing_text="", facing_img_path=None, facing_page_num=None):
@@ -1610,23 +1671,26 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
        - En "precio", incluye el precio calculado/visible con su signo de moneda (ej: "$49.990", "$124.990") o "Confirmar con Erika".
        - En "descripcion_corta", incluye el código ('Cód. XXXXX'), notas olfativas, activos, mililitros, tela, silueta o detalles.
 
-    7. TAXONOMÍA CANÓNICA ESTRICTA (NO INVENTAR NUEVAS SUBCATEGORÍAS NI SECCIONES):
-       - "categoria": Exclusivamente una de: "Dama", "Caballero", "Niños", "Niñas", "Hogar", "General".
-       - "seccion": Exclusivamente una de:
-         * "Belleza y perfumería" (TODOS los perfumes, fragancias, cosméticos, cremas corporales, jabones, desodorantes, champús van bajo esta sección. ¡NUNCA crees "Cuidado personal" como sección, siempre va dentro de "Belleza y perfumería"!).
-         * "Accesorios" (¡MUY IMPORTANTE!: Bolsas, bolsos, carteras, correas, cinturones, aretes, collares, joyas, relojes, parlantes, neceseres, cosmetiqueras y estuches van EXCLUSIVAMENTE en "Accesorios". ¡NUNCA los pongas en "Belleza y perfumería"!).
-         * "Ropa"
-         * "Zapatos"
-         * "Hogar"
-         * "Varios"
+    7. TAXONOMÍA CANÓNICA ESTRICTA DE ALTA PRECISIÓN:
+       - "categoria": Exclusivamente una de: "Dama", "Caballero", "Niños", "Niñas", "Hogar".
+       - "seccion":
+         * "Promociones": ¡OBLIGATORIO para todos los SETS, COMBOS, DUOS, PACKS multi-producto (ej: Set Perfume + Desodorante + Bolsa), ofertas "2x1", "Paga 1 lleva 2"!
+         * "Perfumes y fragancias": ¡EXCLUSIVAMENTE perfumes individuales, colonias y lociones aromáticas! (JAMÁS aretes, JAMÁS desodorantes individuales ni sets con bolsa).
+         * "Accesorios": ¡OBLIGATORIO para joyería y bisutería (aretes, collares, pulseras, anillos), mochilas, bolsos individuales, carteras, billeteras, relojes, gafas! (NUNCA en perfumes).
+         * "Cuidado personal": Desodorantes individuales y antitranspirantes (roll-on, spray), espumas de afeitar, cremas faciales/corporales, sérums (Nocturne Ojos), protectores solares, shampoo.
+         * "Maquillaje": Labiales individuales, máscaras/pestañinas, delineadores, bases, polvos, sombras, rubor, esmaltes.
+         * "Ropa": Vestidos, blusas, pantalones, jeans, chaquetas, ropa interior, pijamas.
+         * "Zapatos": Sandalias, tacones, tenis, botas, calzado.
+         * "Hogar": Edredones, sábanas, toallas, vajilla, sartenes, cocina.
        - "subcategoria":
-         * Para "Accesorios": "Varios" (bolsas, carteras, correas, aretes, collares, joyas, relojes, parlantes, neceseres, cosmetiqueras, gafas, etc.).
-         * Para "Belleza y perfumería", usa ÚNICAMENTE una de estas subcategorías canónicas:
-           - "Perfumes y fragancias": Para TODO tipo de perfumes (masculinos, femeninos, unisex), fragancias, colonias, lociones, splash, mist y sets de perfumes.
-           - "Maquillaje y cuidado personal": Para bases, correctores, labiales, pestañinas, sombras, polvos, cejas, cremas faciales/corporales, sérums, limpiadoras, champú, jabones, desodorantes y bloqueadores solares.
-         * Para "Ropa": "Vestidos y faldas", "Camisas y blusas", "Pantalones y jeans", "Chaquetas y buzos", "Ropa interior y pijamas", "Prendas varias".
+         * Para "Promociones": "Sets y combos", "Ofertas 2x1", "Promociones especiales".
+         * Para "Perfumes y fragancias": "Perfumes masculinos" o "Perfumes femeninos".
+         * Para "Accesorios": "Joyería y bisutería" (aretes, collares, pulseras), "Bolsos y carteras", "Relojes y accesorios".
+         * Para "Cuidado personal": "Desodorantes y antitranspirantes", "Cuidado facial y antiedad", "Cuidado corporal", "Afeitado y barba", "Cuidado capilar", "Protección solar", "Higiene y baño".
+         * Para "Maquillaje": "Labiales", "Ojos y cejas", "Rostro y polvos", "Esmaltes y uñas", "Accesorios de maquillaje".
+         * Para "Ropa": "Vestidos y faldas", "Camisas y blusas", "Pantalones y jeans", "Chaquetas y abrigos", "Ropa interior y pijamas", "Prendas varias".
          * Para "Zapatos": "Sandalias", "Tacones", "Tenis y deportivos", "Botas y botines", "Calzado casual".
-         * Para "Hogar": "Dormitorio y cama", "Cocina y mesa", "Baño", "Hogar y decoración".
+         * Para "Hogar": "Dormitorio y baño", "Cocina y mesa", "Hogar y decoración".
 
     Texto extraído por OCR como referencia (Página {page_num}):
     {page_text}
@@ -1639,8 +1703,8 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
         "precio": "Precio con signo peso (ej: $124.990) o 'Confirmar con Erika'",
         "descripcion_corta": "Cód. XXXXX. Notas olfativas, condición si es promo, o detalles",
         "categoria": "Categoría principal (Dama, Caballero, Niños, Niñas, Hogar)",
-        "seccion": "Sección general (Belleza y perfumería, Ropa, Zapatos, Accesorios, Hogar, Varios)",
-        "subcategoria": "Subcategoría canónica (ej: Perfumes y fragancias, Maquillaje y cuidado personal)",
+        "seccion": "Sección (Promociones, Perfumes y fragancias, Accesorios, Cuidado personal, Maquillaje, Ropa, Zapatos, Hogar)",
+        "subcategoria": "Subcategoría canónica correspondiente",
         "es_promo": false,
         "requisito_promo": "",
         "catalogo": "{title}",
