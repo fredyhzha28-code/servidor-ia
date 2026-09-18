@@ -347,16 +347,29 @@ class GeminiKeyManager:
             if snap.exists:
                 data = snap.to_dict() or {}
                 disabled_list = data.get("disabled_keys", [])
-                disabled_envs = {d.get("env_var"): d.get("detail") for d in disabled_list if d.get("env_var")}
-                disabled_names = {d.get("name"): d.get("detail") for d in disabled_list if d.get("name")}
                 
+                need_resave = False
                 with self.lock:
                     for k in (self.primary_items + self.backup_items):
-                        if k.env_var in disabled_envs or k.name in disabled_names:
+                        # Buscar si esta llave específica fue reportada por su masked_key exacto
+                        matching = next((d for d in disabled_list if d.get("masked_key") and d.get("masked_key") == k.masked_key), None)
+                        
+                        if matching:
                             if not k.permanently_disabled:
                                 k.permanently_disabled = True
-                                k.disabled_reason = disabled_envs.get(k.env_var) or disabled_names.get(k.name) or "Error 403: Clave suspendida o inválida"
-                                print(f"[KeyManager] Sincronizada llave {k.name} ({k.env_var}) como suspendida desde Firestore.")
+                                k.disabled_reason = matching.get("detail") or "Error 403: Clave suspendida o sin permisos"
+                                print(f"[KeyManager] Sincronizada llave {k.name} ({k.env_var}) [{k.masked_key}] como suspendida desde Firestore.")
+                        else:
+                            # Si el usuario cambió la API Key en Render (el masked_key es diferente al que falló antes),
+                            # la llave debe estar ACTIVA y limpia, no heredar la suspensión de la clave anterior
+                            if k.permanently_disabled and k.client is not None:
+                                k.permanently_disabled = False
+                                k.disabled_reason = ""
+                                need_resave = True
+                                print(f"[KeyManager] Reactivada llave {k.name} ({k.env_var}) [{k.masked_key}] porque fue reemplazada en Render.")
+                
+                if need_resave:
+                    self.save_keys_state_to_firestore()
         except Exception as e:
             print(f"[KeyManager] Aviso sincronizando llaves desde Firestore: {e}")
 
@@ -583,11 +596,11 @@ class GeminiKeyManager:
                     res["detail"] = "Operativa"
             except Exception as err:
                 err_msg = str(err)
-                if "401" in err_msg or "403" in err_msg:
+                if "401" in err_msg or "403" in err_msg or "PERMISSION_DENIED" in err_msg or "API_KEY_INVALID" in err_msg:
                     res["status"] = "error_403"
-                    res["detail"] = f"Error 403: Cuenta suspendida o API Key {item.env_var} sin permisos"
+                    res["detail"] = f"Error 403: {err_msg[:160]}"
                     self.mark_cooldown(item, 86400, permanent=True, reason=res["detail"])
-                elif "429" in err_msg or "quota" in err_msg.lower():
+                elif "429" in err_msg or "quota" in err_msg.lower() or "RESOURCE_EXHAUSTED" in err_msg:
                     res["status"] = "cooldown_429"
                     res["detail"] = "Pausa temporal por límite de cuota (429)"
                     self.mark_cooldown(item, 20, permanent=False)
