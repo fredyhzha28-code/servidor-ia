@@ -2324,11 +2324,11 @@ def process_single_catalog(idx, cat):
                 "updatedAt": firestore.SERVER_TIMESTAMP
             }, merge=True)
             
-            # Latido constante en tiempo real a Firestore (cada 3.5s)
-            # Garantiza que el usuario vea en su página web todos los eventos, pausas de cuota (429) y trabajadores en vivo
+            # Latido constante en tiempo real a Firestore (cada 6s)
+            # Garantiza que el usuario vea en su página web todos los eventos sin saturar cuota de Firebase
             def run_heartbeat():
                 while not stop_event.is_set():
-                    time.sleep(3.5)
+                    time.sleep(6.0)
                     if stop_event.is_set() or not catalog_alive or not status_collection:
                         break
                     try:
@@ -2365,7 +2365,7 @@ def process_single_catalog(idx, cat):
                             "keys_detail": telem.get("keys_detail", []),
                             "updatedAt": firestore.SERVER_TIMESTAMP
                         }, merge=True)
-                    except Exception:
+                    except Exception as e:
                         pass
             threading.Thread(target=run_heartbeat, daemon=True).start()
         
@@ -2379,10 +2379,10 @@ def process_single_catalog(idx, cat):
                 return True
             now = time.time()
             with cancel_check_lock:
-                if now - last_cancel_check > 2.0:
+                # Comprobar solo cada 20 segundos para ahorrar cuota de lectura en Firebase Firestore
+                if now - last_cancel_check > 20.0:
                     last_cancel_check = now
                     try:
-                        # 1. Si el usuario borró el documento de status
                         if status_collection:
                             doc_s = status_collection.document(cat_hash).get()
                             if not doc_s.exists:
@@ -2390,21 +2390,7 @@ def process_single_catalog(idx, cat):
                                 catalog_alive = False
                                 stop_event.set()
                                 return True
-                        # 2. Si el usuario borró la revista de la colección de catálogos
-                        if catalogs_collection:
-                            clean_u = url.split('?')[0]
-                            cats = catalogs_collection.get()
-                            exists = any(
-                                ((c.to_dict().get('pdfUrl') or c.to_dict().get('url') or '').split('?')[0] == clean_u or
-                                 (c.to_dict().get('title') and c.to_dict().get('title').strip() == title.strip()))
-                                for c in cats
-                            )
-                            if not exists:
-                                print(f"[{title}] Revista eliminada de Firebase catalogs. Cancelando lectura de inmediato.")
-                                catalog_alive = False
-                                stop_event.set()
-                                return True
-                    except Exception:
+                    except Exception as e:
                         pass
             return not catalog_alive
 
