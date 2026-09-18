@@ -84,6 +84,24 @@ def keys_diagnostics():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/test-keys', methods=['GET', 'POST'])
+@app.route('/api/search/api/test-keys', methods=['GET', 'POST'])
+def test_keys():
+    if 'key_manager' not in globals() or not key_manager:
+        return jsonify({"error": "KeyManager no inicializado"}), 500
+    try:
+        test_results = key_manager.run_live_keys_verification()
+        diag = key_manager.get_detailed_diagnostics()
+        return jsonify({
+            "success": True,
+            "tested_count": len(test_results),
+            "results": test_results,
+            "diagnostics": diag
+        }), 200
+    except Exception as e:
+        print(f"[TestKeys] Error verificando llaves: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 @app.after_request
 def add_cors_headers(response):
@@ -111,34 +129,46 @@ def handle_exception(e):
 # 1. Cargar llaves PRIMARIAS (Tier 1: Cuentas y proyectos independientes 11 a 15 de Render)
 primary_keys_loaded = []
 for i in range(11, 16):
-    val = os.environ.get(f"GEMINI_API_KEY_{i}")
-    if val and val.strip() and val.strip() not in primary_keys_loaded:
-        primary_keys_loaded.append(val.strip())
+    var_name = f"GEMINI_API_KEY_{i}"
+    val = os.environ.get(var_name)
+    if val and val.strip():
+        k_str = val.strip()
+        if not any(item["key"] == k_str for item in primary_keys_loaded):
+            primary_keys_loaded.append({"key": k_str, "env_var": var_name, "id": f"primary_{i-10}", "name": f"Principal-{i-10} (Multicuenta)"})
 
 # Soporte si se configuraron en una sola variable separadas por coma
 multi_primary = os.environ.get("GEMINI_PRIMARY_KEYS", "")
 if multi_primary:
-    for pk in multi_primary.split(","):
-        if pk.strip() and pk.strip() not in primary_keys_loaded:
-            primary_keys_loaded.append(pk.strip())
+    for idx, pk in enumerate(multi_primary.split(",")):
+        k_str = pk.strip()
+        if k_str and not any(item["key"] == k_str for item in primary_keys_loaded):
+            primary_keys_loaded.append({"key": k_str, "env_var": "GEMINI_PRIMARY_KEYS", "id": f"primary_{len(primary_keys_loaded)+1}", "name": f"Principal-{len(primary_keys_loaded)+1} (Multicuenta)"})
 
 # 2. Cargar llaves de RESPALDO (Tier 2: 1 a 10 de cuenta compartida)
 backup_keys_loaded = []
 for main_var in ["GEMINI_API_KEY", "GEMINI_API_KEY_1"]:
     val = os.environ.get(main_var)
-    if val and val.strip() and val.strip() not in primary_keys_loaded and val.strip() not in backup_keys_loaded:
-        backup_keys_loaded.append(val.strip())
+    if val and val.strip():
+        k_str = val.strip()
+        if not any(item["key"] == k_str for item in primary_keys_loaded) and not any(item["key"] == k_str for item in backup_keys_loaded):
+            backup_keys_loaded.append({"key": k_str, "env_var": main_var, "id": "backup_1", "name": "Respaldo-1"})
 
 for i in range(2, 11):
-    val = os.environ.get(f"GEMINI_API_KEY_{i}")
-    if val and val.strip() and val.strip() not in primary_keys_loaded and val.strip() not in backup_keys_loaded:
-        backup_keys_loaded.append(val.strip())
+    var_name = f"GEMINI_API_KEY_{i}"
+    val = os.environ.get(var_name)
+    if val and val.strip():
+        k_str = val.strip()
+        if not any(item["key"] == k_str for item in primary_keys_loaded) and not any(item["key"] == k_str for item in backup_keys_loaded):
+            backup_keys_loaded.append({"key": k_str, "env_var": var_name, "id": f"backup_{i}", "name": f"Respaldo-{i}"})
 
-# También cualquier otra key extra
+# También cualquier otra key extra (16 a 50)
 for i in range(16, 51):
-    val = os.environ.get(f"GEMINI_API_KEY_{i}")
-    if val and val.strip() and val.strip() not in primary_keys_loaded and val.strip() not in backup_keys_loaded:
-        backup_keys_loaded.append(val.strip())
+    var_name = f"GEMINI_API_KEY_{i}"
+    val = os.environ.get(var_name)
+    if val and val.strip():
+        k_str = val.strip()
+        if not any(item["key"] == k_str for item in primary_keys_loaded) and not any(item["key"] == k_str for item in backup_keys_loaded):
+            backup_keys_loaded.append({"key": k_str, "env_var": var_name, "id": f"backup_{len(backup_keys_loaded)+1}", "name": f"Respaldo-{len(backup_keys_loaded)+1}"})
 
 # Inicializar Firebase
 firebase_db = None
@@ -164,31 +194,49 @@ memory_knowledge_cache = {}  # Cache en memoria RAM: cat_hash -> list(products)
 # =====================================================================
 
 class KeyItem:
-    def __init__(self, key, tier, name):
-        self.key = key
+    def __init__(self, key, tier, name, env_var, key_id):
+        self.key = key.strip()
         self.tier = tier  # 1 = Principal (Cuenta independiente), 2 = Respaldo (Compartida)
         self.name = name
+        self.env_var = env_var
+        self.id = key_id
+        self.tier_label = "Principal (Tier 1)" if tier == 1 else "Respaldo (Tier 2)"
+        self.masked_key = (self.key[:6] + "..." + self.key[-4:]) if len(self.key) > 10 else "***"
         self.client = None
+        self.disabled_reason = ""
+        self.error_type = ""
         try:
-            self.client = genai.Client(api_key=key.strip())
+            self.client = genai.Client(api_key=self.key)
         except Exception as e:
-            print(f"Aviso creando cliente Gemini para {name}: {e}")
+            print(f"Aviso creando cliente Gemini para {name} ({env_var}): {e}")
+            self.disabled_reason = f"Error creando cliente: {e}"
+            self.error_type = "403"
         self.available = True
         self.cooldown_until = 0.0
         self.permanently_disabled = (self.client is None)
         self.last_used = 0.0
 
 class GeminiKeyManager:
-    def __init__(self, primary_keys, backup_keys):
+    def __init__(self, primary_data, backup_data):
         self.primary_items = []
-        for i, k in enumerate(primary_keys):
-            if k and k.strip():
-                self.primary_items.append(KeyItem(k.strip(), tier=1, name=f"Principal-{i+1} (Multicuenta)"))
+        for i, info in enumerate(primary_data):
+            self.primary_items.append(KeyItem(
+                key=info["key"],
+                tier=1,
+                name=info.get("name", f"Principal-{i+1} (Multicuenta)"),
+                env_var=info.get("env_var", f"GEMINI_API_KEY_{11+i}"),
+                key_id=info.get("id", f"primary_{i+1}")
+            ))
                 
         self.backup_items = []
-        for i, k in enumerate(backup_keys):
-            if k and k.strip():
-                self.backup_items.append(KeyItem(k.strip(), tier=2, name=f"Respaldo-{i+1}"))
+        for i, info in enumerate(backup_data):
+            self.backup_items.append(KeyItem(
+                key=info["key"],
+                tier=2,
+                name=info.get("name", f"Respaldo-{i+1}"),
+                env_var=info.get("env_var", "GEMINI_API_KEY" if i == 0 else f"GEMINI_API_KEY_{i+1}"),
+                key_id=info.get("id", f"backup_{i+1}")
+            ))
                 
         self.primary_idx = 0
         self.backup_idx = 0
@@ -199,6 +247,67 @@ class GeminiKeyManager:
         
         print(f"[KeyManager] Cargadas {len(self.primary_items)} API keys PRINCIPALES (Cuentas y Proyectos Independientes).")
         print(f"[KeyManager] Cargadas {len(self.backup_items)} API keys de RESPALDO (Tier 2).")
+        # Sincronizar de inmediato si hay registro en Firestore de llaves suspendidas por otro worker
+        self.sync_keys_state_from_firestore()
+
+    def save_keys_state_to_firestore(self):
+        if not firebase_db:
+            return
+        try:
+            now = time.time()
+            disabled = []
+            with self.lock:
+                for k in (self.primary_items + self.backup_items):
+                    if k.permanently_disabled:
+                        disabled.append({
+                            "id": k.id,
+                            "name": k.name,
+                            "env_var": k.env_var,
+                            "masked_key": k.masked_key,
+                            "tier": k.tier,
+                            "tier_label": k.tier_label,
+                            "status": "error_403",
+                            "detail": k.disabled_reason or "Error 403: Clave suspendida, sin permisos o inválida en Render"
+                        })
+            
+            app_id = "tienda-catalogos-app"
+            doc_ref = firebase_db.collection("artifacts").document(app_id).collection("public").document("data").collection("ai_keys_status").document("status")
+            doc_ref.set({
+                "disabled_keys": disabled,
+                "has_errors": len(disabled) > 0,
+                "total_disabled": len(disabled),
+                "summary": {
+                    "total_keys": len(self.primary_items) + len(self.backup_items),
+                    "primary_disabled": sum(1 for k in self.primary_items if k.permanently_disabled),
+                    "backup_disabled": sum(1 for k in self.backup_items if k.permanently_disabled)
+                },
+                "updatedAt": firestore.SERVER_TIMESTAMP
+            }, merge=True)
+        except Exception as e:
+            print(f"[KeyManager] Aviso guardando estado de llaves en Firestore: {e}")
+
+    def sync_keys_state_from_firestore(self):
+        if not firebase_db:
+            return
+        try:
+            app_id = "tienda-catalogos-app"
+            doc_ref = firebase_db.collection("artifacts").document(app_id).collection("public").document("data").collection("ai_keys_status").document("status")
+            snap = doc_ref.get()
+            if snap.exists:
+                data = snap.to_dict() or {}
+                disabled_list = data.get("disabled_keys", [])
+                disabled_envs = {d.get("env_var"): d.get("detail") for d in disabled_list if d.get("env_var")}
+                disabled_names = {d.get("name"): d.get("detail") for d in disabled_list if d.get("name")}
+                
+                with self.lock:
+                    for k in (self.primary_items + self.backup_items):
+                        if k.env_var in disabled_envs or k.name in disabled_names:
+                            if not k.permanently_disabled:
+                                k.permanently_disabled = True
+                                k.disabled_reason = disabled_envs.get(k.env_var) or disabled_names.get(k.name) or "Error 403: Clave suspendida o inválida"
+                                print(f"[KeyManager] Sincronizada llave {k.name} ({k.env_var}) como suspendida desde Firestore.")
+        except Exception as e:
+            print(f"[KeyManager] Aviso sincronizando llaves desde Firestore: {e}")
 
     def get_active_primary_count(self):
         with self.lock:
@@ -259,6 +368,45 @@ class GeminiKeyManager:
             p_wait = sum(1 for k in self.primary_items if not k.permanently_disabled and now < k.cooldown_until)
             p_disabled = sum(1 for k in self.primary_items if k.permanently_disabled)
             b_active = sum(1 for k in self.backup_items if not k.permanently_disabled and now >= k.cooldown_until)
+            b_wait = sum(1 for k in self.backup_items if not k.permanently_disabled and now < k.cooldown_until)
+            b_disabled = sum(1 for k in self.backup_items if k.permanently_disabled)
+            
+            disabled_keys = [
+                {
+                    "id": k.id,
+                    "name": k.name,
+                    "env_var": k.env_var,
+                    "masked_key": k.masked_key,
+                    "tier": k.tier,
+                    "tier_label": k.tier_label,
+                    "status": "error_403",
+                    "detail": k.disabled_reason or "Error 403: Clave suspendida o sin permisos"
+                }
+                for k in (self.primary_items + self.backup_items) if k.permanently_disabled
+            ]
+
+            keys_detail = []
+            for k in (self.primary_items + self.backup_items):
+                st = "active"
+                dt = "Operativa y respondiendo"
+                if k.permanently_disabled:
+                    st = "error_403"
+                    dt = k.disabled_reason or "Error 403: Clave suspendida o inválida"
+                elif now < k.cooldown_until:
+                    st = "cooldown_429"
+                    rem = int(k.cooldown_until - now)
+                    dt = f"Pausa temporal por límite de cuota ({rem}s restantes)"
+                keys_detail.append({
+                    "id": k.id,
+                    "name": k.name,
+                    "env_var": k.env_var,
+                    "masked_key": k.masked_key,
+                    "tier": k.tier,
+                    "tier_label": k.tier_label,
+                    "status": st,
+                    "detail": dt,
+                    "cooldown_remaining": max(0, int(k.cooldown_until - now)) if st == "cooldown_429" else 0
+                })
             
             return {
                 "active_workers": list(self.active_workers.values()),
@@ -267,66 +415,76 @@ class GeminiKeyManager:
                 "primary_cooldown": p_wait,
                 "primary_disabled": p_disabled,
                 "backup_active": b_active,
-                "total_keys": len(self.primary_items) + len(self.backup_items)
+                "backup_cooldown": b_wait,
+                "backup_disabled": b_disabled,
+                "total_keys": len(self.primary_items) + len(self.backup_items),
+                "disabled_keys": disabled_keys,
+                "keys_detail": keys_detail
             }
 
     def get_detailed_diagnostics(self):
+        self.sync_keys_state_from_firestore()
         with self.lock:
             now = time.time()
             items = []
-            for i, k in enumerate(self.primary_items):
+            disabled_keys = []
+            for k in self.primary_items:
                 status = "active"
                 detail = "Operativa y respondiendo"
                 if k.permanently_disabled:
                     status = "error_403"
-                    detail = "Error 403: Clave suspendida, sin permisos o inválida"
+                    detail = k.disabled_reason or "Error 403: Clave suspendida, sin permisos o inválida en Render"
                 elif now < k.cooldown_until:
                     status = "cooldown_429"
                     rem = int(k.cooldown_until - now)
                     detail = f"Pausa temporal por límite de cuota ({rem}s restantes)"
                 
-                masked = (k.key[:6] + "..." + k.key[-4:]) if len(k.key) > 10 else "***"
-                items.append({
-                    "id": f"primary_{i+1}",
+                item_data = {
+                    "id": k.id,
                     "name": k.name,
                     "tier": 1,
                     "tier_label": "Principal (Tier 1)",
-                    "env_var": f"GEMINI_API_KEY_{11+i}",
-                    "masked_key": masked,
+                    "env_var": k.env_var,
+                    "masked_key": k.masked_key,
                     "status": status,
                     "detail": detail,
                     "cooldown_remaining": max(0, int(k.cooldown_until - now)) if status == "cooldown_429" else 0
-                })
+                }
+                items.append(item_data)
+                if status == "error_403":
+                    disabled_keys.append(item_data)
 
-            for i, k in enumerate(self.backup_items):
+            for k in self.backup_items:
                 status = "active"
                 detail = "En espera de respaldo"
                 if k.permanently_disabled:
                     status = "error_403"
-                    detail = "Error 403: Clave suspendida o inválida"
+                    detail = k.disabled_reason or "Error 403: Clave suspendida o inválida en Render"
                 elif now < k.cooldown_until:
                     status = "cooldown_429"
                     rem = int(k.cooldown_until - now)
                     detail = f"Pausa temporal por cuota ({rem}s restantes)"
                 
-                masked = (k.key[:6] + "..." + k.key[-4:]) if len(k.key) > 10 else "***"
-                env_name = "GEMINI_API_KEY" if i == 0 else f"GEMINI_API_KEY_{i+1}"
-                items.append({
-                    "id": f"backup_{i+1}",
+                item_data = {
+                    "id": k.id,
                     "name": k.name,
                     "tier": 2,
                     "tier_label": "Respaldo (Tier 2)",
-                    "env_var": env_name,
-                    "masked_key": masked,
+                    "env_var": k.env_var,
+                    "masked_key": k.masked_key,
                     "status": status,
                     "detail": detail,
                     "cooldown_remaining": max(0, int(k.cooldown_until - now)) if status == "cooldown_429" else 0
-                })
+                }
+                items.append(item_data)
+                if status == "error_403":
+                    disabled_keys.append(item_data)
 
             p_active = sum(1 for k in self.primary_items if not k.permanently_disabled and now >= k.cooldown_until)
             p_wait = sum(1 for k in self.primary_items if not k.permanently_disabled and now < k.cooldown_until)
             p_disabled = sum(1 for k in self.primary_items if k.permanently_disabled)
             b_active = sum(1 for k in self.backup_items if not k.permanently_disabled and now >= k.cooldown_until)
+            b_wait = sum(1 for k in self.backup_items if not k.permanently_disabled and now < k.cooldown_until)
             b_disabled = sum(1 for k in self.backup_items if k.permanently_disabled)
 
             return {
@@ -336,13 +494,59 @@ class GeminiKeyManager:
                     "primary_cooldown": p_wait,
                     "primary_disabled": p_disabled,
                     "backup_active": b_active,
+                    "backup_cooldown": b_wait,
                     "backup_disabled": b_disabled,
                     "has_errors": (p_disabled > 0 or b_disabled > 0)
                 },
                 "keys": items,
+                "disabled_keys": disabled_keys,
                 "recent_events": list(self.recent_events),
                 "active_workers": list(self.active_workers.values())
             }
+
+    def run_live_keys_verification(self):
+        """Prueba en tiempo real cada llave principal para detectar suspensiones (403) al instante."""
+        results = []
+        for item in self.primary_items:
+            res = {
+                "id": item.id,
+                "name": item.name,
+                "env_var": item.env_var,
+                "masked_key": item.masked_key,
+                "tier": item.tier,
+                "tier_label": item.tier_label
+            }
+            try:
+                test_resp = item.client.models.generate_content(
+                    model='gemini-2.0-flash',
+                    contents="Responde solo: OK"
+                )
+                if test_resp and test_resp.text:
+                    res["status"] = "active"
+                    res["detail"] = "Operativa y respondiendo (Validada con éxito)"
+                    with self.lock:
+                        item.permanently_disabled = False
+                        item.disabled_reason = ""
+                else:
+                    res["status"] = "active"
+                    res["detail"] = "Operativa"
+            except Exception as err:
+                err_msg = str(err)
+                if "401" in err_msg or "403" in err_msg:
+                    res["status"] = "error_403"
+                    res["detail"] = f"Error 403: Cuenta suspendida o API Key {item.env_var} sin permisos"
+                    self.mark_cooldown(item, 86400, permanent=True, reason=res["detail"])
+                elif "429" in err_msg or "quota" in err_msg.lower():
+                    res["status"] = "cooldown_429"
+                    res["detail"] = "Pausa temporal por límite de cuota (429)"
+                    self.mark_cooldown(item, 20, permanent=False)
+                else:
+                    res["status"] = "warning"
+                    res["detail"] = f"Aviso: {err_msg[:120]}"
+            results.append(res)
+        
+        self.save_keys_state_to_firestore()
+        return results
 
     def get_client(self):
         sleep_needed = 0.0
@@ -391,14 +595,17 @@ class GeminiKeyManager:
             min_wait = min(waits) if waits else 5.0
             return None, min_wait, None, 0.0
 
-    def mark_cooldown(self, item, seconds=20, permanent=False):
+    def mark_cooldown(self, item, seconds=20, permanent=False, reason=""):
         with self.lock:
             now = time.time()
             item.available = False
             item.cooldown_until = now + seconds
             if permanent:
                 item.permanently_disabled = True
-                print(f"[KeyManager] {item.name} DESHABILITADA PERMANENTEMENTE (401/403).")
+                item.disabled_reason = reason or "Error 403: Cuenta suspendida, permisos insuficientes o API Key no válida"
+                print(f"[KeyManager] {item.name} ({item.env_var}) DESHABILITADA PERMANENTEMENTE (401/403). Motivo: {item.disabled_reason}")
+                # Sincronizar inmediatamente en segundo plano a Firestore
+                threading.Thread(target=self.save_keys_state_to_firestore, daemon=True).start()
             else:
                 print(f"[KeyManager] {item.name} en espera por {int(seconds)}s.")
                 # Si es de respaldo (Tier 2), pausar el grupo de respaldo completo porque comparten cuenta
@@ -629,7 +836,8 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=15, model_name=
                 total_wait_time += 0.5
             elif "401" in error_str or "403" in error_str:
                 actual_attempts += 1
-                key_manager.mark_cooldown(key_item, 86400, permanent=True)
+                reason = f"Error 403: Cuenta suspendida o API Key {key_item.env_var} ({key_item.name}) sin permisos"
+                key_manager.mark_cooldown(key_item, 86400, permanent=True, reason=reason)
                 key_manager.register_key_alert(key_name, "403")
             elif "404" in error_str:
                 # 404 es problema del recurso o modelo, NUNCA debe inhabilitar la API key permanentemente
@@ -2047,6 +2255,8 @@ def process_single_catalog(idx, cat):
                     "primary_disabled": telemetry["primary_disabled"],
                     "backup_active": telemetry["backup_active"]
                 },
+                "disabled_keys": telemetry.get("disabled_keys", []),
+                "keys_detail": telemetry.get("keys_detail", []),
                 "updatedAt": firestore.SERVER_TIMESTAMP
             }, merge=True)
         
@@ -2134,6 +2344,8 @@ def process_single_catalog(idx, cat):
                             "primary_disabled": telemetry["primary_disabled"],
                             "backup_active": telemetry["backup_active"]
                         },
+                        "disabled_keys": telemetry.get("disabled_keys", []),
+                        "keys_detail": telemetry.get("keys_detail", []),
                         "updatedAt": firestore.SERVER_TIMESTAMP
                     }, merge=True)
         
