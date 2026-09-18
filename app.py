@@ -245,7 +245,7 @@ else:
 # SUPABASE REST API INTEGRATION (ILIMITADO, SIN CUOTAS DIARIAS)
 # =====================================================================
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://qlpuuieqoyxksuxeoycd.supabase.co")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", os.environ.get("SUPABASE_SECRET_KEY", "sb_secret_jX_WWCQ-dKVgvP6YZpI1_A_WIP2MGrN"))
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", os.environ.get("SUPABASE_SECRET_KEY", ""))
 
 def supabase_post(table, data):
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
