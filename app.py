@@ -238,6 +238,23 @@ if firebase_creds_b64:
 else:
     print("No se encontró FIREBASE_CREDENTIALS_B64. Funcionando sin caché en Firebase.")
 
+# Registro global de salud y cuota de Firebase Firestore
+firestore_health = {
+    "quota_exceeded": False,
+    "last_error": None,
+    "last_error_time": 0
+}
+
+def record_firestore_error(err):
+    if not err:
+        return
+    err_str = str(err)
+    if "429" in err_str or "Quota exceeded" in err_str or "RESOURCE_EXHAUSTED" in err_str or "ResourceExhausted" in err_str:
+        firestore_health["quota_exceeded"] = True
+        firestore_health["last_error"] = err_str
+        firestore_health["last_error_time"] = time.time()
+        print(f"[FirestoreHealth] 🚨 Alerta: Límite diario de Firestore excedido (429 Quota Exceeded): {err_str[:120]}")
+
 memory_knowledge_cache = {}  # Cache en memoria RAM: cat_hash -> list(products)
 
 # =====================================================================
@@ -372,6 +389,7 @@ class GeminiKeyManager:
                     self.save_keys_state_to_firestore()
         except Exception as e:
             print(f"[KeyManager] Aviso sincronizando llaves desde Firestore: {e}")
+            record_firestore_error(e)
 
     def get_active_primary_count(self):
         with self.lock:
@@ -565,7 +583,14 @@ class GeminiKeyManager:
                 "keys": items,
                 "disabled_keys": disabled_keys,
                 "recent_events": list(self.recent_events),
-                "active_workers": list(self.active_workers.values())
+                "active_workers": list(self.active_workers.values()),
+                "database_status": {
+                    "quota_exceeded": firestore_health["quota_exceeded"],
+                    "last_error": firestore_health["last_error"],
+                    "last_error_time": firestore_health["last_error_time"],
+                    "provider": "Firebase Firestore (Google Cloud)",
+                    "message": "Límite diario gratuito de 50.000 lecturas de Firebase Firestore excedido (Error 429 Quota exceeded). Google ha bloqueado temporalmente las consultas y guardado a la base de datos." if firestore_health["quota_exceeded"] else "Operativa"
+                }
             }
 
     def run_live_keys_verification(self):
@@ -2173,38 +2198,51 @@ def process_single_catalog(idx, cat):
     # 0. Verificación de que el catálogo existe en la base de datos
     if catalogs_collection:
         clean_url = url.split('?')[0]
-        all_cats = catalogs_collection.get()
-        exists_in_db = False
-        for c in all_cats:
-            c_data = c.to_dict()
-            db_url = (c_data.get('pdfUrl') or c_data.get('url') or '').split('?')[0]
-            if db_url == clean_url or (c_data.get('title') and c_data.get('title').strip() == title.strip()):
-                exists_in_db = True
-                break
-                
-        if not exists_in_db:
-            print(f"[{title}] Catálogo no encontrado en Firebase 'catalogs'. Abortando.")
-            if status_collection:
-                try: status_collection.document(cat_hash).delete()
-                except: pass
-            return
+        try:
+            all_cats = catalogs_collection.get()
+            exists_in_db = False
+            for c in all_cats:
+                c_data = c.to_dict()
+                db_url = (c_data.get('pdfUrl') or c_data.get('url') or '').split('?')[0]
+                if db_url == clean_url or (c_data.get('title') and c_data.get('title').strip() == title.strip()):
+                    exists_in_db = True
+                    break
+                    
+            if not exists_in_db:
+                print(f"[{title}] Catálogo no encontrado en Firebase 'catalogs'. Abortando.")
+                if status_collection:
+                    try: status_collection.document(cat_hash).delete()
+                    except: pass
+                return
+        except Exception as fe:
+            print(f"[{title}] Aviso verificando catálogo en Firestore: {fe}")
+            record_firestore_error(fe)
+            # Si Firestore falló con 429 Quota Exceeded, no abortar la lectura del catálogo que el usuario solicitó
             
     # 1. Recuperar estado de procesamiento
     doc_snap = None
     if status_collection:
-        doc_snap = status_collection.document(cat_hash).get()
-        if doc_snap.exists:
-            data = doc_snap.to_dict()
-            total_pg = int(data.get('total_pages', 0) or 0)
-            comp_pg = int(data.get('completed_pages', 0) or 0)
-            if data.get('status') == 'completed' and data.get('progress', 0) >= 100 and total_pg > 0 and comp_pg >= total_pg:
-                print(f"Catálogo {title} ya estaba procesado completamente al 100% ({comp_pg}/{total_pg} págs). Abortando re-lectura.")
-                return
+        try:
+            doc_snap = status_collection.document(cat_hash).get()
+            if doc_snap.exists:
+                data = doc_snap.to_dict()
+                total_pg = int(data.get('total_pages', 0) or 0)
+                comp_pg = int(data.get('completed_pages', 0) or 0)
+                if data.get('status') == 'completed' and data.get('progress', 0) >= 100 and total_pg > 0 and comp_pg >= total_pg:
+                    print(f"Catálogo {title} ya estaba procesado completamente al 100% ({comp_pg}/{total_pg} págs). Abortando re-lectura.")
+                    return
+        except Exception as fe:
+            print(f"[{title}] Aviso leyendo estado de catálogo en Firestore: {fe}")
+            record_firestore_error(fe)
 
     if status_collection and (not doc_snap or not doc_snap.exists):
-        status_collection.document(cat_hash).set({
-            "status": "processing", "title": title, "message": "Descargando PDF...", "progress": 1, "last_successful_page": 0, "updatedAt": firestore.SERVER_TIMESTAMP
-        })
+        try:
+            status_collection.document(cat_hash).set({
+                "status": "processing", "title": title, "message": "Descargando PDF...", "progress": 1, "last_successful_page": 0, "updatedAt": firestore.SERVER_TIMESTAMP
+            })
+        except Exception as fe:
+            print(f"[{title}] Aviso guardando estado inicial en Firestore: {fe}")
+            record_firestore_error(fe)
 
     # 2. Bajar PDF a archivo temporal
     try:
@@ -2726,6 +2764,11 @@ def background_extract_and_save(missing_catalogs):
         cat_h = get_single_catalog_hash(url, title)
         try:
             process_single_catalog(idx, cat)
+        except Exception as e:
+            print(f"[{title}] Error no controlado en process_single_catalog: {e}")
+            record_firestore_error(e)
+            import traceback
+            traceback.print_exc()
         finally:
             with active_processing_lock:
                 active_processing_hashes.discard(cat_h)
@@ -2780,6 +2823,7 @@ def auto_resume_unfinished_catalogs():
             background_extract_and_save(to_resume)
     except Exception as e:
         print(f"[AutoResume] Aviso en verificación de revistas pendientes: {e}")
+        record_firestore_error(e)
 
 # Iniciar auto-reanudación en segundo plano al arrancar
 threading.Thread(target=auto_resume_unfinished_catalogs, daemon=True).start()
@@ -2857,6 +2901,7 @@ def search_products():
                         memory_knowledge_cache[cat_hash] = prods
                 except Exception as e:
                     print(f"Error consultando Firestore para {title}: {e}")
+                    record_firestore_error(e)
 
             # 3. Verificar si el catálogo ya fue memorizado al 100%
             is_completed = False
@@ -2869,8 +2914,8 @@ def search_products():
                         comp_p = int(s_data.get('completed_pages', 0) or 0)
                         if s_data.get('status') == 'completed' and s_data.get('progress', 0) >= 100 and tot_p > 0 and comp_p >= tot_p:
                             is_completed = True
-                except Exception:
-                    pass
+                except Exception as fe:
+                    record_firestore_error(fe)
 
             if prods:
                 combined_items.extend(prods)
@@ -2905,8 +2950,8 @@ def search_products():
                             cmp = int(sd.get('completed_pages', 0) or 0)
                             if sd.get('status') == 'completed' and sd.get('progress', 0) >= 100 and tot > 0 and cmp >= tot:
                                 truly_completed = True
-                    except Exception:
-                        pass
+                    except Exception as fe:
+                        record_firestore_error(fe)
                 
                 if not truly_completed:
                     catalogs_to_run.append(c_data)
