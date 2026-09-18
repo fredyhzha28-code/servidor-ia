@@ -1270,9 +1270,13 @@ def clean_product_taxonomy(p):
         p['subcategoria'] = 'Joyería y bisutería'
         return p
 
-    # 3. SECCIÓN PROMOCIONES: SETS, COMBOS, DUOS, PACKS Y OFERTAS 2X1
-    # Agrupa sets multi-producto (ej: Set Magnat Select con perfume + mini perfume + desodorante + bolsa),
-    # combos, 2x1, 'paga 1 lleva 2' y ofertas especiales multi-producto
+    # 3. SECCIÓN PROMOCIONES (MÁXIMA PRIORIDAD PARA CUALQUIER OFERTA, DESCUENTO, SET O 2X1)
+    # Cualquier producto con descuento (ej: 50% dscto, 55% dscto, oferta estrella), [PROMO], es_promo, sets o combos
+    # DEBE IR OBLIGATORIAMENTE A "Promociones"
+    precio_promo = str(p.get('precio_promo') or '').strip()
+    requisito_promo = str(p.get('requisito_promo') or '').strip()
+    es_promo = bool(p.get('es_promo'))
+
     is_2x1 = bool(re.search(r'\b(2x1|2\s*x\s*1|paga\s*1\s*lleva\s*2|pague\s*1\s*lleva\s*2|lleva\s*2\s*por|lleva\s*3\s*por|promo\s*2x|3x2)\b', full_text, re.I) or
                   re.search(r'\[promo\s*2x1\]', name_lower, re.I))
 
@@ -1280,7 +1284,9 @@ def clean_product_taxonomy(p):
     has_plus_combo = bool('+' in nombre and re.search(r'\b(perfume|parfum|fragancia|colonia|desodorante|roll-on|locion|loción|crema|labial|shampoo|bolsa)\b', name_lower, re.I))
     is_multi_set = has_set_keyword or has_plus_combo
 
-    is_promo_flag = bool(p.get('es_promo')) or bool(re.search(r'\[promo\]|\[oferta\]', name_lower, re.I))
+    is_promo_detected = es_promo or bool(precio_promo) or bool(requisito_promo) or \
+                        bool(re.search(r'\[promo\]|\[oferta\]|\[promo\s*2x1\]|\[descuento\]', name_lower, re.I)) or \
+                        bool(re.search(r'\b(oferta estrella|promo estrella|mega promo|oferta millonaria|oferta dorada|super oferta|súper oferta|precio especial|\b\d+%\s*(dscto|descuento)\b|a solo\s*\$|c\/u a solo|precio rebajado|promoci[oó]n|descuento)\b', full_text, re.I))
 
     if is_2x1:
         p['categoria'] = cat
@@ -1294,10 +1300,18 @@ def clean_product_taxonomy(p):
         p['subcategoria'] = 'Sets y combos'
         return p
 
-    if is_promo_flag and not any(w in name_lower for w in ['labial', 'perfume', 'parfum', 'crema', 'desodorante']):
+    if is_promo_detected:
+        if re.search(r'\b(parfum|perfume|fragancia|colonia|locion|loción|eau de|splash|mist|expression|mithyka|bleu|magnat)\b', name_lower, re.I):
+            sub = 'Fragancias en oferta'
+        elif re.search(r'\b(labial|máscara|mascara|pestañina|base|polvo|sombra|delineador|esmalte)\b', name_lower, re.I):
+            sub = 'Maquillaje en oferta'
+        elif re.search(r'\b(crema|sérum|serum|suero|desodorante|shampoo|bloqueador)\b', name_lower, re.I):
+            sub = 'Cuidado personal en oferta'
+        else:
+            sub = 'Ofertas y descuentos'
         p['categoria'] = cat
         p['seccion'] = 'Promociones'
-        p['subcategoria'] = 'Promociones especiales'
+        p['subcategoria'] = sub
         return p
 
     # 4. ACCESORIOS (Bolsos individuales, mochilas, carteras, relojes, gafas)
@@ -1674,16 +1688,16 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     7. TAXONOMÍA CANÓNICA ESTRICTA DE ALTA PRECISIÓN:
        - "categoria": Exclusivamente una de: "Dama", "Caballero", "Niños", "Niñas", "Hogar".
        - "seccion":
-         * "Promociones": ¡OBLIGATORIO para todos los SETS, COMBOS, DUOS, PACKS multi-producto (ej: Set Perfume + Desodorante + Bolsa), ofertas "2x1", "Paga 1 lleva 2"!
-         * "Perfumes y fragancias": ¡EXCLUSIVAMENTE perfumes individuales, colonias y lociones aromáticas! (JAMÁS aretes, JAMÁS desodorantes individuales ni sets con bolsa).
+         * "Promociones": ¡OBLIGATORIO para TODOS los productos con descuento, promoción (ej: 50% dscto, 55% dscto, oferta estrella), SETS, COMBOS, DUOS, PACKS multi-producto, ofertas "2x1", "Paga 1 lleva 2"!
+         * "Perfumes y fragancias": ¡EXCLUSIVAMENTE perfumes y colonias regulares individuales SIN promoción ni descuento! (JAMÁS aretes, JAMÁS desodorantes, JAMÁS productos con precio de oferta/promo).
          * "Accesorios": ¡OBLIGATORIO para joyería y bisutería (aretes, collares, pulseras, anillos), mochilas, bolsos individuales, carteras, billeteras, relojes, gafas! (NUNCA en perfumes).
-         * "Cuidado personal": Desodorantes individuales y antitranspirantes (roll-on, spray), espumas de afeitar, cremas faciales/corporales, sérums (Nocturne Ojos), protectores solares, shampoo.
-         * "Maquillaje": Labiales individuales, máscaras/pestañinas, delineadores, bases, polvos, sombras, rubor, esmaltes.
+         * "Cuidado personal": Desodorantes individuales y antitranspirantes regulares (roll-on, spray), espumas de afeitar, cremas faciales/corporales, sérums (Nocturne Ojos), protectores solares, shampoo.
+         * "Maquillaje": Labiales individuales regulares, máscaras/pestañinas, delineadores, bases, polvos, sombras, rubor, esmaltes.
          * "Ropa": Vestidos, blusas, pantalones, jeans, chaquetas, ropa interior, pijamas.
          * "Zapatos": Sandalias, tacones, tenis, botas, calzado.
          * "Hogar": Edredones, sábanas, toallas, vajilla, sartenes, cocina.
        - "subcategoria":
-         * Para "Promociones": "Sets y combos", "Ofertas 2x1", "Promociones especiales".
+         * Para "Promociones": "Fragancias en oferta", "Sets y combos", "Ofertas 2x1", "Maquillaje en oferta", "Ofertas y descuentos".
          * Para "Perfumes y fragancias": "Perfumes masculinos" o "Perfumes femeninos".
          * Para "Accesorios": "Joyería y bisutería" (aretes, collares, pulseras), "Bolsos y carteras", "Relojes y accesorios".
          * Para "Cuidado personal": "Desodorantes y antitranspirantes", "Cuidado facial y antiedad", "Cuidado corporal", "Afeitado y barba", "Cuidado capilar", "Protección solar", "Higiene y baño".
