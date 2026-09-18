@@ -788,7 +788,7 @@ def call_gemini_with_key_manager(prompt, files=None, max_retries=15, model_name=
     quota_cooldown_cycles = 0
     max_quota_cycles = 40
     total_wait_time = 0.0
-    max_total_wait = 35.0  # Evita que el worker de Gunicorn caiga por timeout (120s)
+    max_total_wait = 180.0  # Permite esperar a que los límites por minuto de Google (429) se reanuden sin abortar la página
 
     # Pre-cargar imágenes en memoria como Parts de genai para no depender de client.files.upload
     # ni sufrir latencia de subida a la nube en cada reintento
@@ -2323,6 +2323,51 @@ def process_single_catalog(idx, cat):
                 "keys_detail": telemetry.get("keys_detail", []),
                 "updatedAt": firestore.SERVER_TIMESTAMP
             }, merge=True)
+            
+            # Latido constante en tiempo real a Firestore (cada 3.5s)
+            # Garantiza que el usuario vea en su página web todos los eventos, pausas de cuota (429) y trabajadores en vivo
+            def run_heartbeat():
+                while not stop_event.is_set():
+                    time.sleep(3.5)
+                    if stop_event.is_set() or not catalog_alive or not status_collection:
+                        break
+                    try:
+                        with progress_lock:
+                            c_now = completed_count
+                        pct_now = int((c_now / total_pages) * 100) if total_pages > 0 else 0
+                        telem = key_manager.get_telemetry_snapshot()
+                        
+                        cd_count = telem.get("primary_cooldown", 0)
+                        act_workers = telem.get("active_workers", [])
+                        
+                        if cd_count > 0 and len(act_workers) == 0:
+                            msg_now = f"⏳ Pausa temporal por límite de cuota (429) en Google AI Studio. Esperando liberación de cuota..."
+                        else:
+                            msg_now = f"Memorizando con IA: {c_now}/{total_pages} páginas ({pct_now}%)..."
+                            
+                        status_collection.document(cat_hash).set({
+                            "status": "processing",
+                            "title": title,
+                            "message": msg_now,
+                            "progress": pct_now,
+                            "completed_pages": c_now,
+                            "total_pages": total_pages,
+                            "last_successful_page": c_now,
+                            "active_workers": act_workers,
+                            "recent_events": telem.get("recent_events", []),
+                            "keys_summary": {
+                                "primary_active": telem["primary_active"],
+                                "primary_cooldown": telem["primary_cooldown"],
+                                "primary_disabled": telem["primary_disabled"],
+                                "backup_active": telem["backup_active"]
+                            },
+                            "disabled_keys": telem.get("disabled_keys", []),
+                            "keys_detail": telem.get("keys_detail", []),
+                            "updatedAt": firestore.SERVER_TIMESTAMP
+                        }, merge=True)
+                    except Exception:
+                        pass
+            threading.Thread(target=run_heartbeat, daemon=True).start()
         
         last_cancel_check = 0.0
         catalog_alive = True
@@ -2426,30 +2471,48 @@ def process_single_catalog(idx, cat):
             try: os.remove(tmp_path)
             except: pass
             
-        if stop_event.is_set() or not catalog_alive:
+        stop_event.set()
+        if not catalog_alive:
             print(f"[{title}] Proceso cancelado porque la revista fue eliminada.")
             if status_collection:
                 try: status_collection.document(cat_hash).delete()
                 except: pass
         elif status_collection:
-            # Reconciliación automática de libro abierto (sincroniza ofertas de pliegos 30-31, 32-33, etc.)
-            try:
-                reconcile_spread_prices_for_catalog(cat_hash, appId=appId, title=title)
-                reconcile_spread_variants_for_catalog(cat_hash, appId=appId, title=title)
-            except Exception as re_err:
-                print(f"Aviso reconciliando libro abierto: {re_err}")
+            with progress_lock:
+                final_completed = completed_count
+            
+            if final_completed >= total_pages and total_pages > 0:
+                # Reconciliación automática de libro abierto (sincroniza ofertas de pliegos 30-31, 32-33, etc.)
+                try:
+                    reconcile_spread_prices_for_catalog(cat_hash, appId=appId, title=title)
+                    reconcile_spread_variants_for_catalog(cat_hash, appId=appId, title=title)
+                except Exception as re_err:
+                    print(f"Aviso reconciliando libro abierto: {re_err}")
 
-            status_collection.document(cat_hash).set({
-                "status": "completed",
-                "title": title,
-                "message": "¡Revista memorizada con éxito!",
-                "progress": 100,
-                "completed_pages": total_pages,
-                "total_pages": total_pages,
-                "last_successful_page": total_pages,
-                "updatedAt": firestore.SERVER_TIMESTAMP
-            })
-            print(f"[{title}] ¡Proceso completado al 100% exitosamente!")
+                status_collection.document(cat_hash).set({
+                    "status": "completed",
+                    "title": title,
+                    "message": "¡Revista memorizada con éxito!",
+                    "progress": 100,
+                    "completed_pages": total_pages,
+                    "total_pages": total_pages,
+                    "last_successful_page": total_pages,
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                })
+                print(f"[{title}] ¡Proceso completado al 100% exitosamente!")
+            else:
+                pct_f = int((final_completed / total_pages) * 100) if total_pages > 0 else 0
+                status_collection.document(cat_hash).set({
+                    "status": "paused",
+                    "title": title,
+                    "message": f"Lectura pausada en pág {final_completed}/{total_pages} ({pct_f}%). Puedes continuar cuando gustes.",
+                    "progress": pct_f,
+                    "completed_pages": final_completed,
+                    "total_pages": total_pages,
+                    "last_successful_page": final_completed,
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                }, merge=True)
+                print(f"[{title}] Proceso pausado en {final_completed}/{total_pages} páginas.")
             
     except Exception as e:
         print(f"Error procesando PDF: {e}")
