@@ -2304,10 +2304,14 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
          * Cada variante tiene su propio código de referencia ('Cód. 06471', 'Cód. 06475', 'Cód. 06473') y activos diferentes.
          * A cada uno le asignas su nombre comercial descriptivo completo, su código en la descripción y el precio exacto "$49.990".
 
-    5. CUÁNDO SÍ ES UN DUPLICADO (LO QUE DEBES EVITAR):
-       - Solo es un duplicado cuando para UN SOLO producto físico (ej: un solo vestido en la modelo), la página muestra un título genérico ("VESTIDO") y abajo un subtítulo descriptivo ("Vestido amplio en tejido plano...") con el mismo precio.
-       - En ese caso de un solo producto físico: NO crees dos productos ("Vestido" y "Vestido amplio"). Extrae SOLAMENTE UNO con el nombre completo descriptivo ("Vestido amplio") y coloca el resto en "descripcion_corta".
-       - JAMÁS crees productos clones o con nombres 100% idénticos.
+    5. UNIFICACIÓN OBLIGATORIA DE PRENDAS CON TALLAS Y EVITAR DUPLICADOS (REGLA DE ORO):
+       - En catálogos de moda (Carmel, Pacifika, Loguin, Leonisa), una prenda suele tener un titular corto (ej: "C. Camiseta $29.999" o "D. Falda Short $39.999") y abajo el texto descriptivo con tallas (ej: "C. Camiseta con aplique de perlas. Tallas: S, M, L, XL... Cód. 752177..."):
+         * ¡ES UNA SOLA PRENDA FÍSICA! NUNCA crees "Camiseta C" y otra "Camiseta C con aplique de perlas".
+         * NUNCA crees un producto separado por cada talla (S, M, L, XL).
+         * DEBES EXTRAER UN SOLO PRODUCTO con el nombre completo y limpio ("Camiseta con aplique de perlas"), "tipo_variante": "Talla", y en "variantes": [{{"nombre": "S", "codigo": "752177"}}, {{"nombre": "M", "codigo": "752178"}}, ...].
+       - En cosmética y perfumería: Si un labial o base tiene 6 tonos en la misma ficha con un solo precio, EXTRAE UN SOLO PRODUCTO con "tipo_variante": "Tono" y los 6 tonos en el array "variantes".
+       - JAMÁS crees productos clones, duplicados ni registros separados para títulos cortos vs descripciones largas.
+       - Si en la página solo hay una modelo o foto decorativa SIN precio ($) ni código de pedido, NO ES UN PRODUCTO A LA VENTA, ¡no lo extraigas!
 
     6. LIMPIEZA DE NOMBRES Y VIÑETAS:
        - Limpia viñetas como 'a.', 'b.', 'c.', '1.', '2.' al inicio del nombre.
@@ -3548,16 +3552,16 @@ REGLAS DE AUDITORÍA Y UNIFICACIÓN INTELIGENTE:
   * Si alguna de las prendas no está en la lista de productos registrados, DEBES AGREGARLA EN 'products_to_create'.
   * Si un producto existente tiene erróneamente un 'precio_promo' tomado de otra prenda vecina, LIMPIA 'precio_promo': null, 'es_promo': false, 'requisito_promo': null en 'products_to_update'.
 
-2. UNIFICACIÓN DE VARIANTES (TALLAS, TONOS, AROMAS O COLORES) DEL MISMO PRODUCTO:
-- Si un producto tiene varias opciones a elegir:
-  * En ropa o calzado: TALLAS (ej: Vestido en tallas XS #752180, S #752181, M #752182, L #752183, o calzado 35, 36, 37).
-  * En maquillaje: TONOS (ej: Base Illumina con tonos Moreno #06166, Medio #06160, Claro #06157).
-  * En perfumería: AROMAS (ej: Taste Berry Boom #04512, Sweet Vanilla #04513).
-  * En accesorios/moda: COLORES (ej: Negro, Blanco, Azul).
-  * Deben consolidarse obligatoriamente en UNA SOLA ficha principal.
-  * Define 'tipo_variante' ('Talla', 'Tono', 'Aroma' o 'Color').
-  * En 'variantes': [{{"nombre": "XS", "codigo": "752180"}}, {{"nombre": "S", "codigo": "752181"}}].
-  * Todos los demás registros en la base de datos que representaban tallas o tonos sueltos deben incluirse en 'products_to_delete'.
+2. UNIFICACIÓN OBLIGATORIA DE PRENDAS/ARTÍCULOS CON TALLAS, TONOS, COLORES O DUPLICADOS DE TÍTULO:
+- CASO REAL MUY COMÚN EN MODA (CARMEL, PACIFIKA, LOGUIN, LEONISA):
+  En la página aparece la letra de la prenda (ej: "C. Camiseta $29.999" o "D. Falda Short $39.999") y abajo el bloque de texto con tallas y códigos (ej: "C. Camiseta con aplique de perlas. Tallas: S 752177, M 752178, L 752179..."):
+  * ¡ES UNA SOLA PRENDA FÍSICA! NUNCA crees "Camiseta C" y otra "Camiseta C con aplique de perlas", ni crees un producto para cada talla.
+  * Si la base de datos tiene registrados ambos ("Camiseta C" y "Camiseta C con aplique de perlas"), o un registro por cada talla:
+    1. Mantén UN SOLO registro principal en 'products_to_update' con el nombre comercial más completo y descriptivo: ej. "Camiseta con aplique de perlas" (o "Falda Short con taches").
+    2. Agrupa TODAS sus tallas y códigos en 'variantes': [{{"nombre": "S", "codigo": "752177"}}, {{"nombre": "M", "codigo": "752178"}}, {{"nombre": "L", "codigo": "752179"}}].
+    3. Define 'tipo_variante': "Talla".
+    4. Agrega OBLIGATORIAMENTE el ID del registro redundante (ej: el ID de "Camiseta C") a 'products_to_delete'.
+- En cosmética y perfumería: Lo mismo para TONOS de maquillaje (ej: Base con 4 tonos -> 1 solo producto con 4 variantes) y AROMAS de colonias.
 
 3. FUSIÓN DE VENTA INDIVIDUAL + PROMOCIÓN CONDICIONAL EN UN SOLO PRODUCTO:
 - Caso crítico: Cuando un producto se vende de forma individual Y además tiene una oferta especial vinculada o condicional (ej: "Studio Look Desmaquillador Bifásico" venta individual a $32.990 y en oferta a $14.990 por la compra de producto de rostro pág. 47 a 59):
@@ -3584,8 +3588,12 @@ REGLAS DE AUDITORÍA Y UNIFICACIÓN INTELIGENTE:
 5. PRECIOS VINCULADOS DE PÁGINA OPUESTA (LIBRO ABIERTO):
 - Si un producto de la página izquierda no tiene precio impreso y su precio está en la página derecha del pliego (o viceversa), asígnale el precio correspondiente.
 
-6. DEPURACIÓN DE FANTASMAS Y DUPLICADOS:
-- Agrega a 'products_to_delete' cualquier producto que carezca de precio y código, o que sea un duplicado redundante.
+6. DEPURACIÓN DE FANTASMAS Y FOTOS DE MODELOS SIN PRODUCTO COMERCIAL:
+- CONDICIÓN INDISPENSABLE: Los productos a la venta se crean ÚNICAMENTE cuando tienen precio visible ($XX.XXX) o código explícito de pedido en el catálogo.
+- Si en la página o pliego solo hay una modelo posando, una foto editorial estética, o una imagen decorativa sin ficha técnica de compra (sin precio ni código de referencia para pedir):
+  * ¡NO ES UN PRODUCTO A LA VENTA!
+  * Si la base de datos contiene algún producto fantasma creado erróneamente sin precio ni código, o basado únicamente en una foto decorativa, DEBES AGREGAR SU ID A 'products_to_delete'.
+- Igualmente, elimina de 'products_to_delete' cualquier duplicado redundante o clon de un mismo artículo.
 
 7. CUMPLIMIENTO ESTRICTO DE LA INSTRUCCIÓN:
 - Si el administrador solicitó algo específico (ej: "elimina tal producto", "agrega tal tono", "cambia el precio a $X"), ejecútalo con la máxima prioridad.
