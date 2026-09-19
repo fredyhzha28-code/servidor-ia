@@ -284,6 +284,63 @@ def supabase_delete(table, query=""):
 
 memory_knowledge_cache = {}  # Cache en memoria RAM: cat_hash -> list(products)
 
+# Sincronizador en memoria y persistente de categorías con Supabase
+_categories_cache_lock = threading.Lock()
+_known_category_nodes = set()
+_categories_cache_initialized = False
+
+def init_categories_cache():
+    global _categories_cache_initialized, _known_category_nodes
+    if _categories_cache_initialized:
+        return
+    with _categories_cache_lock:
+        if _categories_cache_initialized:
+            return
+        try:
+            cats = supabase_get("categories") or []
+            for c in cats:
+                t = c.get('type') or 'section'
+                parent = (c.get('parent') or '').strip().lower()
+                name = (c.get('name') or '').strip().lower()
+                _known_category_nodes.add((t, parent, name))
+            _categories_cache_initialized = True
+        except Exception as e:
+            print(f"[Supabase Categories Cache Error]: {e}")
+
+def sync_categories_to_supabase(products_list):
+    """
+    Auto-detecta categorías, secciones y subcategorías producidas por la IA
+    y las registra de forma transparente y permanente en la tabla 'categories' de Supabase.
+    """
+    if not products_list or not SUPABASE_URL:
+        return
+    init_categories_cache()
+    new_nodes = []
+    with _categories_cache_lock:
+        for p in products_list:
+            if not isinstance(p, dict):
+                continue
+            cat = (p.get('categoria') or 'Dama').strip()
+            sec = (p.get('seccion') or 'General').strip()
+            sub = (p.get('subcategoria') or 'General').strip()
+
+            sec_key = ('section', cat.lower(), sec.lower())
+            if sec_key not in _known_category_nodes and sec:
+                _known_category_nodes.add(sec_key)
+                new_nodes.append({'name': sec, 'parent': cat, 'type': 'section'})
+
+            sub_key = ('sub', sec.lower(), sub.lower())
+            if sub_key not in _known_category_nodes and sub:
+                _known_category_nodes.add(sub_key)
+                new_nodes.append({'name': sub, 'parent': sec, 'type': 'sub'})
+
+    if new_nodes:
+        try:
+            print(f"[Supabase Categories] Registrando automáticamente {len(new_nodes)} nueva(s) categoría(s) creada(s) por la IA...")
+            supabase_post("categories", new_nodes)
+        except Exception as e:
+            print(f"[Supabase Categories Aviso]: {e}")
+
 # =====================================================================
 # GEMINI KEY MANAGER (TIER 1: MULTICUENTA + TIER 2: RESPALDO)
 # =====================================================================
@@ -2122,6 +2179,7 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
         })
     if supa_products:
         supabase_post("products", supa_products)
+        sync_categories_to_supabase(unique_products)
 
     key_manager.register_worker_finish(thread_id, page_num, used_key, len(unique_products))
     
@@ -2973,6 +3031,7 @@ def extract_missing_product():
             "requisito_promo": prod_data.get('requisito_promo') or '',
             "coords": prod_data.get('coords') if isinstance(prod_data.get('coords'), dict) else {}
         }])
+        sync_categories_to_supabase([prod_data])
             
         return jsonify({"success": True, "product": prod_data})
         
@@ -3271,6 +3330,7 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
 
         if new_products_batch:
             supabase_post("products", new_products_batch)
+            sync_categories_to_supabase(new_products_batch)
 
         return jsonify({
             "success": True,
