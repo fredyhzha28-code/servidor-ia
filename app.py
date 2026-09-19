@@ -1698,16 +1698,17 @@ def clean_product_taxonomy(p):
         p['subcategoria'] = subcat
         return p
 
-    # 7. CALZADO (ZAPATOS)
-    is_shoes = bool(re.search(r'\b(zapato|zapatos|calzado|sandalia|sandalias|tacon|tacón|tacones|plataforma|plataformas|tenis|sneakers|deportivos|bota|botas|botin|botín|botines|mocasines|pantuflas|baletas|flats)\b', name_lower, re.I))
+    # 7. CALZADO (ZAPATOS) DENTRO DE ROPA
+    is_pant_bootcut = bool(re.search(r'\b(bota amplia|bota campana|bota recta|bota tubo|bota ajustada|pantal[oó]n bota)\b', name_lower, re.I))
+    is_shoes = not is_pant_bootcut and bool(re.search(r'\b(zapato|zapatos|calzado|sandalia|sandalias|tacon|tacón|tacones|plataforma|plataformas|tenis|sneakers|deportivos|bota|botas|botin|botín|botines|mocasines|pantuflas|baletas|flats)\b', name_lower, re.I))
     if is_shoes:
-        subcat = 'Calzado casual'
+        subcat = 'Calzado y zapatos'
         if re.search(r'sandalia', name_lower, re.I): subcat = 'Sandalias'
         elif re.search(r'tacon|tacón|tacones|plataforma', name_lower, re.I): subcat = 'Tacones'
         elif re.search(r'tenis|sneakers|deportiv', name_lower, re.I): subcat = 'Tenis y deportivos'
         elif re.search(r'bota|botin|botín|botines', name_lower, re.I): subcat = 'Botas y botines'
         p['categoria'] = cat
-        p['seccion'] = 'Zapatos'
+        p['seccion'] = 'Ropa'
         p['subcategoria'] = subcat
         return p
 
@@ -1758,6 +1759,48 @@ def clean_product_taxonomy(p):
     p['seccion'] = 'Cuidado personal'
     p['subcategoria'] = 'Cuidado corporal'
     return p
+
+def is_valid_product(p):
+    """
+    Filtro estricto de productos reales para evitar fantasmas, portadas y páginas editoriales/informativas:
+    1. Debe tener un precio numérico real visible (ej: $55.999, $29.990, etc., diferente de 'Confirmar con Erika', $0 o vacío).
+    2. O si su precio es 'Confirmar con Erika' o no tiene precio directo, DEBE tener un código numérico legítimo
+       (código de 4 a 8 dígitos numéricos, o cód./cod./ref. con número en 'codigo', 'descripcion_corta' o en variantes).
+    Si NO tiene precio numérico Y NO tiene código real:
+    ¡Es publicidad, introducción editorial, resumen de catálogo o marca (fantasma)! NO DEBE CREARSE.
+    """
+    if not isinstance(p, dict):
+        return False
+    nombre = str(p.get('nombre') or '').strip()
+    if not nombre or len(nombre) < 3:
+        return False
+
+    precio = str(p.get('precio') or '').strip()
+    precio_promo = str(p.get('precio_promo') or '').strip()
+    has_numeric_price = any(
+        re.search(r'\d', pr) and 'confirmar' not in pr.lower() and pr not in ('$0', '0')
+        for pr in [precio, precio_promo]
+    )
+    if has_numeric_price:
+        return True
+
+    codigo = str(p.get('codigo') or '').strip()
+    has_code_field = bool(re.search(r'\b\d{4,8}\b', codigo) or re.search(r'c[oó]d|ref', codigo, re.I))
+
+    variantes = p.get('variantes') or []
+    has_variant_code = any(
+        isinstance(v, dict) and bool(re.search(r'\b\d{4,8}\b', str(v.get('codigo') or '')))
+        for v in variantes
+    )
+
+    desc = str(p.get('descripcion_corta') or '')
+    full_text = f"{nombre} {desc}"
+    has_explicit_code = bool(re.search(r'\b(c[oó]d\.?|cod\.?|ref\.?)\s*:?\s*\d{4,8}\b', full_text, re.I)) or bool(re.search(r'\b\d{5,6}\b', full_text))
+
+    if has_code_field or has_variant_code or has_explicit_code:
+        return True
+
+    return False
 
 def extract_products_from_page(page_text, image_path, title, page_num, is_audit=False, facing_text="", facing_img_path=None, facing_page_num=None):
     spread_instruction = ""
@@ -1878,13 +1921,16 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     {promo_gold_rule}
     Tu objetivo es extraer con precisión ÚNICAMENTE los productos reales a la venta, distinguiendo variantes, detectando promociones y calculando precios unitarios:
 
-    0. REGLA DE ORO: EXCLUSIÓN DE PORTADAS Y FOTOS EDITORIALES/PUBLICITARIAS SIN PRODUCTO A LA VENTA:
-       - ¡ATENCIÓN MÁXIMA!: Si esta página es la PORTADA de la revista (ej: logo de Cyzone o L'Bel grande), o es una FOTO PUBLICITARIA EDITORIAL (ej: modelo mirando a la cámara o sosteniendo un frasco con un eslogan de portada como "TU ESTILO ES TODO", "HAZLO TUYO", "SEDUCE CON NOTAS...") Y NO TIENE CÓDIGO NUMÉRICO DE 5 DÍGITOS (Cód. XXXXX) NI PRECIO EN PESOS ($XX.XXX):
-         ¡NO ES UN PRODUCTO A LA VENTA EN ESTA PÁGINA!
-         DEBES RETORNAR UNA LISTA VACÍA: []
-       - CONDICIÓN ESTRICTA PARA CONSIDERAR QUE HAY UN PRODUCTO:
-         El producto DEBE TENER UN CÓDIGO EXPLÍCITO (ej: "Cód. 35356", "Cod. 09327", o 5 dígitos numéricos impresos al lado del artículo) O UN PRECIO VISIBLE ($XX.XXX).
-         Si un frasco, accesorio o ropa en la foto NO tiene código de 5 dígitos NI precio: ¡ES SOLO PUBLICIDAD O DECORACIÓN! NO LO EXTRAIGAS. Devuelve [].
+    0. REGLA SUPREMA: EXCLUSIÓN TOTAL DE PÁGINAS INFORMATIVAS, EDITORIALES, RESÚMENES DE MARCAS Y PORTADAS:
+       - ¡ATENCIÓN MÁXIMA!: Si esta página es la PORTADA, o es una PÁGINA INFORMATIVA O DE PUBLICIDAD DE MARCAS (ejemplos reales: "TUS 3 CATÁLOGOS FAVORITOS EN 1 SOLO PEDIDO", "CARMEL + PACIFIKA + LOGUIN", "ZOI BEAUTY", "ESTILO LIBRE Y CÓMODO", eslóganes publicitarios, bienvenida o índices):
+         ¡NINGUNO DE ESOS ENCABEZADOS ES UN PRODUCTO A LA VENTA!
+         ESTÁ TOTALMENTE PROHIBIDO CREAR PRODUCTOS COMO "Zoi Beauty Productos Favoritos", "Ropa Interior y Deportiva Pacifika" o "Ropa Infantil Loguin Talla 2 a 14".
+       - CONDICIÓN ESTRICTA E INDISPENSABLE PARA SER UN PRODUCTO REAL A LA VENTA:
+         1. Debe tener un precio explícito visible en pesos colombianos ($XX.XXX).
+         2. O si es un artículo sin precio, DEBE TENER UN CÓDIGO NUMÉRICO EXPLÍCITO DE REFERENCIA (ej: "Cód. 636102", "Cód. 09327", "Cod. 12291", o 5-6 dígitos junto a la prenda/artículo).
+       - Si en la página NO hay precios en pesos ($) NI códigos numéricos de referencia para comprar:
+         ¡NO HAY NINGÚN PRODUCTO A LA VENTA EN ESTA PÁGINA!
+         DEBES RETORNAR OBLIGATORIAMENTE UNA LISTA VACÍA: []
 
     1. CÁLCULO DE PRECIO POR MILILITRO O GRAMO (MUY IMPORTANTE):
        - En catálogos de perfumería y cosmética (L'Bel, Esika, Cyzone, etc.), a veces el precio total no está en letras gigantes, pero la ficha del producto indica el contenido y el precio por mililitro o gramo.
@@ -2152,6 +2198,7 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
     unique_products = consolidate_page_promos(unique_products)
     unique_products = enhance_and_enforce_page_promos(unique_products, page_text=page_text, facing_text=facing_text, page_num=page_num, title=title)
     unique_products = [clean_product_taxonomy(p) for p in unique_products]
+    unique_products = [p for p in unique_products if is_valid_product(p)]
     del page_text
     print(f"[{title} | Pág {page_num}/{total_pages}] {used_key}: {len(products)} -> Consolidados y unificados: {len(unique_products)}")
     
@@ -3312,6 +3359,8 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
         # 3. Crear
         new_products_batch = []
         for cr in products_to_create:
+            if not is_valid_product(cr):
+                continue
             if cr.get('nombre'):
                 _, c_name = clean_product_name(cr.get('nombre'))
                 cr['nombre'] = c_name if c_name else cr.get('nombre')
