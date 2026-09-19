@@ -1429,17 +1429,29 @@ def consolidate_page_variants(products):
 
 def consolidate_page_promos(products):
     """
-    Unifica productos donde uno es la venta individual normal y otro es la oferta promocional condicional
-    del mismo artículo físico (ejemplo: 'Parlante Beat Box (Venta Individual) $120.000' y
-    '[PROMO] Parlante Beat Box (Por compra de Perfume Icon) $49.990').
-    En lugar de dejar 2 productos, crea UN SOLO producto con:
-      precio = precio individual normal ($120.000)
-      precio_promo = precio promocional ($49.990)
-      es_promo = True
-      requisito_promo = texto del requisito
+    Consolida ÚNICAMENTE cuando se trata del MISMO producto físico exacto
+    donde uno fue extraído como venta individual y el otro explícitamente como [PROMO] condicional.
+    ¡JAMÁS debe fusionar dos prendas o artículos distintos (ej: Chaqueta y Short, Camisa y Pantalón, Blusa y Falda)!
     """
     if not products or len(products) < 2:
         return products
+
+    # Palabras genéricas de corte, material o color que NO deben contar como identidad de producto
+    GENERIC_STOPWORDS = {
+        'efecto', 'cuero', 'tejido', 'plano', 'punto', 'poliester', 'poliéster', 'algodon', 'algodón',
+        'spandex', 'licra', 'rib', 'tacto', 'suave', 'estampado', 'estampada', 'textura', 'tiro',
+        'alto', 'medio', 'bajo', 'amplio', 'amplia', 'ajustado', 'ajustada', 'semiajustado', 'semiajustada',
+        'negro', 'negra', 'blanco', 'blanca', 'rojo', 'roja', 'azul', 'verde', 'nuevo', 'nueva',
+        'color', 'moda', 'mujer', 'hombre', 'dama', 'caballero', 'prenda', 'tono', 'tonos'
+    }
+
+    # Tipos de prendas/artículos incompatibles: Si uno es X y el otro es Y, NUNCA pueden ser el mismo producto
+    GARMENT_TYPES = [
+        'chaqueta', 'short', 'pantalon', 'pantalón', 'camisa', 'camiseta', 'blusa', 'vestido',
+        'falda', 'enterizo', 'buzo', 'saco', 'chaleco', 'pijama', 'brasier', 'panty', 'boxer',
+        'zapato', 'sandalia', 'tenis', 'bota', 'bolso', 'cartera', 'reloj', 'perfume', 'colonia',
+        'desodorante', 'labial', 'sombras', 'base', 'polvo', 'corrector', 'shampoo', 'crema'
+    ]
 
     used_indices = set()
     consolidated = []
@@ -1450,7 +1462,9 @@ def consolidate_page_promos(products):
         
         name1 = str(p1.get('nombre') or '').lower()
         clean_name1 = re.sub(r'\[promo\]|\(venta individual\)|\(por compra[^)]*\)|promo!?', '', name1, flags=re.IGNORECASE).strip()
-        clean_words1 = set(w for w in re.findall(r'\b\w{4,}\b', clean_name1))
+        words1 = set(w for w in re.findall(r'\b\w{4,}\b', clean_name1) if w not in GENERIC_STOPWORDS)
+
+        p1_is_promo = bool(p1.get('es_promo')) or ('[promo]' in name1) or bool(p1.get('requisito_promo'))
 
         matched_j = None
         for j, p2 in enumerate(products):
@@ -1458,16 +1472,34 @@ def consolidate_page_promos(products):
                 continue
             name2 = str(p2.get('nombre') or '').lower()
             clean_name2 = re.sub(r'\[promo\]|\(venta individual\)|\(por compra[^)]*\)|promo!?', '', name2, flags=re.IGNORECASE).strip()
-            clean_words2 = set(w for w in re.findall(r'\b\w{4,}\b', clean_name2))
+            words2 = set(w for w in re.findall(r'\b\w{4,}\b', clean_name2) if w not in GENERIC_STOPWORDS)
 
-            common = clean_words1.intersection(clean_words2)
-            if len(common) >= 2 or (len(common) >= 1 and ('parlante' in common or 'reloj' in common or 'audifono' in common or 'mochila' in common or 'maletin' in common or 'bolso' in common)):
-                p1_is_promo = p1.get('es_promo') or '[promo]' in name1 or bool(p1.get('requisito_promo'))
-                p2_is_promo = p2.get('es_promo') or '[promo]' in name2 or bool(p2.get('requisito_promo'))
-                
-                if p1_is_promo != p2_is_promo or (p1.get('precio') != p2.get('precio')):
-                    matched_j = j
+            p2_is_promo = bool(p2.get('es_promo')) or ('[promo]' in name2) or bool(p2.get('requisito_promo'))
+
+            # CONDICIÓN 1 OBLIGATORIA: Al menos uno de los dos DEBE ser explícitamente una promoción
+            # Si ninguno de los dos es promo, son dos productos independientes que se venden a precio normal
+            if not (p1_is_promo or p2_is_promo):
+                continue
+
+            # CONDICIÓN 2 OBLIGATORIA: No pueden ser prendas/artículos distintos
+            # (ej: Chaqueta vs Short, Camisa vs Pantalón, Blusa vs Falda)
+            diff_garments = False
+            for g1 in GARMENT_TYPES:
+                if g1 in clean_name1:
+                    for g2 in GARMENT_TYPES:
+                        if g1 != g2 and g2 in clean_name2:
+                            diff_garments = True
+                            break
+                if diff_garments:
                     break
+            if diff_garments:
+                continue
+
+            # CONDICIÓN 3 OBLIGATORIA: Deben compartir el nombre sustantivo del producto
+            common = words1.intersection(words2)
+            if len(common) >= 2 or (len(common) >= 1 and ('parlante' in common or 'reloj' in common or 'audifono' in common or 'mochila' in common or 'maletin' in common or 'bolso' in common or 'desmaquillador' in common or 'serum' in common or 'sérum' in common)):
+                matched_j = j
+                break
 
         if matched_j is not None:
             p2 = products[matched_j]
@@ -1492,7 +1524,7 @@ def consolidate_page_promos(products):
             unified_name = re.sub(r'\s{2,}', ' ', unified_name).strip()
 
             promo_price = promo_p.get('precio_promo') or promo_p.get('precio')
-            req = promo_p.get('requisito_promo') or regular_p.get('requisito_promo') or "Por la compra del producto requerido en promoción"
+            req = promo_p.get('requisito_promo') or regular_p.get('requisito_promo') or ""
 
             regular_p['nombre'] = unified_name
             regular_p['precio_promo'] = promo_price
@@ -1505,7 +1537,7 @@ def consolidate_page_promos(products):
             regular_p['descripcion_corta'] = curr_desc
 
             consolidated.append(regular_p)
-            print(f"[PromoUnifier] Unificado '{unified_name}': Normal={regular_p.get('precio')} | Promo={promo_price} ({req})")
+            print(f"[PromoUnifier] Unificado correctamente '{unified_name}': Regular={regular_p.get('precio')} | Promo={promo_price}")
         else:
             consolidated.append(p1)
             used_indices.add(i)
@@ -1931,6 +1963,20 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
        - Si en la página NO hay precios en pesos ($) NI códigos numéricos de referencia para comprar:
          ¡NO HAY NINGÚN PRODUCTO A LA VENTA EN ESTA PÁGINA!
          DEBES RETORNAR OBLIGATORIAMENTE UNA LISTA VACÍA: []
+
+    0.1 REGLA SUPREMA DE MÚLTIPLES PRENDAS / OUTFITS EN LA MISMA PÁGINA (LOOKS Y CONJUNTOS):
+       - ¡ATENCIÓN MÁXIMA EN CATÁLOGOS DE MODA (CARMEL, PACIFIKA, LOGUIN, LEONISA)!:
+         Cuando una modelo luce varias prendas combinadas (ejemplo: Chaqueta y Short, o Camisa y Pantalón, o Blusa y Falda):
+         La página lista por separado cada prenda con su propia letra (A, B, C, D...), código y precio individual, por ejemplo:
+         "NUEVO $69.999 C - CHAQUETA ... Cód. 752182..."
+         "$59.999 D - SHORT ... Cód. 400614..."
+       - ¡ESTÁ TOTALMENTE PROHIBIDO FUSIONAR O UNIFICAR ESAS DOS PRENDAS DISTINTAS EN UN SOLO PRODUCTO!
+       - ¡ESTÁ ESTRICTAMENTE PROHIBIDO PONER EL PRECIO DE UNA PRENDA COMO 'PRECIO PROMO' DE LA OTRA!
+       - ¡NO ES UNA PROMOCIÓN! Son dos prendas 100% diferentes que se venden por separado a precio normal.
+       - DEBES EXTRAER OBLIGATORIAMENTE CADA PRENDA COMO UN PRODUCTO INDEPENDIENTE:
+         * Producto 1: "Chaqueta Amplia Efecto Cuero", precio: "$69.999", es_promo: false
+         * Producto 2: "Short Tiro Alto Efecto Cuero", precio: "$59.999", es_promo: false
+       - SÓLO marca un producto como promoción ("es_promo": true) cuando la página contenga TEXTO EXPLÍCITO DE OFERTA impreso en el catálogo (ej: "2x1", "Paga 1 lleva 2", "Lleva 2 por...", "Por compra de X lleva este a $Y", o "Set x2").
 
     1. CÁLCULO DE PRECIO POR MILILITRO O GRAMO (MUY IMPORTANTE):
        - En catálogos de perfumería y cosmética (L'Bel, Esika, Cyzone, etc.), a veces el precio total no está en letras gigantes, pero la ficha del producto indica el contenido y el precio por mililitro o gramo.
@@ -3231,8 +3277,13 @@ PRODUCTOS REGISTRADOS ACTUALMENTE EN LA BASE DE DATOS PARA ESTE PLIEGO ({len(sim
 
 REGLAS DE AUDITORÍA Y UNIFICACIÓN INTELIGENTE:
 
-1. DISTINCIÓN DE PRODUCTOS (NO MEZCLAR PRODUCTOS DISTINTOS):
-- Si en la página o pliego conviven productos de diferente tipo o línea (ej: Base Multifuncional Illumina vs Desmaquillador Bifásico Studio Look, o Labial vs Delineador), NO los fusiones. Cada producto diferente DEBE mantener su propia identidad.
+1. DISTINCIÓN ABSOLUTA DE PRENDAS Y PRODUCTOS DISTINTOS (JAMÁS MEZCLAR NI CREAR PROMOS FALSAS):
+- Si en la página o pliego conviven prendas o productos diferentes (ej: Chaqueta y Short, Blusa y Pantalón, Vestido y Blazer, o dos artículos con letras distintas como "C - CHAQUETA $69.999" y "D - SHORT $59.999"):
+  * ¡ESTÁ ESTRICTAMENTE PROHIBIDO FUSIONARLOS EN UN SOLO PRODUCTO!
+  * ¡ESTÁ ESTRICTAMENTE PROHIBIDO PONER EL PRECIO DE UNO COMO 'PRECIO PROMO' DEL OTRO!
+  * Son dos productos 100% independientes a precio normal. NO es una promoción.
+  * Si alguna de las prendas no está en la lista de productos registrados, DEBES AGREGARLA EN 'products_to_create'.
+  * Si un producto existente tiene erróneamente un 'precio_promo' tomado de otra prenda vecina, LIMPIA 'precio_promo': null, 'es_promo': false, 'requisito_promo': null en 'products_to_update'.
 
 2. UNIFICACIÓN DE TONOS / VARIANTES DEL MISMO PRODUCTO:
 - Si un producto tiene varios tonos, colores o aromas a lo largo del pliego (ej: Base Illumina con tonos Moreno #06166, Medio #06160, Medio Claro #06158, Claro #06157):
