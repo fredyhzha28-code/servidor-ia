@@ -245,6 +245,37 @@ def supabase_post(table, data):
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=12) as resp:
             return resp.status in (200, 201)
+    except urllib.error.HTTPError as e:
+        err_content = ""
+        try:
+            err_content = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        # Fallback si las columnas tipo_variante o variantes aún no se han creado en Supabase
+        if table == "products" and ("PGRST204" in err_content or "tipo_variante" in err_content or "variantes" in err_content):
+            try:
+                items = data if isinstance(data, list) else [data]
+                clean_data = []
+                for it in items:
+                    c_it = dict(it)
+                    coords = c_it.get("coords") if isinstance(c_it.get("coords"), dict) else {}
+                    if "variantes" in c_it and "variantes" not in coords:
+                        coords["variantes"] = c_it["variantes"]
+                    if "tipo_variante" in c_it and "tipo_variante" not in coords:
+                        coords["tipo_variante"] = c_it["tipo_variante"]
+                    c_it["coords"] = coords
+                    c_it.pop("tipo_variante", None)
+                    c_it.pop("variantes", None)
+                    clean_data.append(c_it)
+                fallback_payload = clean_data if isinstance(data, list) else clean_data[0]
+                fb_body = json.dumps(fallback_payload).encode("utf-8")
+                fb_req = urllib.request.Request(url, data=fb_body, headers=headers, method="POST")
+                with urllib.request.urlopen(fb_req, timeout=12) as resp2:
+                    return resp2.status in (200, 201)
+            except Exception as e_fb:
+                print(f"[Supabase Products Fallback]: {e_fb}")
+        print(f"[Supabase] Aviso guardando en '{table}': {e} - {err_content}")
+        return False
     except Exception as e:
         print(f"[Supabase] Aviso guardando en '{table}': {e}")
         return False
@@ -756,7 +787,11 @@ def local_search_in_json(query, products_data):
             
         results = []
         for p in products:
-            text_to_search = normalize_text(f"{p.get('nombre', '')} {p.get('catalogo', '')} {p.get('seccion', '')} {p.get('subcategoria', '')} {p.get('descripcion_corta', '')}")
+            vars_list = p.get('variantes') or []
+            if isinstance(p.get('coords'), dict) and not vars_list:
+                vars_list = p['coords'].get('variantes') or []
+            var_terms = " ".join([f"{v.get('nombre', '')} {v.get('codigo', '')}" for v in vars_list if isinstance(v, dict)])
+            text_to_search = normalize_text(f"{p.get('nombre', '')} {p.get('catalogo', '')} {p.get('seccion', '')} {p.get('subcategoria', '')} {p.get('descripcion_corta', '')} {p.get('tipo_variante', '')} {var_terms}")
             score = sum(1 for w in query_words if w in text_to_search)
             if score > 0:
                 results.append((score, p))
@@ -1157,7 +1192,19 @@ def deduplicate_and_merge_page_products(products):
                         
                 if not best_product.get('precio') and item_b['precio']:
                     best_product['precio'] = item_b['precio']
-                    
+
+                # Preservar o fusionar variantes
+                vars_a = best_product.get('variantes') if isinstance(best_product.get('variantes'), list) else []
+                vars_b = item_b['raw'].get('variantes') if isinstance(item_b['raw'].get('variantes'), list) else []
+                if vars_b:
+                    existing_vnames = {str(v.get('nombre', '')).strip().lower() for v in vars_a}
+                    for vb in vars_b:
+                        if str(vb.get('nombre', '')).strip().lower() not in existing_vnames:
+                            vars_a.append(vb)
+                    best_product['variantes'] = vars_a
+                if not best_product.get('tipo_variante') and item_b['raw'].get('tipo_variante'):
+                    best_product['tipo_variante'] = item_b['raw'].get('tipo_variante')
+
                 print(f"[Deduplicador] Fusionado duplicado en página: '{item_a['raw_name']}' y '{item_b['raw_name']}' -> '{best_product['nombre']}' (${best_product.get('precio')})")
                 
         merged_products.append(best_product)
@@ -1308,11 +1355,116 @@ def enhance_and_enforce_page_promos(products, page_text="", facing_text="", page
 
     return labeled_products
 
+def extract_variants_from_text(p):
+    """
+    Si el producto no tiene un array de variantes explícito pero en su descripción o título
+    aparecen tallas, tonos, aromas o colores detallados, los extrae automáticamente.
+    """
+    if not isinstance(p, dict):
+        return p
+    if p.get('variantes') and len(p['variantes']) > 0:
+        return p
+
+    raw_desc = f"{p.get('nombre', '')} {p.get('descripcion_corta', '')}"
+    default_code = str(p.get('codigo') or '')
+
+    # 1. TALLAS (Ropa, calzado, moda)
+    m_tallas_block = re.search(r'(?:tallas?|sizes?)(?:\s+[a-zA-Záéíóúüñ]+)?\s*:\s*([^;\n]+?)(?=\.\s+[A-Z]|\n|$)', raw_desc, re.IGNORECASE)
+    if m_tallas_block:
+        block_text = m_tallas_block.group(1).strip()
+        variants = []
+        token_matches = re.findall(r'([A-Za-z0-9\s]{1,15}?)\s*(?:[\(\[\{]\s*(?:c[oó]d\.?\s*)?(\d{4,8})\s*[\)\]\}]|\s*c[oó]d\.?\s*(\d{4,8}))(?=[,;\.\n\s]|$)', block_text, re.IGNORECASE)
+        if token_matches and len(token_matches) >= 2:
+            for sz_name, c1, c2 in token_matches:
+                clean_sz = re.sub(r'[^a-zA-Z0-9]', '', sz_name).strip()
+                c = c1 or c2 or default_code
+                if clean_sz:
+                    variants.append({"nombre": clean_sz.upper() if len(clean_sz) <= 3 else clean_sz, "codigo": c})
+        else:
+            parts = re.split(r'[,\|\/\–\—]+', block_text)
+            if len(parts) == 1 and '-' in block_text and not re.search(r'\d{4,8}', block_text):
+                parts = block_text.split('-')
+            for part in parts:
+                part = part.strip()
+                if not part: continue
+                c_m = re.search(r'(?:c[oó]d\.?\s*)?(\d{4,8})', part, re.IGNORECASE)
+                cod = c_m.group(1) if c_m else default_code
+                clean_name = re.sub(r'[\(\[\{]?(?:c[oó]d\.?\s*)?\d{4,8}[\)\]\}]?', '', part, flags=re.IGNORECASE).strip()
+                clean_name = re.sub(r'[^a-zA-Z0-9áéíóúüñ\s]', '', clean_name).strip()
+                if clean_name and len(clean_name) <= 12:
+                    variants.append({"nombre": clean_name.upper() if len(clean_name) <= 3 else clean_name, "codigo": cod})
+        if len(variants) >= 2:
+            p['tipo_variante'] = 'Talla'
+            p['variantes'] = variants
+            return p
+
+    # 2. TONOS (Maquillaje y cosmética)
+    m_tonos_block = re.search(r'(?:tonos?|shades?)(?:\s+[a-zA-Záéíóúüñ]+)?\s*:\s*([^;\n]+?)(?=\.\s+[A-Z]|\n|$)', raw_desc, re.IGNORECASE)
+    if m_tonos_block:
+        block_text = m_tonos_block.group(1).strip()
+        variants = []
+        token_matches = re.findall(r'([A-Za-z0-9áéíóúüñ\s]{2,25}?)\s*(?:[\(\[\{]\s*(?:c[oó]d\.?\s*)?(\d{4,8})\s*[\)\]\}]|\s*c[oó]d\.?\s*(\d{4,8}))(?=[,;\.\n\s]|$)', block_text, re.IGNORECASE)
+        if token_matches and len(token_matches) >= 2:
+            for t_name, c1, c2 in token_matches:
+                t_clean = t_name.strip()
+                c = c1 or c2 or default_code
+                if t_clean:
+                    variants.append({"nombre": t_clean, "codigo": c})
+        else:
+            parts = re.split(r'[,\|\/\–\—]+', block_text)
+            for part in parts:
+                part = part.strip()
+                if not part: continue
+                c_m = re.search(r'(?:c[oó]d\.?\s*)?(\d{4,8})', part, re.IGNORECASE)
+                cod = c_m.group(1) if c_m else default_code
+                clean_name = re.sub(r'[\(\[\{]?(?:c[oó]d\.?\s*)?\d{4,8}[\)\]\}]?', '', part, flags=re.IGNORECASE).strip()
+                clean_name = re.sub(r'[^a-zA-Z0-9áéíóúüñ\s]', ' ', clean_name).strip()
+                clean_name = " ".join(clean_name.split())
+                if clean_name:
+                    variants.append({"nombre": clean_name, "codigo": cod})
+        if len(variants) >= 2:
+            p['tipo_variante'] = 'Tono'
+            p['variantes'] = variants
+            return p
+
+    # 3. AROMAS (Colonias, fragancias, splashes)
+    m_aromas_block = re.search(r'(?:aromas?|fragancias?)(?:\s+[a-zA-Záéíóúüñ]+)?\s*:\s*([^;\n]+?)(?=\.\s+[A-Z]|\n|$)', raw_desc, re.IGNORECASE)
+    if m_aromas_block:
+        block_text = m_aromas_block.group(1).strip()
+        variants = []
+        token_matches = re.findall(r'([A-Za-z0-9áéíóúüñ\s]{2,25}?)\s*(?:[\(\[\{]\s*(?:c[oó]d\.?\s*)?(\d{4,8})\s*[\)\]\}]|\s*c[oó]d\.?\s*(\d{4,8}))(?=[,;\.\n\s]|$)', block_text, re.IGNORECASE)
+        if token_matches and len(token_matches) >= 2:
+            for a_name, c1, c2 in token_matches:
+                a_clean = a_name.strip()
+                c = c1 or c2 or default_code
+                if a_clean:
+                    variants.append({"nombre": a_clean, "codigo": c})
+        else:
+            parts = re.split(r'[,\|\/\–\—]+', block_text)
+            for part in parts:
+                part = part.strip()
+                if not part: continue
+                c_m = re.search(r'(?:c[oó]d\.?\s*)?(\d{4,8})', part, re.IGNORECASE)
+                cod = c_m.group(1) if c_m else default_code
+                clean_name = re.sub(r'[\(\[\{]?(?:c[oó]d\.?\s*)?\d{4,8}[\)\]\}]?', '', part, flags=re.IGNORECASE).strip()
+                clean_name = re.sub(r'[^a-zA-Z0-9áéíóúüñ\s]', ' ', clean_name).strip()
+                clean_name = " ".join(clean_name.split())
+                if clean_name:
+                    variants.append({"nombre": clean_name, "codigo": cod})
+        if len(variants) >= 2:
+            p['tipo_variante'] = 'Aroma'
+            p['variantes'] = variants
+            return p
+            return p
+
+    return p
+
 def consolidate_page_variants(products):
     """
     Consolida productos de una misma página que representan el MISMO artículo
-    pero en diferentes tonos, colores, aromas o acabados al mismo precio unitario.
+    pero en diferentes tallas, tonos, colores, aromas o acabados al mismo precio unitario.
     Ejemplos:
+    - 4 tallas de "Vestido Corto Silueta Amplia" (XS, S, M, L) a $69.999 -> 1 producto con variantes
     - 4 tonos de "Studio Look Corrector Facial" a $17.990 -> 1 producto con variantes
     - 6 tonos de "Studio Look Eyes To Go" a $30.990 -> 1 producto con variantes
     - 3 tonos de "Studio Look Rubor Mousse" a $24.600 -> 1 producto con variantes
@@ -1345,19 +1497,22 @@ def consolidate_page_variants(products):
             non_grouped.append(p)
             continue
 
-        # Extraer código numérico de 5 dígitos de la descripción o nombre
-        code_match = re.search(r'(?:c[oó]d\.?\s*|c[oó]digo\s*:?\s*)?(\d{5})', f"{raw_name} {p.get('descripcion_corta', '')}", re.IGNORECASE)
+        # Extraer código numérico de 4 a 8 dígitos de la descripción o nombre
+        code_match = re.search(r'(?:c[oó]d\.?\s*|c[oó]digo\s*:?\s*)?(\b\d{4,8}\b)', f"{raw_name} {p.get('descripcion_corta', '')}", re.IGNORECASE)
         cod = code_match.group(1) if code_match else ""
 
         # Limpiar nombre de prefijos promocionales o números
         clean_name = re.sub(r'\[.*?\]', '', raw_name).strip()
-        clean_name = re.sub(r'\b\d{5}\b', '', clean_name).strip()
+        clean_name = re.sub(r'\b\d{4,8}\b', '', clean_name).strip()
 
-        tokens = clean_name.split()
+        # Normalizar omitiendo tokens de tallas para que agrupen bajo la misma clave
+        clean_name_for_group = re.sub(r'\b(?:talla\s*)?(?:xxs|xs|s|m|l|xl|xxl|3xl|[2-4]\d)\b', '', clean_name, flags=re.IGNORECASE).strip()
+
+        tokens = clean_name_for_group.split()
         if len(tokens) >= 3:
             base_key = " ".join(tokens[:3]).lower()
         else:
-            base_key = tokens[0].lower() if tokens else clean_name.lower()
+            base_key = tokens[0].lower() if tokens else clean_name_for_group.lower()
 
         group_id = f"{base_key}_{precio}"
         if group_id not in groups:
@@ -1393,22 +1548,55 @@ def consolidate_page_variants(products):
             if not parent_title:
                 parent_title = items[0]['prod'].get('nombre', '')
 
-            # Determinar tipo de variante
+            # Determinar tipo de variante: Talla, Aroma, Tono o Color
             all_text = " ".join([f"{it['raw_name']} {it['prod'].get('descripcion_corta', '')}" for it in items]).lower()
-            tipo_variante = "Aroma" if any(w in all_text for w in ['colonia', 'splash', 'fragancia', 'aroma', 'vainilla', 'frutal', 'cítrica', 'tentación']) else "Tono"
+            
+            is_size = any(re.search(rf'\b{re.escape(sz)}\b', all_text, re.IGNORECASE) for sz in [
+                'xs', 's', 'm', 'l', 'xl', 'xxl', 'xxs', '3xl', 'talla', 'tallas', 'size'
+            ]) or any(w in all_text for w in [
+                'vestido', 'blusa', 'camisa', 'camiseta', 'pantalon', 'pantalón', 'jean', 'short',
+                'chaqueta', 'falda', 'enterizo', 'brasier', 'panty', 'boxer', 'calzado', 'zapato',
+                'sandalia', 'tenis', 'tacón', 'tacones', 'botas', 'botines', 'pijama'
+            ])
+            is_scent = any(w in all_text for w in [
+                'colonia', 'splash', 'fragancia', 'aroma', 'mist', 'vainilla', 'frutal', 'cítrica',
+                'tentación', 'floral', 'coco', 'bruma', 'loción perfumada'
+            ])
+            is_shade = any(w in all_text for w in [
+                'tono', 'tonos', 'labial', 'matte', 'mate', 'gloss', 'corrector', 'base', 'rubor',
+                'blush', 'sombra', 'polvo', 'esmalte', 'delineador', 'pestañina', 'rimel', 'iluminador'
+            ])
+            is_color = any(w in all_text for w in [
+                'color', 'colores', 'negro', 'blanco', 'azul', 'rojo', 'verde', 'amarillo', 'marfil', 'gris'
+            ])
+
+            if is_size and not is_shade and not is_scent:
+                tipo_variante = "Talla"
+            elif is_scent:
+                tipo_variante = "Aroma"
+            elif is_shade:
+                tipo_variante = "Tono"
+            elif is_color:
+                tipo_variante = "Color"
+            else:
+                tipo_variante = "Variante"
 
             variants_list = []
             for it in items:
-                shade_name = it['clean_name']
+                opt_name = it['clean_name']
                 for pt_word in parent_title.split():
-                    shade_name = re.sub(rf'\b{re.escape(pt_word)}\b', '', shade_name, flags=re.IGNORECASE)
-                shade_name = re.sub(r'[^a-zA-Záéíóúüñ0-9\s\(\)]', ' ', shade_name).strip()
-                shade_name = " ".join(shade_name.split())
-                if not shade_name:
-                    shade_name = it['clean_name']
+                    opt_name = re.sub(rf'\b{re.escape(pt_word)}\b', '', opt_name, flags=re.IGNORECASE)
+                opt_name = re.sub(r'[^a-zA-Záéíóúüñ0-9\s\(\)]', ' ', opt_name).strip()
+                opt_name = " ".join(opt_name.split())
+                if not opt_name:
+                    opt_name = it['clean_name']
+
+                # Si es talla y es corta, formatear en mayúsculas
+                if tipo_variante == "Talla" and len(opt_name) <= 3:
+                    opt_name = opt_name.upper()
 
                 variants_list.append({
-                    "nombre": shade_name,
+                    "nombre": opt_name,
                     "codigo": it['code']
                 })
 
@@ -1417,7 +1605,7 @@ def consolidate_page_variants(products):
             parent_prod['precio'] = gdata['precio']
             parent_prod['tipo_variante'] = tipo_variante
             parent_prod['variantes'] = variants_list
-            parent_prod['descripcion_corta'] = re.sub(r'c[oó]d\.?\s*\d{5}\.?', '', parent_prod.get('descripcion_corta', ''), flags=re.IGNORECASE).strip()
+            parent_prod['descripcion_corta'] = re.sub(r'c[oó]d\.?\s*\d{4,8}\.?', '', parent_prod.get('descripcion_corta', ''), flags=re.IGNORECASE).strip()
 
             consolidated.append(parent_prod)
             print(f"[VariantsUnifier] Consolidado '{parent_title}' ({len(variants_list)} {tipo_variante}s): {[v['nombre'] for v in variants_list]}")
@@ -1607,38 +1795,37 @@ def clean_product_taxonomy(p):
         p['subcategoria'] = 'Joyería y bisutería'
         return p
 
-    # 3. SECCIÓN PROMOCIONES (MÁXIMA PRIORIDAD PARA CUALQUIER OFERTA, DESCUENTO, SET O 2X1)
-    # Cualquier producto con descuento (ej: 50% dscto, 55% dscto, oferta estrella), [PROMO], es_promo, sets o combos
-    # DEBE IR OBLIGATORIAMENTE A "Promociones"
-    precio_promo = str(p.get('precio_promo') or '').strip()
-    requisito_promo = str(p.get('requisito_promo') or '').strip()
-    es_promo = bool(p.get('es_promo'))
-
+    # 3. PROMOCIONES GENUINAS (ESTRICTO: Sólo 2x1, Sets/Combos o texto explícito de PROMO)
+    # Un precio tachado ("ANTES: $XX.XXX") o precio regular NO es promoción.
     is_2x1 = bool(re.search(r'\b(2x1|2\s*x\s*1|paga\s*1\s*lleva\s*2|pague\s*1\s*lleva\s*2|lleva\s*2\s*por|lleva\s*3\s*por|promo\s*2x|3x2)\b', full_text, re.I) or
                   re.search(r'\[promo\s*2x1\]', name_lower, re.I))
 
-    has_set_keyword = bool(re.search(r'\b(set|combo|pack|kit|duo|dúo|trio|trío|estuche de regalo|colección de regalo)\b', name_lower, re.I))
-    has_plus_combo = bool('+' in nombre and re.search(r'\b(perfume|parfum|fragancia|colonia|desodorante|roll-on|locion|loción|crema|labial|shampoo|bolsa)\b', name_lower, re.I))
-    is_multi_set = has_set_keyword or has_plus_combo
+    is_multi_set = bool(re.search(r'\b(set\s*x[2-9]|kit\s*x[2-9]|pack\s*x[2-9]|estuche de regalo|colecci[oó]n de regalo)\b', name_lower, re.I) or
+                        ('+' in nombre and re.search(r'\b(perfume|parfum|fragancia|colonia|desodorante|roll-on|locion|crema|labial|shampoo|bolsa)\b', name_lower, re.I)))
 
-    is_promo_detected = es_promo or bool(precio_promo) or bool(requisito_promo) or \
-                        bool(re.search(r'\[promo\]|\[oferta\]|\[promo\s*2x1\]|\[descuento\]', name_lower, re.I)) or \
-                        bool(re.search(r'\b(oferta estrella|promo estrella|mega promo|oferta millonaria|oferta dorada|super oferta|súper oferta|precio especial|\b\d+%\s*(dscto|descuento)\b|a solo\s*\$|c\/u a solo|precio rebajado|promoci[oó]n|descuento)\b', full_text, re.I))
+    has_explicit_promo_text = bool(re.search(r'\b(promo estrella|mega promo|oferta millonaria|oferta dorada|super oferta|súper oferta|super promo|súper promo)\b', full_text, re.I) or
+                                   re.search(r'\[promo\]|\[oferta\]', name_lower, re.I) or
+                                   re.search(r'\b(5[0-9]|6[0-9]|7[0-9]|8[0-9])%\s*(dscto|descuento)\b', full_text, re.I) or
+                                   (re.search(r'\bpromo\b', name_lower, re.I) and not re.search(r'\b(promesa)\b', name_lower, re.I)))
+
+    has_conditional_promo = bool(p.get('requisito_promo') and re.search(r'por\s+(la\s+)?compra|paga\s+1\s+lleva\s+2|2x1', str(p.get('requisito_promo')), re.I))
 
     if is_2x1:
         p['categoria'] = cat
         p['seccion'] = 'Promociones'
         p['subcategoria'] = 'Ofertas 2x1'
+        p['es_promo'] = True
         return p
 
     if is_multi_set:
         p['categoria'] = cat
         p['seccion'] = 'Promociones'
         p['subcategoria'] = 'Sets y combos'
+        p['es_promo'] = True
         return p
 
-    if is_promo_detected:
-        if re.search(r'\b(parfum|perfume|fragancia|colonia|locion|loción|eau de|splash|mist|expression|mithyka|bleu|magnat)\b', name_lower, re.I):
+    if has_explicit_promo_text or has_conditional_promo:
+        if re.search(r'\b(parfum|perfume|fragancia|colonia|locion|loción|eau de|splash|mist)\b', name_lower, re.I):
             sub = 'Fragancias en oferta'
         elif re.search(r'\b(labial|máscara|mascara|pestañina|base|polvo|sombra|delineador|esmalte)\b', name_lower, re.I):
             sub = 'Maquillaje en oferta'
@@ -1649,7 +1836,11 @@ def clean_product_taxonomy(p):
         p['categoria'] = cat
         p['seccion'] = 'Promociones'
         p['subcategoria'] = sub
+        p['es_promo'] = True
         return p
+
+    # SI NO TIENE TEXTO EXPLÍCITO DE PROMO, ES UN PRODUCTO NORMAL
+    p['es_promo'] = False
 
     # 4. ACCESORIOS (Bolsos individuales, mochilas, carteras, relojes, gafas)
     # Nota: Si venía "+ bolsa" en un set/combo, ya fue clasificado arriba en Promociones > Sets y combos
@@ -1910,27 +2101,66 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
            "subcategoria": "Maquillaje y cuidado personal"
          }}
 
-    0.3 REGLA SUPREMA DE UNIFICACIÓN DE VARIANTES (TONOS, AROMAS, COLORES Y ACABADOS):
-       - En catálogos de cosmética, belleza y perfumería (ej: sombras retráctiles Eyes To Go, correctores faciales Studio Look, rubores Mousse Blush, barras Multi Stick, colonias refrescantes Taste, labiales, esmaltes):
-         A menudo se exhibe UN SOLO producto físico que se vende al MISMO precio unitario pero en múltiples tonos, colores o aromas (ej: Claro, Medio Claro, Medio, Moreno).
-       - ¡ESTÁ ESTRICTAMENTE PROHIBIDO CREAR 10 PRODUCTOS DUPLICADOS PARA CADA TONO O AROMA!:
-         Debes crear UN SOLO producto consolidado con el campo "tipo_variante" ("Tono", "Aroma" o "Color") y el array "variantes" conteniendo el nombre de cada opción y su código de 5 dígitos:
-         {{
-           "nombre": "Studio Look Corrector Facial de Alta Cobertura",
-           "precio": "$17.990",
-           "descripcion_corta": "Corrector facial de alta cobertura 4 g. Corrige manchas, ojeras y granitos.",
-           "tipo_variante": "Tono",
-           "variantes": [
-             {{"nombre": "Claro", "codigo": "15080"}},
-             {{"nombre": "Medio Claro", "codigo": "15081"}},
-             {{"nombre": "Medio", "codigo": "15082"}},
-             {{"nombre": "Moreno", "codigo": "17020"}}
-           ],
-           "categoria": "Dama",
-           "seccion": "Belleza y perfumería",
-           "subcategoria": "Maquillaje y cuidado personal"
-         }}
-       - Solo extrae productos por separado cuando sean artículos físicos totalmente distintos o con diferente precio.
+    0.3 REGLA SUPREMA DE UNIFICACIÓN DE VARIANTES (TALLAS, TONOS, AROMAS, COLORES Y ACABADOS):
+       - ¡ESTÁ ESTRICTAMENTE PROHIBIDO CREAR PRODUCTOS INDIVIDUALES SEPARADOS PARA CADA TALLA, TONO O AROMA!:
+         Siempre que un artículo físico se venda al mismo precio pero ofrezca opciones a elegir por el cliente, DEBES CREAR UN SOLO Y ÚNICO PRODUCTO CONSOLIDADO con su campo "tipo_variante" y el array "variantes" conteniendo todas las opciones y sus códigos:
+
+       - CASO A: TALLAS DE ROPA, MODA Y CALZADO (Carmel, Pacifika, Loguin, Leonisa, etc.):
+         * Aplica para vestidos, blusas, camisas, pantalones, jeans, shorts, faldas, chaquetas, enterizos, pijamas, ropa interior y calzado.
+         * Cuando la página muestra una prenda con múltiples tallas disponibles (ej: "Tallas: XS - S - M - L - XL", o "Tallas: 6, 8, 10, 12, 14", o calzado "Tallas: 35, 36, 37, 38, 39, 40"):
+         * Si cada talla tiene su propio código en la tabla o viñeta (ej: XS Cód. 752180, S Cód. 752181, M Cód. 752182):
+           {{
+             "nombre": "Vestido Corto Silueta Amplia en Tejido Plano",
+             "precio": "$69.999",
+             "tipo_variante": "Talla",
+             "variantes": [
+               {{"nombre": "XS", "codigo": "752180"}},
+               {{"nombre": "S", "codigo": "752181"}},
+               {{"nombre": "M", "codigo": "752182"}},
+               {{"nombre": "L", "codigo": "752183"}},
+               {{"nombre": "XL", "codigo": "752184"}}
+             ],
+             "descripcion_corta": "Cód. 752180. Vestido corto de silueta amplia en tejido plano con caída suave. Tallas XS a XL disponibles.",
+             "categoria": "Dama", "seccion": "Ropa", "subcategoria": "Vestidos y faldas"
+           }}
+         * Si las tallas comparten un único código general de referencia (ej: Cód. 636102), asígnales ese mismo código a cada opción del array.
+
+       - CASO B: TONOS DE MAQUILLAJE Y COSMÉTICA (Cyzone, Esika, L'Bel, Yanbal, Avon):
+         * Aplica para labiales, bases, polvos compactos, correctores, rubores/blush, sombras, delineadores y esmaltes.
+         * {{
+             "nombre": "Studio Look Corrector Facial de Alta Cobertura",
+             "precio": "$17.990",
+             "tipo_variante": "Tono",
+             "variantes": [
+               {{"nombre": "Claro", "codigo": "15080"}},
+               {{"nombre": "Medio Claro", "codigo": "15081"}},
+               {{"nombre": "Medio", "codigo": "15082"}},
+               {{"nombre": "Moreno", "codigo": "17020"}}
+             ],
+             "descripcion_corta": "Corrector facial de alta cobertura 4 g. Corrige manchas, ojeras y granitos.",
+             "categoria": "Dama", "seccion": "Maquillaje", "subcategoria": "Rostro y polvos"
+           }}
+
+       - CASO C: AROMAS Y FRAGANCIAS (Colonias Taste, splashes, brumas, lociones aromáticas):
+         * Aplica cuando una línea de colonias o splashes corporales se exhibe con diversos aromas al mismo precio:
+         * {{
+             "nombre": "Cyzone Colonias Refrescantes Taste",
+             "precio": "$19.990",
+             "tipo_variante": "Aroma",
+             "variantes": [
+               {{"nombre": "Berry Boom", "codigo": "04512"}},
+               {{"nombre": "Sweet Vanilla", "codigo": "04513"}},
+               {{"nombre": "Fresh Coconut", "codigo": "04514"}},
+               {{"nombre": "Choco Twist", "codigo": "04515"}}
+             ],
+             "descripcion_corta": "Colonias refrescantes corporales 200 ml. Aromas irresistibles de larga duración.",
+             "categoria": "Dama", "seccion": "Perfumes y fragancias", "subcategoria": "Perfumes femeninos"
+           }}
+
+       - CASO D: COLORES O ACABADOS (Prendas y accesorios en varios colores):
+         * Aplica cuando el mismo bolso, reloj o accesorio se ofrece en Negro, Blanco, Marfil o Azul. Define "tipo_variante": "Color".
+
+       - REGLA DE ORO: Solo extrae productos en fichas separadas cuando sean artículos físicos totalmente distintos (ej: Chaqueta y Short) o tengan precios diferentes. Si son opciones del mismo producto, DEBEN IR CONSOLIDADAS en el array "variantes".
 
     0.4 REGLA SUPREMA DE UNIFICACIÓN DE PRODUCTOS EN PROMOCIÓN CONDICIONAL:
        - Cuando en una página aparece un producto en oferta especial condicionado a la compra de otro producto (ejemplo: "Parlante Beat Box a solo $49.990 por la compra del Perfume Icon", y en letra pequeña o en la misma página dice "Pedido individualmente sin condición de compra a $120.000"):
@@ -2043,21 +2273,24 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
          * "PROMO 2X" / "PROMOCIÓN 2X"
          * "3X2" / "LLEVA 3 POR..."
        - ESTO SIGNIFICA QUE EL CLIENTE PUEDE ELEGIR Y COMBINAR MULTIPLES UNIDADES POR ESE PRECIO ESPECIAL:
-         1) Para CADA VARIANTE o TONO individual disponible bajo esa oferta (ej: 6 tonos de labial Glowy Stain):
-            * En "nombre", incluye obligatoriamente la promoción en el título:
-              "[PROMO 2X1] Studio Look Glowy Stain Caramel Latte (Paga 1 Lleva 2)"
-            * En "precio": Coloca el precio total del combo/promo (ej: "$29.990").
-            * En "es_promo": true
-            * En "requisito_promo": "Promoción 2x1: Paga 1 y lleva 2 a solo $29.990 (elige 2 tonos iguales o combinados)"
-            * En "descripcion_corta": "🔥 Promoción Paga 1 Lleva 2 por $29.990. Cód. 12935. Brillo labial hidratante con tinta de larga duración 3.6 ml..."
-         2) Y ADEMÁS, si hay tonos o variantes combinables en la página (ej: tonos de labial, tonos de delineador, fragancias combinables):
-            * EXTRAE TAMBIÉN UN PRODUCTO GENERAL DE LA PROMOCIÓN para que el cliente pueda pedir el combo completo y seleccionar sus 2 tonos:
-              - "nombre": "[PROMO 2X1] Studio Look Glowy Stain (Paga 1 Lleva 2 por $29.990 - Elige 2 tonos)"
-              - "precio": "$29.990"
-              - "es_promo": true
-              - "requisito_promo": "Paga 1 y lleva 2 por $29.990. Puedes escoger y combinar 2 tonos de la página."
-              - "descripcion_corta": "Promoción Paga 1 Lleva 2 por $29.990. Tonos disponibles para elegir y combinar: Pink Lemonade, Caramel Latte, Hot Chocolate, Rose Spritz, Strawberry Shake, Grape Juice."
-              - "categoria": "Dama", "seccion": "Belleza y perfumería", "subcategoria": "Maquillaje y cuidado personal"
+         * ¡PROHIBIDO CREAR PRODUCTOS INDIVIDUALES PARA CADA TONO O VARIANTE!:
+         * DEBES CREAR UN SOLO Y ÚNICO PRODUCTO CONSOLIDADO para la promoción que contenga todas las opciones a escoger en el array "variantes":
+           - "nombre": "[PROMO 2X1] Studio Look Glowy Stain (Paga 1 Lleva 2 por $29.990)"
+           - "precio": "$29.990"
+           - "es_promo": true
+           - "promo_cantidad_requerida": 2
+           - "requisito_promo": "Paga 1 y lleva 2 por $29.990 (Escoge 2 tonos iguales o combinados)"
+           - "tipo_variante": "Tono"
+           - "variantes": [
+               {{"nombre": "Pink Lemonade", "codigo": "12936"}},
+               {{"nombre": "Caramel Latte", "codigo": "12935"}},
+               {{"nombre": "Hot Chocolate", "codigo": "12927"}},
+               {{"nombre": "Rose Spritz", "codigo": "12925"}},
+               {{"nombre": "Strawberry Shake", "codigo": "12932"}},
+               {{"nombre": "Grape Juice", "codigo": "12926"}}
+             ]
+           - "descripcion_corta": "🔥 Promoción Paga 1 Lleva 2 por $29.990. Brillo labial hidratante de larga duración. Escoge 2 tonos para tu promoción."
+           - "categoria": "Dama", "seccion": "Belleza y perfumería", "subcategoria": "Maquillaje y cuidado personal"
 
     4. PROMOCIONES "A SOLO $ XX.XXX c/u" O "CUALQUIERA POR..." (PRECIO COMPARTIDO PARA VARIAS VARIANTES):
        - En catálogos de cosmética y cuidado personal, a menudo aparece un único precio promocional grande que dice "A SOLO $ 49,990 c/u" (donde 'c/u' significa 'cada uno').
@@ -2085,13 +2318,13 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     7. TAXONOMÍA CANÓNICA ESTRICTA DE ALTA PRECISIÓN:
        - "categoria": Exclusivamente una de: "Dama", "Caballero", "Niños", "Niñas", "Hogar".
        - "seccion":
-         * "Promociones": ¡OBLIGATORIO para TODOS los productos con descuento, promoción (ej: 50% dscto, 55% dscto, oferta estrella), SETS, COMBOS, DUOS, PACKS multi-producto, ofertas "2x1", "Paga 1 lleva 2"!
-         * "Perfumes y fragancias": ¡EXCLUSIVAMENTE perfumes y colonias regulares individuales SIN promoción ni descuento! (JAMÁS aretes, JAMÁS desodorantes, JAMÁS productos con precio de oferta/promo).
-         * "Accesorios": ¡OBLIGATORIO para joyería y bisutería (aretes, collares, pulseras, anillos), mochilas, bolsos individuales, carteras, billeteras, relojes, gafas! (NUNCA en perfumes).
-         * "Cuidado personal": Desodorantes individuales y antitranspirantes regulares (roll-on, spray), espumas de afeitar, cremas faciales/corporales, sérums (Nocturne Ojos), protectores solares, shampoo.
-         * "Maquillaje": Labiales individuales regulares, máscaras/pestañinas, delineadores, bases, polvos, sombras, rubor, esmaltes.
-         * "Ropa": Vestidos, blusas, pantalones, jeans, chaquetas, ropa interior, pijamas.
-         * "Zapatos": Sandalias, tacones, tenis, botas, calzado.
+         * "Promociones": SÓLO cuando la página o el título tenga TEXTO EXPLÍCITO DE PROMOCIÓN impreso en el catálogo (ej: "PROMO", "PROMOCIÓN", "2X1", "PAGA 1 LLEVA 2", "3X2", "LLEVA 2 POR...", "SET X2", o descuentos masivos de más del 50% como "50% DSCTO").
+           IMPORTANTE: Si un producto sólo muestra su precio normal (incluso si tiene un precio de referencia anterior tachado como "ANTES: $XX.XXX"), ¡NO ES UNA PROMOCIÓN, es un producto normal! Clasifícalo en su sección correspondiente ("Ropa", "Maquillaje", "Cuidado personal", "Perfumes y fragancias", "Accesorios") con "es_promo": false.
+         * "Perfumes y fragancias": Perfumes y colonias regulares individuales (JAMÁS aretes, JAMÁS desodorantes).
+         * "Accesorios": Joyería y bisutería (aretes, collares, pulseras, anillos), mochilas, bolsos individuales, carteras, billeteras, relojes, gafas.
+         * "Cuidado personal": Desodorantes y antitranspirantes regulares (roll-on, spray), espumas de afeitar, cremas faciales/corporales, sérums (Nocturne Ojos), protectores solares, shampoo.
+         * "Maquillaje": Labiales, máscaras/pestañinas, delineadores, bases, polvos, sombras, rubor, esmaltes.
+         * "Ropa": Vestidos, faldas, blusas, camisetas, camisas, pantalones, jeans, shorts, enterizos, chaquetas, ropa interior, pijamas, calzado y zapatos.
          * "Hogar": Edredones, sábanas, toallas, vajilla, sartenes, cocina.
        - "subcategoria":
          * Para "Promociones": "Fragancias en oferta", "Sets y combos", "Ofertas 2x1", "Maquillaje en oferta", "Ofertas y descuentos".
@@ -2110,9 +2343,14 @@ def extract_products_from_page(page_text, image_path, title, page_num, is_audit=
     Devuelve exclusivamente un JSON con la siguiente estructura (Array de objetos):
     [
       {{
-        "nombre": "Nombre descriptivo limpio (ej: Extréme L'Bel Parfum Masculino, [PROMO] Parlante Beat Box)",
-        "precio": "Precio con signo peso (ej: $124.990) o 'Confirmar con Erika'",
-        "descripcion_corta": "Cód. XXXXX. Notas olfativas, condición si es promo, o detalles",
+        "nombre": "Nombre descriptivo limpio (ej: Extréme L'Bel Parfum Masculino, Vestido Corto Silueta Amplia, [PROMO] Parlante Beat Box)",
+        "precio": "Precio con signo peso (ej: $124.990, $69.999) o 'Confirmar con Erika'",
+        "tipo_variante": "Talla" (o "Tono" o "Aroma" o "Color" o "" si no tiene variantes),
+        "variantes": [
+          {{"nombre": "XS", "codigo": "752180"}},
+          {{"nombre": "S", "codigo": "752181"}}
+        ],
+        "descripcion_corta": "Cód. XXXXX. Notas olfativas, condición si es promo, tallas o detalles",
         "categoria": "Categoría principal (Dama, Caballero, Niños, Niñas, Hogar)",
         "seccion": "Sección (Promociones, Perfumes y fragancias, Accesorios, Cuidado personal, Maquillaje, Ropa, Zapatos, Hogar)",
         "subcategoria": "Subcategoría canónica correspondiente",
@@ -2243,14 +2481,23 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
     unique_products = consolidate_page_variants(unique_products)
     unique_products = consolidate_page_promos(unique_products)
     unique_products = enhance_and_enforce_page_promos(unique_products, page_text=page_text, facing_text=facing_text, page_num=page_num, title=title)
+    unique_products = [extract_variants_from_text(p) for p in unique_products]
     unique_products = [clean_product_taxonomy(p) for p in unique_products]
     unique_products = [p for p in unique_products if is_valid_product(p)]
     del page_text
     print(f"[{title} | Pág {page_num}/{total_pages}] {used_key}: {len(products)} -> Consolidados y unificados: {len(unique_products)}")
     
-    # 5. Guardar productos en Supabase (Ilimitado y permanente)
+    # 5. Guardar productos en Supabase (Ilimitado y permanente con variantes completas)
     supa_products = []
     for p in unique_products:
+        coords_dict = dict(p.get("coords")) if isinstance(p.get("coords"), dict) else {}
+        variants_list = p.get("variantes") if isinstance(p.get("variantes"), list) else []
+        tipo_var = str(p.get("tipo_variante") or "")
+        
+        # Respaldo garantizado de variantes dentro de coords
+        coords_dict["variantes"] = variants_list
+        coords_dict["tipo_variante"] = tipo_var
+
         supa_products.append({
             "nombre": p.get("nombre") or "Producto",
             "descripcion_corta": p.get("descripcion_corta") or "",
@@ -2261,6 +2508,8 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
             "categoria": p.get("categoria") or "Dama",
             "seccion": p.get("seccion") or "General",
             "subcategoria": p.get("subcategoria") or "General",
+            "tipo_variante": tipo_var,
+            "variantes": variants_list,
             "catalogo": title,
             "catalogo_url": url.split('?')[0],
             "catalogo_hash": cat_hash,
@@ -2268,7 +2517,7 @@ def process_single_page(tmp_pdf_path, page_num, cat_info, total_pages):
             "es_promo": bool(p.get("es_promo", False)),
             "tipo_promo": p.get("tipo_promo") or "",
             "requisito_promo": p.get("requisito_promo") or "",
-            "coords": p.get("coords") if isinstance(p.get("coords"), dict) else {}
+            "coords": coords_dict
         })
     if supa_products:
         supabase_post("products", supa_products)
@@ -2799,6 +3048,8 @@ def search_products():
                                     "pagina": str(p_data.get("pagina", "1")),
                                     "seccion": p_data.get("seccion", ""),
                                     "subcategoria": p_data.get("subcategoria", ""),
+                                    "tipo_variante": p_data.get("tipo_variante") or (p_data.get("coords") or {}).get("tipo_variante") or "",
+                                    "variantes": p_data.get("variantes") or (p_data.get("coords") or {}).get("variantes") or [],
                                     "descripcion_corta": p_data.get("descripcion_corta", "")
                                 })
                         if prods:
@@ -3042,9 +3293,9 @@ def extract_missing_product():
           * En 'es_promo': true.
           * En 'tipo_promo': 'escala_2x'.
           * En 'requisito_promo': '1x $15.990 o 2x $24.990 (Escoge 2 tonos iguales o combinados)'.
-        - Si el producto tiene múltiples tonos, colores o aromas (ej: Magic Red #03406, Natural Rose #03380, etc.):
-          * En 'tipo_variante': 'Tono', 'Aroma' o 'Color'.
-          * En 'variantes': Array de objetos [{{"nombre": "Tono", "codigo": "12345"}}].
+        - Si el producto tiene múltiples tallas, tonos, colores o aromas (ej: tallas XS, S, M, L con códigos individuales o compartidos, o tonos de labial, o aromas de colonia):
+          * En 'tipo_variante': 'Talla', 'Tono', 'Aroma' o 'Color'.
+          * En 'variantes': Array de objetos [{{"nombre": "XS", "codigo": "752180"}}, {{"nombre": "S", "codigo": "752181"}}].
         - Si el precio está por unidad de medida (ej: '100 ml ... ml a $1.249,90'), calcula el precio multiplicando: 100 * 1249.90 = '$124.990'.
         - Si la página indica una oferta compartida como 'A SOLO $ 49,990 c/u' (cada uno), asigna ese precio ('$49.990') al producto.
         - Si el producto NO tiene precio pero SÍ tiene código (ej: 'Cód. 09583'), en precio pon exactamente: 'Confirmar con Erika'.
@@ -3063,9 +3314,9 @@ def extract_missing_product():
           "es_promo": true,
           "tipo_promo": "escala_2x",
           "requisito_promo": "1x $15.990 o 2x $24.990 (Escoge 2 tonos iguales o combinados)",
-          "tipo_variante": "Tono",
+          "tipo_variante": "Talla" (o "Tono" o "Aroma" o "Color" o ""),
           "variantes": [
-            {{"nombre": "Tono 1", "codigo": "12345"}}
+            {{"nombre": "Opción 1", "codigo": "12345"}}
           ],
           "descripcion_corta": "Cód. XXXXX. Subtítulo, notas olfativas o detalles",
           "categoria": "Categoría principal (Dama, Caballero, Niños, Niñas, Hogar)",
@@ -3095,6 +3346,7 @@ def extract_missing_product():
             
         _, clean_name = clean_product_name(prod_data.get('nombre', ''))
         prod_data['nombre'] = clean_name if clean_name else prod_data.get('nombre', '')
+        prod_data = extract_variants_from_text(prod_data)
         prod_data = clean_product_taxonomy(prod_data)
         prod_data['imagen'] = img_url
         prod_data['catalogo'] = title
@@ -3102,6 +3354,15 @@ def extract_missing_product():
         prod_data['catalogo_hash'] = cat_hash
         prod_data['pagina'] = str(page_number)
         
+        coords_dict = dict(prod_data.get('coords')) if isinstance(prod_data.get('coords'), dict) else {}
+        variants_list = prod_data.get('variantes') if isinstance(prod_data.get('variantes'), list) else []
+        tipo_var = str(prod_data.get('tipo_variante') or '')
+        coords_dict["variantes"] = variants_list
+        coords_dict["tipo_variante"] = tipo_var
+        prod_data['tipo_variante'] = tipo_var
+        prod_data['variantes'] = variants_list
+        prod_data['coords'] = coords_dict
+
         p_id = get_single_catalog_hash(f"{cat_hash}_{prod_data.get('nombre')}_{prod_data.get('precio', '')}_{page_number}")
         prod_data['id'] = p_id
         supabase_post("products", [{
@@ -3115,6 +3376,8 @@ def extract_missing_product():
             "categoria": prod_data.get('categoria', 'Dama'),
             "seccion": prod_data.get('seccion', 'Promociones'),
             "subcategoria": prod_data.get('subcategoria', 'General'),
+            "tipo_variante": tipo_var,
+            "variantes": variants_list,
             "catalogo": title,
             "catalogo_url": catalog_url.split('?')[0],
             "catalogo_hash": cat_hash,
@@ -3122,7 +3385,7 @@ def extract_missing_product():
             "es_promo": bool(prod_data.get('es_promo', False)),
             "tipo_promo": prod_data.get('tipo_promo') or '',
             "requisito_promo": prod_data.get('requisito_promo') or '',
-            "coords": prod_data.get('coords') if isinstance(prod_data.get('coords'), dict) else {}
+            "coords": coords_dict
         }])
         sync_categories_to_supabase([prod_data])
             
@@ -3285,12 +3548,16 @@ REGLAS DE AUDITORÍA Y UNIFICACIÓN INTELIGENTE:
   * Si alguna de las prendas no está en la lista de productos registrados, DEBES AGREGARLA EN 'products_to_create'.
   * Si un producto existente tiene erróneamente un 'precio_promo' tomado de otra prenda vecina, LIMPIA 'precio_promo': null, 'es_promo': false, 'requisito_promo': null en 'products_to_update'.
 
-2. UNIFICACIÓN DE TONOS / VARIANTES DEL MISMO PRODUCTO:
-- Si un producto tiene varios tonos, colores o aromas a lo largo del pliego (ej: Base Illumina con tonos Moreno #06166, Medio #06160, Medio Claro #06158, Claro #06157):
-  * Deben consolidarse en UNA SOLA ficha principal.
-  * Define 'tipo_variante' ('Tono', 'Aroma' o 'Color').
-  * En 'variantes': [{{"nombre": "Nombre Tono", "codigo": "12345"}}].
-  * Todos los demás registros en la base de datos que representaban tonos sueltos deben incluirse en 'products_to_delete'.
+2. UNIFICACIÓN DE VARIANTES (TALLAS, TONOS, AROMAS O COLORES) DEL MISMO PRODUCTO:
+- Si un producto tiene varias opciones a elegir:
+  * En ropa o calzado: TALLAS (ej: Vestido en tallas XS #752180, S #752181, M #752182, L #752183, o calzado 35, 36, 37).
+  * En maquillaje: TONOS (ej: Base Illumina con tonos Moreno #06166, Medio #06160, Claro #06157).
+  * En perfumería: AROMAS (ej: Taste Berry Boom #04512, Sweet Vanilla #04513).
+  * En accesorios/moda: COLORES (ej: Negro, Blanco, Azul).
+  * Deben consolidarse obligatoriamente en UNA SOLA ficha principal.
+  * Define 'tipo_variante' ('Talla', 'Tono', 'Aroma' o 'Color').
+  * En 'variantes': [{{"nombre": "XS", "codigo": "752180"}}, {{"nombre": "S", "codigo": "752181"}}].
+  * Todos los demás registros en la base de datos que representaban tallas o tonos sueltos deben incluirse en 'products_to_delete'.
 
 3. FUSIÓN DE VENTA INDIVIDUAL + PROMOCIÓN CONDICIONAL EN UN SOLO PRODUCTO:
 - Caso crítico: Cuando un producto se vende de forma individual Y además tiene una oferta especial vinculada o condicional (ej: "Studio Look Desmaquillador Bifásico" venta individual a $32.990 y en oferta a $14.990 por la compra de producto de rostro pág. 47 a 59):
@@ -3337,8 +3604,8 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
       "subtitulo_promo": "Subtítulo de la promo o null",
       "requisito_promo": "Condición explicada o null",
       "promo_categoria_filtro": "CYZONE:47-59" o null,
-      "tipo_variante": "Tono" / "Aroma" / null,
-      "variantes": [ {{"nombre": "Tono 1", "codigo": "12345"}} ],
+      "tipo_variante": "Talla" / "Tono" / "Aroma" / "Color" / null,
+      "variantes": [ {{"nombre": "Opción 1", "codigo": "12345"}} ],
       "descripcion_corta": "Cód. XXXXX. Detalles, beneficios...",
       "pagina": "{page_number}"
     }}
@@ -3353,8 +3620,8 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
       "subtitulo_promo": null,
       "requisito_promo": null,
       "promo_categoria_filtro": null,
-      "tipo_variante": "Tono",
-      "variantes": [],
+      "tipo_variante": "Talla" (o "Tono" o "Aroma" o "Color" o ""),
+      "variantes": [ {{"nombre": "Opción 1", "codigo": "12345"}} ],
       "descripcion_corta": "...",
       "categoria": "...",
       "subcategoria": "...",
@@ -3367,7 +3634,7 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
 }}
 """
 
-        raw_res = call_gemini_with_key_manager(prompt, files=temp_img_paths, model_name='gemini-3.6-flash')
+        raw_res = call_gemini_with_key_manager(prompt, files=temp_img_paths)
         for tp in temp_img_paths:
             try: os.remove(tp)
             except: pass
@@ -3378,17 +3645,17 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
         if clean_text.endswith('```'): clean_text = clean_text[:-3]
         clean_text = clean_text.strip()
 
-        result_ai = json.loads(clean_text)
-        summary = result_ai.get('summary', 'Auditoría con IA ejecutada exitosamente.')
-        products_to_update = result_ai.get('products_to_update', [])
-        products_to_create = result_ai.get('products_to_create', [])
-        products_to_delete = result_ai.get('products_to_delete', [])
+        audit_result = json.loads(clean_text)
+        summary = audit_result.get('summary', 'Auditoría completada.')
+        products_to_update = audit_result.get('products_to_update', [])
+        products_to_create = audit_result.get('products_to_create', [])
+        products_to_delete = audit_result.get('products_to_delete', [])
 
-        # Aplicar cambios en Supabase
         updated_count = 0
         created_count = 0
         deleted_count = 0
 
+        # Aplicar cambios en Supabase
         # 1. Eliminar
         for del_id in products_to_delete:
             if del_id:
@@ -3403,7 +3670,14 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
                 if 'nombre' in clean_up:
                     _, c_name = clean_product_name(clean_up['nombre'])
                     if c_name: clean_up['nombre'] = c_name
+                clean_up = extract_variants_from_text(clean_up)
                 clean_up['id'] = str(u_id)
+                coords = dict(clean_up.get('coords')) if isinstance(clean_up.get('coords'), dict) else {}
+                if 'variantes' in clean_up:
+                    coords['variantes'] = clean_up['variantes']
+                if 'tipo_variante' in clean_up:
+                    coords['tipo_variante'] = clean_up['tipo_variante']
+                clean_up['coords'] = coords
                 if supabase_post("products", [clean_up]):
                     updated_count += 1
 
@@ -3415,6 +3689,7 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
             if cr.get('nombre'):
                 _, c_name = clean_product_name(cr.get('nombre'))
                 cr['nombre'] = c_name if c_name else cr.get('nombre')
+                cr = extract_variants_from_text(cr)
                 cr = clean_product_taxonomy(cr)
                 c_page = str(cr.get('pagina') or page_number)
                 new_id = get_single_catalog_hash(f"{cat_hash}_{cr.get('nombre')}_{cr.get('precio', '')}_{c_page}_{time.time()}")
@@ -3425,6 +3700,12 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
                 cr['pagina'] = int(c_page) if str(c_page).isdigit() else 0
                 if not cr.get('imagen_recorte'):
                     cr['imagen_recorte'] = f"{R2_PUBLIC_URL}/thumbnails/{cat_hash}/page_{c_page}.jpg"
+                coords = dict(cr.get('coords')) if isinstance(cr.get('coords'), dict) else {}
+                coords['variantes'] = cr.get('variantes') if isinstance(cr.get('variantes'), list) else []
+                coords['tipo_variante'] = str(cr.get('tipo_variante') or '')
+                cr['coords'] = coords
+                cr['variantes'] = coords['variantes']
+                cr['tipo_variante'] = coords['tipo_variante']
                 new_products_batch.append(cr)
                 created_count += 1
 
