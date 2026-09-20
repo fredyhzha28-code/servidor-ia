@@ -3534,15 +3534,28 @@ def audit_spread_ai():
 Eres un Auditor de Inteligencia Artificial experto en catálogos de belleza y moda (Cyzone, Esika, L'Bel).
 Estás auditando el pliego de catálogo correspondiente a las páginas {pages_to_audit} de la revista "{title}".
 
-INSTRUCCIÓN DEL ADMINISTRADOR:
+========================================================================================
+¡ORDEN DIRECTA Y MANDATORIA DEL ADMINISTRADOR HUMANO (MÁXIMA PRIORIDAD ABSOLUTA)!:
 "{instruction}"
+========================================================================================
+
+¡ATENCIÓN CRÍTICA - REGLA DE ORO #0 (MÁXIMA PRIORIDAD):
+1. SI EL ADMINISTRADOR TE DICE: "crea...", "crealo...", "agrega...", "falta el producto...", "no me creaste...", o te menciona un producto y su precio (ej: "crea el producto que esta en la pagina 161 winner sport 95,990"):
+   - ¡TIENES LA OBLIGACIÓN ABSOLUTA DE CREARLO EN 'products_to_create'!
+   - Si el administrador lo ve en la revista y te lo escribe, ¡EL PRODUCTO EXISTE Y TIENE QUE SER CREADO SÍ O SÍ!
+   - NO apliques la Regla 3 ni ninguna otra regla para rechazarlo o fusionarlo si el administrador pide crear el producto individual.
+   - Aunque aparezca mencionado en una promoción o en un pack de dos perfumes (ej: Winner Sport en un dúo), si el usuario te ordena crear el producto individual Winner Sport a $95.990 (o el precio que indique el pliego), ¡CRÉALO DE INMEDIATO en 'products_to_create'!
+   - Lee minuciosamente el pliego y el OCR de las páginas {pages_to_audit} para extraer su nombre comercial completo, notas aromáticas, descripción, volumen (ej: 100 ml), código si está visible, y el precio exacto ($95.990).
+2. Si el administrador te dice que elimines un producto, agrégalo de inmediato a 'products_to_delete'.
+3. Si el administrador te pide cambiar cualquier dato (nombre, precio, promo, variantes, página), actualízalo de inmediato en 'products_to_update'.
+4. La orden del administrador ANULA y TIENE PREVALENCIA TOTAL sobre cualquier otra regla general.
 
 PRODUCTOS REGISTRADOS ACTUALMENTE EN LA BASE DE DATOS PARA ESTE PLIEGO ({len(simplified_prods)} productos):
 {json.dumps(simplified_prods, ensure_ascii=False, indent=2)}
 
 {ocr_summary}
 
-REGLAS DE AUDITORÍA Y UNIFICACIÓN INTELIGENTE:
+REGLAS GENERALES DE AUDITORÍA Y UNIFICACIÓN INTELIGENTE:
 
 1. DISTINCIÓN ABSOLUTA DE PRENDAS Y PRODUCTOS DISTINTOS (JAMÁS MEZCLAR NI CREAR PROMOS FALSAS):
 - Si en la página o pliego conviven prendas o productos diferentes (ej: Chaqueta y Short, Blusa y Pantalón, Vestido y Blazer, o dos artículos con letras distintas como "C - CHAQUETA $69.999" y "D - SHORT $59.999"):
@@ -3558,15 +3571,14 @@ REGLAS DE AUDITORÍA Y UNIFICACIÓN INTELIGENTE:
   * ¡ES UNA SOLA PRENDA FÍSICA! NUNCA crees "Camiseta C" y otra "Camiseta C con aplique de perlas", ni crees un producto para cada talla.
   * Si la base de datos tiene registrados ambos ("Camiseta C" y "Camiseta C con aplique de perlas"), o un registro por cada talla:
     1. Mantén UN SOLO registro principal en 'products_to_update' con el nombre comercial más completo y descriptivo: ej. "Camiseta con aplique de perlas" (o "Falda Short con taches").
-    2. Agrupa TODAS sus tallas y códigos en 'variantes': [{{"nombre": "S", "codigo": "752177"}}, {{"nombre": "M", "codigo": "752178"}}, {{"nombre": "L", "codigo": "752179"}}].
+    2. Agrupa TODAS sus tallas y códigos en 'variantes': [{"nombre": "S", "codigo": "752177"}, {"nombre": "M", "codigo": "752178"}, {"nombre": "L", "codigo": "752179"}].
     3. Define 'tipo_variante': "Talla".
     4. Agrega OBLIGATORIAMENTE el ID del registro redundante (ej: el ID de "Camiseta C") a 'products_to_delete'.
 - En cosmética y perfumería: Lo mismo para TONOS de maquillaje (ej: Base con 4 tonos -> 1 solo producto con 4 variantes) y AROMAS de colonias.
 
 3. FUSIÓN DE VENTA INDIVIDUAL + PROMOCIÓN CONDICIONAL EN UN SOLO PRODUCTO:
 - Caso crítico: Cuando un producto se vende de forma individual Y además tiene una oferta especial vinculada o condicional (ej: "Studio Look Desmaquillador Bifásico" venta individual a $32.990 y en oferta a $14.990 por la compra de producto de rostro pág. 47 a 59):
-  * ¡NO DEBEN EXISTIR DOS PRODUCTOS SEPARADOS!
-  * Deben consolidarse en UN SOLO producto en 'products_to_update' con:
+  * A menos que el administrador ordene expresamente mantener o crear el producto individual por separado, consolídalo en UN SOLO producto en 'products_to_update' con:
     - 'nombre': "Studio Look Desmaquillador Bifásico con Ácido Hialurónico" (nombre comercial limpio)
     - 'precio': "$32.990" (precio regular individual)
     - 'precio_promo': "$14.990" (precio de oferta condicional)
@@ -3596,7 +3608,7 @@ REGLAS DE AUDITORÍA Y UNIFICACIÓN INTELIGENTE:
 - Igualmente, elimina de 'products_to_delete' cualquier duplicado redundante o clon de un mismo artículo.
 
 7. CUMPLIMIENTO ESTRICTO DE LA INSTRUCCIÓN:
-- Si el administrador solicitó algo específico (ej: "elimina tal producto", "agrega tal tono", "cambia el precio a $X"), ejecútalo con la máxima prioridad.
+- Si el administrador solicitó algo específico (ej: "elimina tal producto", "agrega tal tono", "cambia el precio a $X", "crea tal producto"), ejecútalo con la máxima prioridad.
 
 FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
 {{
@@ -3692,30 +3704,41 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
         # 3. Crear
         new_products_batch = []
         for cr in products_to_create:
-            if not is_valid_product(cr):
+            nombre = str(cr.get('nombre') or '').strip()
+            if not nombre or len(nombre) < 2:
                 continue
-            if cr.get('nombre'):
-                _, c_name = clean_product_name(cr.get('nombre'))
-                cr['nombre'] = c_name if c_name else cr.get('nombre')
-                cr = extract_variants_from_text(cr)
-                cr = clean_product_taxonomy(cr)
-                c_page = str(cr.get('pagina') or page_number)
-                new_id = get_single_catalog_hash(f"{cat_hash}_{cr.get('nombre')}_{cr.get('precio', '')}_{c_page}_{time.time()}")
-                cr['id'] = new_id
-                cr['catalogo'] = title
-                cr['catalogo_url'] = catalog_url.split('?')[0] if catalog_url else ''
-                cr['catalogo_hash'] = cat_hash
-                cr['pagina'] = int(c_page) if str(c_page).isdigit() else 0
-                if not cr.get('imagen_recorte'):
-                    cr['imagen_recorte'] = f"{R2_PUBLIC_URL}/thumbnails/{cat_hash}/page_{c_page}.jpg"
-                coords = dict(cr.get('coords')) if isinstance(cr.get('coords'), dict) else {}
-                coords['variantes'] = cr.get('variantes') if isinstance(cr.get('variantes'), list) else []
-                coords['tipo_variante'] = str(cr.get('tipo_variante') or '')
-                cr['coords'] = coords
-                cr['variantes'] = coords['variantes']
-                cr['tipo_variante'] = coords['tipo_variante']
-                new_products_batch.append(cr)
-                created_count += 1
+
+            # Si el usuario dio una instrucción explícita o el producto tiene precio/código, no descartarlo
+            if not is_valid_product(cr):
+                has_price_num = bool(re.search(r'\d', str(cr.get('precio') or '')))
+                has_variants = bool(cr.get('variantes') and len(cr.get('variantes')) > 0)
+                if not has_price_num and not has_variants and not cr.get('descripcion_corta'):
+                    continue
+
+            _, c_name = clean_product_name(nombre)
+            cr['nombre'] = c_name if c_name else nombre
+            cr = extract_variants_from_text(cr)
+            cr = clean_product_taxonomy(cr)
+            c_page = str(cr.get('pagina') or page_number)
+            new_id = get_single_catalog_hash(f"{cat_hash}_{cr.get('nombre')}_{cr.get('precio', '')}_{c_page}_{time.time()}")
+            cr['id'] = new_id
+            cr['catalogo'] = title
+            cr['catalogo_url'] = catalog_url.split('?')[0] if catalog_url else ''
+            cr['catalogo_hash'] = cat_hash
+            cr['pagina'] = int(c_page) if str(c_page).isdigit() else (page_number or 0)
+            thumb_url = f"{R2_PUBLIC_URL}/thumbnails/{cat_hash}/page_{c_page}.jpg"
+            if not cr.get('imagen_recorte'):
+                cr['imagen_recorte'] = thumb_url
+            if not cr.get('imagen'):
+                cr['imagen'] = thumb_url
+            coords = dict(cr.get('coords')) if isinstance(cr.get('coords'), dict) else {}
+            coords['variantes'] = cr.get('variantes') if isinstance(cr.get('variantes'), list) else []
+            coords['tipo_variante'] = str(cr.get('tipo_variante') or '')
+            cr['coords'] = coords
+            cr['variantes'] = coords['variantes']
+            cr['tipo_variante'] = coords['tipo_variante']
+            new_products_batch.append(cr)
+            created_count += 1
 
         if new_products_batch:
             supabase_post("products", new_products_batch)
