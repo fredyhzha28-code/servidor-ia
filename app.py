@@ -230,6 +230,13 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://qlpuuieqoyxksuxeoycd.supa
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", os.environ.get("SUPABASE_SECRET_KEY", os.environ.get("SUPABASE_KEY", _DEFAULT_SUPA_SEC)))
 SUPABASE_KEY = SUPABASE_SERVICE_KEY
 
+VALID_PRODUCT_COLUMNS = {
+    'id', 'catalogo', 'catalogo_hash', 'catalogo_url', 'categoria', 'codigo',
+    'coords', 'descripcion_corta', 'es_promo', 'imagen_recorte', 'nombre',
+    'pagina', 'precio', 'precio_promo', 'requisito_promo', 'seccion',
+    'subcategoria', 'tipo_promo', 'tipo_variante', 'variantes'
+}
+
 def supabase_post(table, data):
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return False
@@ -241,6 +248,25 @@ def supabase_post(table, data):
             "Content-Type": "application/json",
             "Prefer": "resolution=merge-duplicates"
         }
+        # Si la tabla es products, sanitizar los campos contra el esquema real de Supabase
+        if table == "products":
+            items = data if isinstance(data, list) else [data]
+            clean_items = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                c_it = dict(it)
+                coords = c_it.get("coords") if isinstance(c_it.get("coords"), dict) else {}
+                for k, v in list(c_it.items()):
+                    if k not in VALID_PRODUCT_COLUMNS:
+                        if k == "imagen" and not c_it.get("imagen_recorte"):
+                            c_it["imagen_recorte"] = v
+                        coords[k] = v
+                        c_it.pop(k, None)
+                c_it["coords"] = coords
+                clean_items.append(c_it)
+            data = clean_items if isinstance(data, list) else (clean_items[0] if clean_items else data)
+
         body = json.dumps(data).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=12) as resp:
@@ -251,29 +277,6 @@ def supabase_post(table, data):
             err_content = e.read().decode("utf-8", errors="ignore")
         except Exception:
             pass
-        # Fallback si las columnas tipo_variante o variantes aún no se han creado en Supabase
-        if table == "products" and ("PGRST204" in err_content or "tipo_variante" in err_content or "variantes" in err_content):
-            try:
-                items = data if isinstance(data, list) else [data]
-                clean_data = []
-                for it in items:
-                    c_it = dict(it)
-                    coords = c_it.get("coords") if isinstance(c_it.get("coords"), dict) else {}
-                    if "variantes" in c_it and "variantes" not in coords:
-                        coords["variantes"] = c_it["variantes"]
-                    if "tipo_variante" in c_it and "tipo_variante" not in coords:
-                        coords["tipo_variante"] = c_it["tipo_variante"]
-                    c_it["coords"] = coords
-                    c_it.pop("tipo_variante", None)
-                    c_it.pop("variantes", None)
-                    clean_data.append(c_it)
-                fallback_payload = clean_data if isinstance(data, list) else clean_data[0]
-                fb_body = json.dumps(fallback_payload).encode("utf-8")
-                fb_req = urllib.request.Request(url, data=fb_body, headers=headers, method="POST")
-                with urllib.request.urlopen(fb_req, timeout=12) as resp2:
-                    return resp2.status in (200, 201)
-            except Exception as e_fb:
-                print(f"[Supabase Products Fallback]: {e_fb}")
         print(f"[Supabase] Aviso guardando en '{table}': {e} - {err_content}")
         return False
     except Exception as e:
