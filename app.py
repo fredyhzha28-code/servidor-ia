@@ -3571,7 +3571,7 @@ REGLAS GENERALES DE AUDITORÍA Y UNIFICACIÓN INTELIGENTE:
   * ¡ES UNA SOLA PRENDA FÍSICA! NUNCA crees "Camiseta C" y otra "Camiseta C con aplique de perlas", ni crees un producto para cada talla.
   * Si la base de datos tiene registrados ambos ("Camiseta C" y "Camiseta C con aplique de perlas"), o un registro por cada talla:
     1. Mantén UN SOLO registro principal en 'products_to_update' con el nombre comercial más completo y descriptivo: ej. "Camiseta con aplique de perlas" (o "Falda Short con taches").
-    2. Agrupa TODAS sus tallas y códigos en 'variantes': [{"nombre": "S", "codigo": "752177"}, {"nombre": "M", "codigo": "752178"}, {"nombre": "L", "codigo": "752179"}].
+    2. Agrupa TODAS sus tallas y códigos en 'variantes': [{{"nombre": "S", "codigo": "752177"}}, {{"nombre": "M", "codigo": "752178"}}, {{"nombre": "L", "codigo": "752179"}}].
     3. Define 'tipo_variante': "Talla".
     4. Agrega OBLIGATORIAMENTE el ID del registro redundante (ej: el ID de "Camiseta C") a 'products_to_delete'.
 - En cosmética y perfumería: Lo mismo para TONOS de maquillaje (ej: Base con 4 tonos -> 1 solo producto con 4 variantes) y AROMAS de colonias.
@@ -3749,7 +3749,10 @@ FORMATO DE RESPUESTA EXCLUSIVAMENTE JSON:
             "summary": summary,
             "updated_count": updated_count,
             "created_count": created_count,
-            "deleted_count": deleted_count
+            "deleted_count": deleted_count,
+            "updated": updated_count,
+            "created": created_count,
+            "deleted": deleted_count
         })
 
     except Exception as e:
